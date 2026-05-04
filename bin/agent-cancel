@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# agent-cancel <id> [--force] [reason]
+# Close a thread by appending a 'block' event to=user with the given reason.
+# Refuses to cancel a thread already done or blocked, unless --force is given.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-cancel <id> [--force] [reason]
+  id       any event id in the thread (resolves to thread root automatically)
+  reason   free text (default: "cancelled")
+  --force  allow cancelling a thread already done/blocked
+
+prints the new event id on stdout
+EOF
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+id="$1"; shift
+
+force=0
+reason=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force) force=1; shift;;
+        --)      shift; reason="$*"; break;;
+        --*)     echo "agent-cancel: unknown flag '$1'" >&2; exit 1;;
+        *)       reason="$*"; break;;
+    esac
+done
+
+[ -z "$reason" ] && reason="cancelled"
+
+[ -d .agents ] && [ -f .agents/bus.jsonl ] || {
+    echo "agent-cancel: no .agents/ here — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+
+root=$(jq -rs --arg id "$id" '
+    (map(select(.id == $id)) | .[0]) as $e
+    | if $e then ($e.ref // $e.id) else "" end
+' .agents/bus.jsonl)
+
+[ -n "$root" ] || {
+    echo "agent-cancel: event id '$id' not found in bus" >&2
+    exit 1
+}
+
+last_status=$(jq -rs --arg root "$root" '
+    map(select((.ref // .id) == $root)) | last | .status
+' .agents/bus.jsonl)
+
+if [ "$last_status" = "done" ] || [ "$last_status" = "blocked" ]; then
+    if [ $force -ne 1 ]; then
+        echo "agent-cancel: thread $root is already $last_status (use --force to override)" >&2
+        exit 1
+    fi
+fi
+
+agent-send user block --ref "$root" "cancelled: $reason"

@@ -92,7 +92,7 @@ cmux send-key --surface <recipient_surface_id> Enter
 The recipient is expected to read the bus on signal. The signal is a
 wake-up; the bus is the source of truth.
 
-## Surface lifecycle (v1.1)
+## Surface lifecycle
 
 `agent-init` purges entries in `agents.json` whose `cmux_surface_id` no
 longer corresponds to a live terminal surface in the current workspace
@@ -102,5 +102,48 @@ longer corresponds to a live terminal surface in the current workspace
 live, with a clear error message asking the peer to re-run `agent-init`.
 
 `agent-inbox` displays `[stale]` on threads whose `from` is no longer in
-`agents.json`. It is read-only — the bus is never mutated. Manual cleanup
-of stale threads is done with `agent-done <id>`.
+`agents.json`. It is read-only — the bus is never mutated.
+
+## Stuck detection
+
+`agent-inbox` flags a thread as `[stuck Xm]` when the **last event**
+declares `status: in_progress` and is older than the stuck threshold
+(default 10 minutes). This is a heuristic for "the peer probably crashed
+mid-task or the work was abandoned."
+
+- Threshold is configurable per call: `--stuck-after MIN`
+- Or globally via env: `AGENT_BUS_STUCK_AFTER_MIN`
+- Setting it to `0` or a negative number disables the check
+- Filters: `--no-stuck` hides stuck threads, `--only-stuck` shows only them
+- JSON output adds `stuck: bool` and `age_minutes: N` per thread
+
+Stuck detection only fires on `in_progress` — an `open` thread is not
+stuck, it's just unclaimed work, regardless of age.
+
+## Recovery
+
+When a peer crashes or a thread gets abandoned, two wrappers help close
+or restart the work cleanly without breaking the append-only invariant:
+
+- **`agent-cancel <id> [reason]`** appends a `block` event addressed to
+  `user`, declaring `status: blocked`. This closes the thread cleanly.
+  Refuses if the thread is already `done` or `blocked` (use `--force` to
+  override).
+
+- **`agent-resume <id> [body]`** appends a new `handoff` event referencing
+  the thread root, addressed to the **original recipient** (the `to` of
+  the root event). This re-opens the thread with the latest event being
+  a fresh handoff, and sends a wake-up signal. Default body is
+  `RESUME: <previous root body>`. Refuses if the thread is already `done`
+  or `blocked` (use `--force` to override).
+
+Both commands resolve the thread root from any event id in the chain —
+you can pass the root id, an ack id, anything that belongs to the
+thread.
+
+Manual cleanup of an arbitrary thread is also possible with
+`agent-done <id>` (declares `done` from your own perspective). Choose:
+
+- `agent-done` if **you** are completing or accepting the close
+- `agent-cancel` if **the work is dropped** and should be escalated/audited
+- `agent-resume` if **the work should be retried** by the original peer

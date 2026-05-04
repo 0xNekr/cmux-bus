@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# agent-resume <id> [--force] [body]
+# Re-handoff a thread to its original recipient (the 'to' of the root event).
+# Useful when the peer crashed mid-task: the thread chain stays intact, a new
+# handoff event becomes the latest state, and the peer's inbox sees it again.
+# Refuses if the thread is already done or blocked, unless --force is given.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-resume <id> [--force] [body]
+  id       any event id in the thread (resolves to thread root automatically)
+  body     new handoff body (default: "RESUME: <previous root body>")
+  --force  allow resuming a thread already done/blocked
+
+prints the new event id on stdout
+EOF
+    exit 2
+}
+
+[ $# -ge 1 ] || usage
+id="$1"; shift
+
+force=0
+body=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --force) force=1; shift;;
+        --)      shift; body="$*"; break;;
+        --*)     echo "agent-resume: unknown flag '$1'" >&2; exit 1;;
+        *)       body="$*"; break;;
+    esac
+done
+
+[ -d .agents ] && [ -f .agents/bus.jsonl ] || {
+    echo "agent-resume: no .agents/ here — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+
+root=$(jq -rs --arg id "$id" '
+    (map(select(.id == $id)) | .[0]) as $e
+    | if $e then ($e.ref // $e.id) else "" end
+' .agents/bus.jsonl)
+
+[ -n "$root" ] || {
+    echo "agent-resume: event id '$id' not found in bus" >&2
+    exit 1
+}
+
+root_event=$(jq -cs --arg root "$root" '
+    map(select(.id == $root)) | .[0]
+' .agents/bus.jsonl)
+
+orig_recipient=$(echo "$root_event" | jq -r '.to')
+prev_body=$(echo "$root_event" | jq -r '.body')
+
+if [ -z "$orig_recipient" ] || [ "$orig_recipient" = "null" ]; then
+    echo "agent-resume: cannot determine original recipient for thread $root" >&2
+    exit 1
+fi
+
+if [ "$orig_recipient" = "user" ]; then
+    echo "agent-resume: the original recipient was 'user' — nothing to wake up" >&2
+    echo "agent-resume: send a regular agent-send to a peer instead" >&2
+    exit 1
+fi
+
+last_status=$(jq -rs --arg root "$root" '
+    map(select((.ref // .id) == $root)) | last | .status
+' .agents/bus.jsonl)
+
+if [ "$last_status" = "done" ] || [ "$last_status" = "blocked" ]; then
+    if [ $force -ne 1 ]; then
+        echo "agent-resume: thread $root is already $last_status (use --force to override)" >&2
+        exit 1
+    fi
+fi
+
+if [ -z "$body" ]; then
+    body="RESUME: $prev_body"
+fi
+
+agent-send "$orig_recipient" handoff --ref "$root" "$body"

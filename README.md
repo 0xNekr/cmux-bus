@@ -91,8 +91,32 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 |---|---|
 | `agent-init <name>` | Bootstrap or refresh this workspace for `<name>`. Creates `.agents/`, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, updates `.gitignore`. Purges stale entries from previous sessions. |
 | `agent-send <to> <type> [flags] <body>` | Append an event and signal the recipient. Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. Refuses to send to a recipient whose surface is no longer live. |
-| `agent-inbox [--json] [--no-stale] [--only-stale]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. |
+| `agent-inbox [--json] [--no-stale\|--only-stale] [--no-stuck\|--only-stuck] [--stuck-after MIN]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. Threads whose last event is `in_progress` and older than the stuck threshold (default 10 min, configurable via `AGENT_BUS_STUCK_AFTER_MIN` env) appear with `[stuck Xm]`. |
 | `agent-done <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
+| `agent-cancel <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |
+| `agent-resume <id> [--force] [body]` | Re-open a stuck/crashed thread by appending a fresh `handoff` to its **original recipient**. Default body: `RESUME: <previous>`. Refuses if the thread is already done/blocked unless `--force`. |
+
+## Recovery — what to do when a peer crashes
+
+If your peer pane is interrupted mid-task (auto-reviewer denied a
+command, the process died, the human Ctrl+C'd it…), the thread is left
+declared `in_progress` with no follow-up. After ~10 minutes, your
+`agent-inbox` will tag it `[stuck Xm]`. You then have three deliberate
+choices:
+
+```sh
+# 1. The peer is back and ready — just re-ping the same thread
+agent-resume <thread-id>
+
+# 2. You changed your mind — drop the thread cleanly with a paper trail
+agent-cancel <thread-id> "blocked on <reason>, dropping"
+
+# 3. You took over the work yourself — close it manually
+agent-done <thread-id> "did it myself, see commit abc123"
+```
+
+The bus is never mutated retroactively — every action is a new event
+appended to the chain. Past state is always inspectable.
 
 ## Event schema
 
