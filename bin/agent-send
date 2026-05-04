@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# agent-send <to> <type> [--ref ID] [--paths "p1,p2"] [--status STATUS] <body...>
+# Append an event to .agents/bus.jsonl and signal the recipient via cmux send.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-send <to> <type> [flags] <body...>
+  to       recipient agent name (must exist in .agents/agents.json) or 'user'
+  type     ask | handoff | done | block | ack
+  --ref ID         parent event id (chains the thread)
+  --paths "p1,p2"  comma-separated paths_claimed
+  --status STATUS  open | in_progress | done | blocked (default: type-derived)
+
+prints the new event id on stdout
+EOF
+    exit 2
+}
+
+[ $# -ge 3 ] || usage
+
+to="$1"; shift
+type="$1"; shift
+
+case "$type" in
+    ask|handoff|done|block|ack) ;;
+    *) echo "agent-send: invalid type '$type' (ask|handoff|done|block|ack)" >&2; exit 1;;
+esac
+
+ref=""
+paths_csv=""
+status=""
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --ref)    ref="$2"; shift 2;;
+        --paths)  paths_csv="$2"; shift 2;;
+        --status) status="$2"; shift 2;;
+        --)       shift; break;;
+        --*)      echo "agent-send: unknown flag '$1'" >&2; exit 1;;
+        *)        break;;
+    esac
+done
+
+[ $# -ge 1 ] || { echo "agent-send: missing body" >&2; exit 1; }
+body="$*"
+
+if [ -z "$status" ]; then
+    case "$type" in
+        ask|handoff) status="open";;
+        ack)         status="in_progress";;
+        done)        status="done";;
+        block)       status="blocked";;
+    esac
+fi
+case "$status" in open|in_progress|done|blocked) ;; *)
+    echo "agent-send: invalid status '$status'" >&2; exit 1;;
+esac
+
+[ -d .agents ] && [ -f .agents/agents.json ] || {
+    echo "agent-send: no .agents/ here — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+
+my_surface="${CMUX_SURFACE_ID:-}"
+[ -n "$my_surface" ] || { echo "agent-send: CMUX_SURFACE_ID not set" >&2; exit 1; }
+
+from=$(jq -r --arg s "$my_surface" '.agents | to_entries[] | select(.value == $s) | .key' .agents/agents.json | head -n1)
+[ -n "$from" ] || {
+    echo "agent-send: this surface is not registered — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+
+if [ "$to" != "user" ]; then
+    target_surface=$(jq -r --arg n "$to" '.agents[$n] // empty' .agents/agents.json)
+    [ -n "$target_surface" ] || {
+        echo "agent-send: unknown recipient '$to' — known agents:" >&2
+        jq -r '.agents | keys[]' .agents/agents.json | sed 's/^/  /' >&2
+        exit 1
+    }
+    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ && /in_window=true/ {print $2}')
+    if [ -n "$live" ] && ! printf '%s\n' "$live" | grep -qxF "$target_surface"; then
+        echo "agent-send: recipient '$to' has a stale surface (pane closed or cmux restarted)" >&2
+        echo "agent-send: ask them to run 'agent-init $to' from their current pane" >&2
+        exit 1
+    fi
+fi
+
+id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+paths_json='[]'
+if [ -n "$paths_csv" ]; then
+    paths_json=$(jq -nc --arg csv "$paths_csv" '$csv | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
+fi
+
+ref_json='null'
+[ -n "$ref" ] && ref_json=$(jq -nc --arg r "$ref" '$r')
+
+event=$(jq -nc \
+    --arg id "$id" \
+    --arg ts "$ts" \
+    --arg from "$from" \
+    --arg to "$to" \
+    --arg type "$type" \
+    --argjson ref "$ref_json" \
+    --arg status "$status" \
+    --argjson paths_claimed "$paths_json" \
+    --arg body "$body" \
+    '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, body:$body}')
+
+echo "$event" >> .agents/bus.jsonl
+
+if [ "$to" != "user" ]; then
+    cmux send --surface "$target_surface" "new $type id=$id from=$from" >/dev/null
+    cmux send-key --surface "$target_surface" Enter >/dev/null
+fi
+
+echo "$id"

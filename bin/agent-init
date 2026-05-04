@@ -1,0 +1,202 @@
+#!/usr/bin/env bash
+# agent-init <agent_name>
+# Bootstrap a workspace for the cmux multi-agent bus.
+# Creates .agents/{bus.jsonl,agents.json,PROTOCOL.md}, updates .gitignore,
+# and registers <agent_name> -> $CMUX_SURFACE_ID in agents.json.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: agent-init <agent_name>" >&2
+    echo "  registers this pane as <agent_name> in .agents/agents.json" >&2
+    exit 2
+}
+
+[ $# -eq 1 ] || usage
+name="$1"
+
+[[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || {
+    echo "agent-init: name must be lowercase, start with a letter, [a-z0-9_-], 1..32 chars" >&2
+    exit 1
+}
+
+surface="${CMUX_SURFACE_ID:-}"
+[ -n "$surface" ] || {
+    echo "agent-init: CMUX_SURFACE_ID is not set — run inside a cmux pane" >&2
+    exit 1
+}
+
+dir=".agents"
+mkdir -p "$dir"
+touch "$dir/bus.jsonl"
+
+agents_file="$dir/agents.json"
+[ -s "$agents_file" ] || echo '{"agents":{}}' > "$agents_file"
+
+live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ && /in_window=true/ {print $2}')
+purged=""
+if [ -n "$live" ]; then
+    live_json=$(printf '%s\n' "$live" | jq -R . | jq -s .)
+    purged=$(jq -r --argjson live "$live_json" '.agents | to_entries | map(select(.value as $u | $live | index($u) | not)) | map(.key) | join(",")' "$agents_file")
+    tmp=$(mktemp)
+    jq --argjson live "$live_json" '.agents = (.agents | with_entries(select(.value as $u | $live | index($u))))' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
+fi
+
+tmp=$(mktemp)
+jq --arg n "$name" --arg s "$surface" '.agents[$n] = $s' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
+
+gitignore=".gitignore"
+if [ ! -f "$gitignore" ] || ! grep -qxF ".agents/" "$gitignore"; then
+    [ -f "$gitignore" ] && [ -n "$(tail -c1 "$gitignore" 2>/dev/null)" ] && echo >> "$gitignore"
+    echo ".agents/" >> "$gitignore"
+fi
+
+protocol="$dir/PROTOCOL.md"
+if [ ! -f "$protocol" ]; then
+    cat > "$protocol" <<'PROTOCOL'
+# Multi-Agent Bus — Protocol v1
+
+This workspace coordinates two or more agents (e.g. Claude, Codex) running in
+adjacent cmux panes. Communication uses an append-only event-sourced log.
+
+## Files
+
+- `.agents/bus.jsonl` — append-only event log, one JSON per line
+- `.agents/agents.json` — `{agent_name: cmux_surface_id}` registry
+- `.agents/PROTOCOL.md` — this file
+
+## Event schema
+
+```json
+{
+  "id":             "8-char id",
+  "ts":             "ISO-8601 UTC",
+  "from":           "agent name",
+  "to":             "agent name (or 'user')",
+  "type":           "ask|handoff|done|block|ack",
+  "ref":            "id of parent event, or null",
+  "status":         "open|in_progress|done|blocked",
+  "paths_claimed":  ["glob", ...],
+  "body":           "free text"
+}
+```
+
+The bus is append-only: `status` is *declared* by an event, not mutated on
+prior events. The effective state of a thread is the **last** event whose
+`ref` chains back to the root.
+
+## Types
+
+- `ask` — open a thread asking the recipient for input
+- `handoff` — pass a task; recipient should `ack` then `done`
+- `ack` — acknowledge receipt; declares `in_progress`
+- `done` — close a thread with the result
+- `block` — escalate to user when stuck
+
+## Routing defaults
+
+- **Claude** — design, critique, broad exploration, multi-file refactor, UX/API framing
+- **Codex** — CLI diagnostics, one-shot scripts, tests, bisect, migrations, hypothesis verification
+
+## Inbox routine
+
+Before starting any new task, every agent **must**:
+
+1. Read `.agents/bus.jsonl` (if it exists)
+2. Group events by thread root (`ref ?? id`)
+3. For each thread where the last event targets you (`to == me`) and the
+   declared status is not `done` or `blocked`: process it.
+4. Once caught up, take new work.
+
+## Path ownership
+
+When sending a `handoff`, declare `paths_claimed` (array of file paths or
+globs). The other agent **must not** edit those paths until the thread is
+closed by a `done` or `block` event.
+
+## Disagreement rule
+
+If a thread exchanges two `ask` ↔ `ask` round-trips between agents without
+converging, the next event must be a `block` directed to `user`, with:
+- the body summarizing the disagreement
+- each agent's recommendation (declared in prior events)
+- explicit options the user can choose
+
+No agent edits the disputed paths until the user resolves the block.
+
+## Signaling
+
+After appending an event, the sender notifies the recipient by injecting
+text into their cmux pane:
+
+```
+cmux send --surface <recipient_surface_id> "new <type> id=<event_id>"
+cmux send-key --surface <recipient_surface_id> Enter
+```
+
+The recipient is expected to read the bus on signal. Polling is fine too;
+the bus is the source of truth, the signal is a wake-up.
+PROTOCOL
+fi
+
+agents_md="AGENTS.md"
+mark_start="<!-- agent-bus:start v1 -->"
+mark_end="<!-- agent-bus:end v1 -->"
+block=$(cat <<'BLOCK'
+<!-- agent-bus:start v1 -->
+## Multi-agent bus (cmux)
+
+This workspace runs a multi-agent coordination protocol. Peer agents (typically
+Claude and Codex) work in adjacent cmux panes and communicate via an event log
+at `.agents/bus.jsonl`.
+
+**At session start:**
+1. Read `.agents/PROTOCOL.md` once — it defines the schema, types, inbox
+   routine, path-ownership rule, and disagreement escalation.
+2. Run `agent-inbox` to see open threads addressed to you. Process them before
+   taking new work.
+
+**To send or hand off:** `agent-send <to> <type> [--ref ID] [--paths "p1,p2"]
+<body>`. Types: `ask`, `handoff`, `done`, `block`, `ack`.
+**To close a thread:** `agent-done <id> [body]`.
+**Never edit a path another agent has claimed in an open thread.**
+
+Peers and surfaces are listed in `.agents/agents.json`.
+<!-- agent-bus:end v1 -->
+BLOCK
+)
+
+if [ ! -f "$agents_md" ]; then
+    printf '%s\n' "$block" > "$agents_md"
+    agents_md_action="created"
+elif grep -qF "$mark_start" "$agents_md"; then
+    out=$(mktemp)
+    in_block=0
+    emitted=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [[ "$line" == *"$mark_start"* ]]; then
+            [ $emitted -eq 0 ] && { printf '%s\n' "$block" >> "$out"; emitted=1; }
+            in_block=1
+            continue
+        fi
+        if [[ "$line" == *"$mark_end"* ]]; then
+            in_block=0
+            continue
+        fi
+        [ $in_block -eq 0 ] && printf '%s\n' "$line" >> "$out"
+    done < "$agents_md"
+    mv "$out" "$agents_md"
+    agents_md_action="updated"
+else
+    [ -n "$(tail -c1 "$agents_md" 2>/dev/null)" ] && printf '\n' >> "$agents_md"
+    printf '\n%s\n' "$block" >> "$agents_md"
+    agents_md_action="appended"
+fi
+
+echo "agent-init: registered '$name' -> surface '$surface'"
+echo "agent-init: $(jq -c .agents "$agents_file")"
+echo "agent-init: protocol at $protocol, bus at $dir/bus.jsonl"
+echo "agent-init: $agents_md $agents_md_action"
+if [ -n "$purged" ]; then
+    echo "agent-init: purged stale entries: $purged"
+fi

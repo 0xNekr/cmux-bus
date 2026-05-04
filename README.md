@@ -1,0 +1,169 @@
+# cmux-bus
+
+> Native multi-agent message bus for [cmux](https://cmux.com) — coordinate
+> Claude Code, Codex CLI and other terminal agents across panes via an
+> event-sourced JSONL log.
+
+`cmux-bus` is a tiny, cmux-native coordination protocol for multiple AI
+coding agents working side by side in adjacent panes. It gives them a
+shared message bus, structured handoffs, file-ownership claims, and a
+clean escalation path back to the human.
+
+No daemon. No HTTP server. No MCP layer. No Node or Python. Just
+~4 bash scripts, `jq`, and the `cmux` CLI you already have.
+
+## Why
+
+Most multi-agent setups today are tmux-based and ship as orchestrators
+(agent-of-empires, CAO, ccmanager, agentic-tmux, multi-agent-shogun,
+agent-deck, batty…). That's great if you live in tmux. If you live in
+**cmux**, you have a richer native API (sidebar, browser, surfaces,
+notifications, socket control) and don't need a heavy orchestrator on top
+— you need a thin protocol that uses what cmux already gives you.
+
+`cmux-bus` is that thin protocol. It does one thing: lets two agents pass
+work to each other reliably without stepping on each other's files, with
+an audit trail you can inspect with `cat`.
+
+## Requirements
+
+- [cmux](https://cmux.com) (uses `CMUX_SURFACE_ID`, `cmux send`,
+  `cmux send-key`, `cmux surface-health`)
+- `bash` 3.2+ (macOS default works, no Homebrew bash needed)
+- `jq` 1.6+
+
+## Install
+
+```sh
+git clone https://github.com/0xNekr/cmux-bus.git
+cd cmux-bus
+./install.sh
+```
+
+The installer symlinks the four `bin/agent-*` scripts into `~/.local/bin`
+(create it if missing). Updates are then a `git pull` away.
+
+If Claude Code is detected (`~/.claude/rules/` exists), it also installs
+`agents-protocol.md` there so Claude auto-loads the protocol context at
+session start.
+
+## Quick start
+
+In a cmux workspace with two panes (e.g. one running `claude`, one
+running `codex`), **from the workspace root in each pane**:
+
+```sh
+# Pane A (Claude), cwd = workspace root
+agent-init claude
+
+# Pane B (Codex), cwd = workspace root
+agent-init codex
+```
+
+That's the bootstrap. Each pane registers its `CMUX_SURFACE_ID` in
+`.agents/agents.json`, the bus file is created, and an `AGENTS.md` is
+written at the workspace root so any agent starting fresh in this project
+sees the protocol. The `.agents/` directory is runtime state — it is
+added to your `.gitignore` automatically and should not be committed.
+
+Now from Claude:
+
+```sh
+ID=$(agent-send codex handoff --paths "src/api.ts,src/types.ts" \
+  "Refactor src/api.ts to use the new Result type")
+echo "$ID"   # 8-char id, e.g. 'a3f81c92'
+```
+
+Codex's pane receives a wake-up signal in its prompt:
+`new handoff id=a3f81c92 from=claude`. It runs `agent-inbox`, sees the
+open thread, does the work (without anyone else touching `src/api.ts` or
+`src/types.ts`), and closes the loop:
+
+```sh
+agent-done a3f81c92 "done in commit abc123. Tests passing."
+```
+
+Claude's pane receives a wake-up; `agent-inbox` is now clean.
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| `agent-init <name>` | Bootstrap or refresh this workspace for `<name>`. Creates `.agents/`, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, updates `.gitignore`. Purges stale entries from previous sessions. |
+| `agent-send <to> <type> [flags] <body>` | Append an event and signal the recipient. Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. Refuses to send to a recipient whose surface is no longer live. |
+| `agent-inbox [--json] [--no-stale] [--only-stale]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. |
+| `agent-done <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
+
+## Event schema
+
+Every line in `.agents/bus.jsonl` is one JSON object:
+
+```json
+{
+  "id":             "8-char id",
+  "ts":             "ISO-8601 UTC",
+  "from":           "agent name",
+  "to":             "agent name (or 'user')",
+  "type":           "ask|handoff|done|block|ack",
+  "ref":            "id of parent event, or null",
+  "status":         "open|in_progress|done|blocked",
+  "paths_claimed":  ["glob", ...],
+  "body":           "free text"
+}
+```
+
+The bus is **append-only**. State is event-sourced: the effective status
+of a thread is whatever the last event in the chain declares. See
+[`PROTOCOL.md`](./PROTOCOL.md) for the full spec.
+
+## Workspace isolation
+
+The bus lives in `.agents/` at your workspace root. Each project has its
+own bus, registry, and protocol — they never see each other. A single
+pane can participate in multiple workspaces; just `agent-init` in each.
+
+## Surface lifecycle
+
+cmux surface IDs are tied to a live pane. If you close a pane, restart
+cmux, or recreate a split, the old surface ID becomes stale.
+
+- `agent-init` auto-purges stale entries on every run
+- `agent-send` refuses to signal a stale recipient (no silent void)
+- `agent-inbox` flags threads opened by stale senders (`[stale]`)
+
+The bus is never auto-rewritten. Cleanup of stale threads is a deliberate
+human action via `agent-done <id>`.
+
+## Routing defaults
+
+A loose convention, not enforcement:
+
+- **Claude** — design, critique, broad exploration, multi-file refactor
+- **Codex** — CLI diagnostics, scripts, tests, bisect, hypothesis checks
+
+Override freely based on what each agent is best at for the task at hand.
+
+## What this is not
+
+- Not an orchestrator (no scheduler, no worktree management)
+- Not a tmux thing (uses cmux's native API; tmux users have plenty of
+  better-fit projects)
+- Not a daemon, broker, or service
+- Not opinionated about which agents you run — anything that runs in a
+  terminal and can read/write files works
+
+## Comparison
+
+| | cmux-bus | cmuxlayer | agent-of-empires | CAO |
+|---|---|---|---|---|
+| Multiplexer | cmux native | cmux native | tmux | tmux |
+| Transport | JSONL file + cmux signal | MCP server (Node) | tmux send-keys | HTTP MCP server (Python) |
+| Structured handoffs | ✅ | ❌ | partial | ✅ |
+| File ownership claims | ✅ | ❌ | ❌ | ❌ |
+| Append-only audit trail | ✅ | partial (telemetry) | ❌ | ❌ |
+| Dependencies | bash + jq | Node + npm | Rust binary | Python 3.10+ |
+| Order of magnitude (LOC) | hundreds | thousands | tens of thousands | thousands |
+
+## License
+
+[Apache-2.0](./LICENSE)

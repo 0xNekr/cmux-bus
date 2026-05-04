@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+json=0; stale_filter=all
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) json=1;;
+    --no-stale) [ "$stale_filter" = all ] || { echo "agent-inbox: use only one stale filter" >&2; exit 2; }; stale_filter=no;;
+    --only-stale) [ "$stale_filter" = all ] || { echo "agent-inbox: use only one stale filter" >&2; exit 2; }; stale_filter=only;;
+    *) echo "usage: agent-inbox [--json] [--no-stale|--only-stale]" >&2; exit 2;;
+  esac; shift
+done
+[ -f .agents/agents.json ] || { echo "agent-inbox: no .agents/ here — run 'agent-init <your_name>' first" >&2; exit 1; }
+[ -f .agents/bus.jsonl ] || { echo "agent-inbox: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2; exit 1; }
+my_surface="${CMUX_SURFACE_ID:-}"; [ -n "$my_surface" ] || { echo "agent-inbox: CMUX_SURFACE_ID not set" >&2; exit 1; }
+me=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' .agents/agents.json | head -n1)
+[ -n "$me" ] || { echo "agent-inbox: this surface is not registered — run 'agent-init <your_name>' first" >&2; exit 1; }
+agents=$(jq -c '.agents' .agents/agents.json)
+items=$(jq -s --arg me "$me" --argjson agents "$agents" --arg stale_filter "$stale_filter" '
+  def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
+  map(select(type=="object" and .id)) as $events |
+  ($events|map({key:.id,value:.})|from_entries) as $m |
+  ($events|map(.+{root:root($m;.)})|group_by(.root)|map({root:.[0].root,last:.[-1]})) |
+  map(select(.last.to==$me and (.last.status|IN("done","blocked")|not)) | .+{stale:($agents[.last.from] == null)}) |
+  if $stale_filter=="no" then map(select(.stale|not)) elif $stale_filter=="only" then map(select(.stale)) else . end
+' .agents/bus.jsonl)
+[ "$json" -eq 1 ] && { printf '%s\n' "$items"; exit 0; }
+count=$(printf '%s' "$items" | jq 'length')
+[ "$count" -eq 0 ] && { echo "agent-inbox: no open threads for $me"; exit 0; }
+printf '%-16s %-8s %-12s %-10s %-10s %s\n' ROOT ID TYPE STATUS FROM BODY
+printf '%s' "$items" | jq -r '.[]|[(if .stale then "[stale] "+.root else .root end),.last.id,.last.type,.last.status,.last.from,(.last.body|gsub("[\r\n]+";" "))]|@tsv' |
+while IFS=$'\t' read -r root id type status from body; do
+  printf '%-16s %-8s %-12s %-10s %-10s %s\n' "$root" "$id" "$type" "$status" "$from" "$body"
+done

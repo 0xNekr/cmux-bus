@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+[ $# -ge 1 ] || { echo "usage: agent-done <id> [body...]" >&2; exit 2; }
+ref="$1"; shift; body="${*:-done}"
+[ -f .agents/agents.json ] || { echo "agent-done: no .agents/ here — run 'agent-init <your_name>' first" >&2; exit 1; }
+[ -f .agents/bus.jsonl ] || { echo "agent-done: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2; exit 1; }
+my_surface="${CMUX_SURFACE_ID:-}"; [ -n "$my_surface" ] || { echo "agent-done: CMUX_SURFACE_ID not set" >&2; exit 1; }
+from=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' .agents/agents.json | head -n1)
+[ -n "$from" ] || { echo "agent-done: this surface is not registered — run 'agent-init <your_name>' first" >&2; exit 1; }
+thread=$(jq -s --arg ref "$ref" '
+  def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
+  map(select(type=="object" and .id)) as $events | ($events|map({key:.id,value:.})|from_entries) as $m |
+  if $m[$ref]==null then null else ($events|map(.+{root:root($m;.)})|map(select(.root==root($m;$m[$ref])))|last) end
+' .agents/bus.jsonl)
+[ "$thread" != null ] || { echo "agent-done: unknown event id '$ref'" >&2; exit 1; }
+to=$(printf '%s' "$thread" | jq -r .from); root=$(printf '%s' "$thread" | jq -r .root)
+id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n'); ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+event=$(jq -nc --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" --arg ref "$root" --arg body "$body" \
+  '{id:$id,ts:$ts,from:$from,to:$to,type:"done",ref:$ref,status:"done",paths_claimed:[],body:$body}')
+echo "$event" >> .agents/bus.jsonl
+if [ "$to" != user ]; then
+  target_surface=$(jq -r --arg n "$to" '.agents[$n]//empty' .agents/agents.json)
+  [ -n "$target_surface" ] && { cmux send --surface "$target_surface" "new done id=$id from=$from" >/dev/null; cmux send-key --surface "$target_surface" Enter >/dev/null; }
+fi
+echo "$id"
