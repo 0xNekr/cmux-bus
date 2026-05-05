@@ -40,7 +40,7 @@ cd cmux-bus
 ./install.sh
 ```
 
-The installer symlinks the four `bin/agent-*` scripts into `~/.local/bin`
+The installer symlinks all `bin/agent-*` scripts into `~/.local/bin`
 (create it if missing). Updates are then a `git pull` away.
 
 If Claude Code is detected (`~/.claude/rules/` exists), it also installs

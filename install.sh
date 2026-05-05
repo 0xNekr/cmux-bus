@@ -6,6 +6,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src_bin="$repo_root/bin"
+tools=(agent-init agent-send agent-inbox agent-done agent-cancel agent-resume)
 
 missing=()
 command -v jq >/dev/null 2>&1 || missing+=("jq")
@@ -25,7 +26,7 @@ case ":$PATH:" in
     *) echo "warning: $target_dir is not in your PATH" >&2 ;;
 esac
 
-for tool in agent-init agent-send agent-inbox agent-done; do
+for tool in "${tools[@]}"; do
     src="$src_bin/$tool"
     if [ ! -f "$src" ]; then
         echo "error: missing $src" >&2
@@ -35,7 +36,7 @@ for tool in agent-init agent-send agent-inbox agent-done; do
 done
 
 linked=()
-for tool in agent-init agent-send agent-inbox agent-done; do
+for tool in "${tools[@]}"; do
     src="$src_bin/$tool"
     dst="$target_dir/$tool"
     ln -sfn "$src" "$dst"
