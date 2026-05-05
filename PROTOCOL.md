@@ -43,6 +43,9 @@ partial JSON into `bus.jsonl`.
 - `done` — close a thread with the result
 - `block` — escalate to user when stuck
 
+When `ref` is not `null`, it must point to an existing event id in the
+same `bus.jsonl`. Writers should refuse orphan references.
+
 ## Routing defaults
 
 These are conventions, not enforced rules:

@@ -90,7 +90,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | Command | What it does |
 |---|---|
 | `agent-init <name>` | Bootstrap or refresh this workspace for `<name>`. Creates `.agents/`, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, updates `.gitignore`. Purges stale entries from previous sessions. |
-| `agent-send <to> <type> [flags] <body>` | Append an event and signal the recipient. Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. Refuses to send to a recipient whose surface is no longer live. |
+| `agent-send <to> <type> [flags] <body>` | Append an event and signal the recipient. Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. Refuses unknown refs and stale recipients. |
 | `agent-inbox [--json] [--no-stale\|--only-stale] [--no-stuck\|--only-stuck] [--stuck-after MIN]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. Threads whose last event is `in_progress` and older than the stuck threshold (default 10 min, configurable via `AGENT_BUS_STUCK_AFTER_MIN` env) appear with `[stuck Xm]`. |
 | `agent-done <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
 | `agent-cancel <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |

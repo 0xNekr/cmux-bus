@@ -107,6 +107,22 @@ esac
     exit 1
 }
 
+[ -f .agents/bus.jsonl ] || {
+    echo "agent-send: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+
+if [ -n "$ref" ]; then
+    jq empty .agents/bus.jsonl >/dev/null || {
+        echo "agent-send: cannot validate --ref because .agents/bus.jsonl is malformed" >&2
+        exit 1
+    }
+    jq -e --arg ref "$ref" 'select(type == "object" and .id == $ref) | halt' .agents/bus.jsonl >/dev/null || {
+        echo "agent-send: unknown --ref '$ref' — cannot append an orphan event" >&2
+        exit 1
+    }
+fi
+
 my_surface="${CMUX_SURFACE_ID:-}"
 [ -n "$my_surface" ] || { echo "agent-send: CMUX_SURFACE_ID not set" >&2; exit 1; }
 
