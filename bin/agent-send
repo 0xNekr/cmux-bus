@@ -4,6 +4,50 @@
 
 set -euo pipefail
 
+append_event() {
+    local event="$1"
+    local bus=".agents/bus.jsonl"
+    local lock=".agents/bus.lock"
+    local tries=0
+
+    case "$event" in
+        *$'\n'*|*$'\r'*)
+            echo "agent-send: refusing to append event with raw newline/control characters" >&2
+            exit 1
+            ;;
+    esac
+
+    printf '%s\n' "$event" | jq -e '
+        type == "object"
+        and (.id | type == "string")
+        and (.ts | type == "string")
+        and (.from | type == "string")
+        and (.to | type == "string")
+        and (.type | IN("ask","handoff","done","block","ack"))
+        and ((.ref == null) or (.ref | type == "string"))
+        and (.status | IN("open","in_progress","done","blocked"))
+        and (.paths_claimed | type == "array")
+        and (.body | type == "string")
+    ' >/dev/null || {
+        echo "agent-send: generated event does not match the bus schema" >&2
+        exit 1
+    }
+
+    trap 'rmdir ".agents/bus.lock" 2>/dev/null || true' EXIT INT TERM
+    while ! mkdir "$lock" 2>/dev/null; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            echo "agent-send: timed out waiting for bus lock ($lock)" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+
+    printf '%s\n' "$event" >> "$bus"
+    rmdir "$lock"
+    trap - EXIT INT TERM
+}
+
 usage() {
     cat >&2 <<EOF
 usage: agent-send <to> <type> [flags] <body...>
@@ -110,7 +154,7 @@ event=$(jq -nc \
     --arg body "$body" \
     '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, body:$body}')
 
-echo "$event" >> .agents/bus.jsonl
+append_event "$event"
 
 if [ "$to" != "user" ]; then
     cmux send --surface "$target_surface" "new $type id=$id from=$from" >/dev/null

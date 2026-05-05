@@ -1,5 +1,50 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+append_event() {
+    local event="$1"
+    local bus=".agents/bus.jsonl"
+    local lock=".agents/bus.lock"
+    local tries=0
+
+    case "$event" in
+        *$'\n'*|*$'\r'*)
+            echo "agent-done: refusing to append event with raw newline/control characters" >&2
+            exit 1
+            ;;
+    esac
+
+    printf '%s\n' "$event" | jq -e '
+        type == "object"
+        and (.id | type == "string")
+        and (.ts | type == "string")
+        and (.from | type == "string")
+        and (.to | type == "string")
+        and (.type | IN("ask","handoff","done","block","ack"))
+        and ((.ref == null) or (.ref | type == "string"))
+        and (.status | IN("open","in_progress","done","blocked"))
+        and (.paths_claimed | type == "array")
+        and (.body | type == "string")
+    ' >/dev/null || {
+        echo "agent-done: generated event does not match the bus schema" >&2
+        exit 1
+    }
+
+    trap 'rmdir ".agents/bus.lock" 2>/dev/null || true' EXIT INT TERM
+    while ! mkdir "$lock" 2>/dev/null; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            echo "agent-done: timed out waiting for bus lock ($lock)" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+
+    printf '%s\n' "$event" >> "$bus"
+    rmdir "$lock"
+    trap - EXIT INT TERM
+}
+
 [ $# -ge 1 ] || { echo "usage: agent-done <id> [body...]" >&2; exit 2; }
 ref="$1"; shift; body="${*:-done}"
 [ -f .agents/agents.json ] || { echo "agent-done: no .agents/ here — run 'agent-init <your_name>' first" >&2; exit 1; }
@@ -17,7 +62,7 @@ to=$(printf '%s' "$thread" | jq -r .from); root=$(printf '%s' "$thread" | jq -r 
 id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n'); ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 event=$(jq -nc --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" --arg ref "$root" --arg body "$body" \
   '{id:$id,ts:$ts,from:$from,to:$to,type:"done",ref:$ref,status:"done",paths_claimed:[],body:$body}')
-echo "$event" >> .agents/bus.jsonl
+append_event "$event"
 if [ "$to" != user ]; then
   target_surface=$(jq -r --arg n "$to" '.agents[$n]//empty' .agents/agents.json)
   [ -n "$target_surface" ] && { cmux send --surface "$target_surface" "new done id=$id from=$from" >/dev/null; cmux send-key --surface "$target_surface" Enter >/dev/null; }

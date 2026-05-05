@@ -31,6 +31,10 @@ The bus is **append-only**: `status` is *declared* by an event, not mutated
 on prior events. The effective state of a thread is the **last** event whose
 `ref` chains back to the root.
 
+Writers must append exactly one valid JSON object per line. Writes are
+serialized with `.agents/bus.lock` so concurrent agents cannot interleave
+partial JSON into `bus.jsonl`.
+
 ## Types
 
 - `ask` — open a thread asking the recipient for input

@@ -140,6 +140,10 @@ The bus is **append-only**. State is event-sourced: the effective status
 of a thread is whatever the last event in the chain declares. See
 [`PROTOCOL.md`](./PROTOCOL.md) for the full spec.
 
+Writers validate each event as a single-line JSON object and serialize
+appends with `.agents/bus.lock`, so concurrent agents cannot interleave
+partial JSON lines.
+
 ## Workspace isolation
 
 The bus lives in `.agents/` at your workspace root. Each project has its
