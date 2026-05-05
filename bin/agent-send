@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # agent-send <to> <type> [--ref ID] [--paths "p1,p2"] [--status STATUS] <body...>
-# Append an event to .agents/bus.jsonl and signal the recipient via cmux send.
+# Append event(s) to .agents/bus.jsonl and signal recipient(s) via cmux send.
 
 set -euo pipefail
 
@@ -51,13 +51,13 @@ append_event() {
 usage() {
     cat >&2 <<EOF
 usage: agent-send <to> <type> [flags] <body...>
-  to       recipient agent name (must exist in .agents/agents.json) or 'user'
+  to       recipient agent name, comma-separated names, 'all', or 'user'
   type     ask | handoff | done | block | ack
   --ref ID         parent event id (chains the thread)
   --paths "p1,p2"  comma-separated paths_claimed
   --status STATUS  open | in_progress | done | blocked (default: type-derived)
 
-prints the new event id on stdout
+prints new event id(s) on stdout, one per line
 EOF
     exit 2
 }
@@ -66,11 +66,19 @@ EOF
 
 to="$1"; shift
 type="$1"; shift
+broadcast_requested=0
+[ "$to" = "all" ] && broadcast_requested=1
+case "$to" in *,*) broadcast_requested=1;; esac
 
 case "$type" in
     ask|handoff|done|block|ack) ;;
     *) echo "agent-send: invalid type '$type' (ask|handoff|done|block|ack)" >&2; exit 1;;
 esac
+
+if [ "$broadcast_requested" -eq 1 ] && [ "$type" != "ask" ]; then
+    echo "agent-send: broadcast is only supported for type 'ask'" >&2
+    exit 1
+fi
 
 ref=""
 paths_csv=""
@@ -132,23 +140,53 @@ from=$(jq -r --arg s "$my_surface" '.agents | to_entries[] | select(.value == $s
     exit 1
 }
 
-if [ "$to" != "user" ]; then
-    target_surface=$(jq -r --arg n "$to" '.agents[$n] // empty' .agents/agents.json)
+if [ "$to" = "all" ]; then
+    recipients=$(jq -r --arg from "$from" '.agents | keys[] | select(. != $from)' .agents/agents.json)
+elif [ "$to" = "user" ]; then
+    recipients="user"
+else
+    recipients=$(jq -nr --arg csv "$to" --arg from "$from" '
+        $csv
+        | split(",")
+        | map(gsub("^\\s+|\\s+$"; ""))
+        | map(select(length > 0 and . != $from))
+        | reduce .[] as $r ([]; if index($r) then . else . + [$r] end)
+        | .[]
+    ')
+fi
+
+[ -n "$recipients" ] || {
+    echo "agent-send: no recipients after expanding '$to'" >&2
+    exit 1
+}
+
+if [ "$(printf '%s\n' "$recipients" | wc -l | tr -d ' ')" -gt 1 ] && [ -n "$ref" ]; then
+    echo "agent-send: broadcast with --ref is not supported; reply to each thread separately" >&2
+    exit 1
+fi
+
+live=""
+if ! { [ "$recipients" = "user" ]; }; then
+    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ && /in_window=true/ {print $2}')
+fi
+
+while IFS= read -r recipient; do
+    [ -n "$recipient" ] || continue
+    [ "$recipient" != "user" ] || continue
+    target_surface=$(jq -r --arg n "$recipient" '.agents[$n] // empty' .agents/agents.json)
     [ -n "$target_surface" ] || {
-        echo "agent-send: unknown recipient '$to' — known agents:" >&2
+        echo "agent-send: unknown recipient '$recipient' — known agents:" >&2
         jq -r '.agents | keys[]' .agents/agents.json | sed 's/^/  /' >&2
         exit 1
     }
-    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ && /in_window=true/ {print $2}')
     if [ -n "$live" ] && ! printf '%s\n' "$live" | grep -qxF "$target_surface"; then
-        echo "agent-send: recipient '$to' has a stale surface (pane closed or cmux restarted)" >&2
-        echo "agent-send: ask them to run 'agent-init $to' from their current pane" >&2
+        echo "agent-send: recipient '$recipient' has a stale surface (pane closed or cmux restarted)" >&2
+        echo "agent-send: ask them to run 'agent-init $recipient' from their current pane" >&2
         exit 1
     fi
-fi
-
-id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
-ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+done <<EOF
+$recipients
+EOF
 
 paths_json='[]'
 if [ -n "$paths_csv" ]; then
@@ -158,23 +196,31 @@ fi
 ref_json='null'
 [ -n "$ref" ] && ref_json=$(jq -nc --arg r "$ref" '$r')
 
-event=$(jq -nc \
-    --arg id "$id" \
-    --arg ts "$ts" \
-    --arg from "$from" \
-    --arg to "$to" \
-    --arg type "$type" \
-    --argjson ref "$ref_json" \
-    --arg status "$status" \
-    --argjson paths_claimed "$paths_json" \
-    --arg body "$body" \
-    '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, body:$body}')
+while IFS= read -r recipient; do
+    [ -n "$recipient" ] || continue
+    id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    event=$(jq -nc \
+        --arg id "$id" \
+        --arg ts "$ts" \
+        --arg from "$from" \
+        --arg to "$recipient" \
+        --arg type "$type" \
+        --argjson ref "$ref_json" \
+        --arg status "$status" \
+        --argjson paths_claimed "$paths_json" \
+        --arg body "$body" \
+        '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, body:$body}')
 
-append_event "$event"
+    append_event "$event"
 
-if [ "$to" != "user" ]; then
-    cmux send --surface "$target_surface" "new $type id=$id from=$from" >/dev/null
-    cmux send-key --surface "$target_surface" Enter >/dev/null
-fi
+    if [ "$recipient" != "user" ]; then
+        target_surface=$(jq -r --arg n "$recipient" '.agents[$n] // empty' .agents/agents.json)
+        cmux send --surface "$target_surface" "new $type id=$id from=$from" >/dev/null
+        cmux send-key --surface "$target_surface" Enter >/dev/null
+    fi
 
-echo "$id"
+    echo "$id"
+done <<EOF
+$recipients
+EOF

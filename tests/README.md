@@ -14,9 +14,9 @@ Covered areas:
 
 - `agent-init` direct and via symlink, including protocol/template sync
 - `install.sh` symlinking all commands
-- `agent-send` ref validation, paths/status parsing, peer signaling, multiline
-  bodies, invalid recipients/types/statuses, stale recipients, `to=user`
-  behavior, and concurrent writes
+- `agent-send` ref validation, paths/status parsing, peer signaling, broadcast
+  fan-out (`all` and CSV), multiline bodies, invalid recipients/types/statuses,
+  stale recipients, `to=user` behavior, and concurrent writes
 - `agent-done` signaling and unknown ids
 - `agent-cancel` and `agent-resume` recovery events and rejection paths
 - `agent-inbox` empty, stale, and stuck cases

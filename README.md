@@ -91,7 +91,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | Command | What it does |
 |---|---|
 | `agent-init <name>` | Bootstrap or refresh this workspace for `<name>`. Creates `.agents/`, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, updates `.gitignore`. Purges stale entries from previous sessions. |
-| `agent-send <to> <type> [flags] <body>` | Append an event and signal the recipient. Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. Refuses unknown refs and stale recipients. |
+| `agent-send <to> <type> [flags] <body>` | Append event(s) and signal recipient(s). Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. For `ask`, `<to>` may be `all` or comma-separated names (`claude,deepseek`); this fans out into one thread per peer. Refuses unknown refs and stale recipients. |
 | `agent-inbox [--json] [--no-stale\|--only-stale] [--no-stuck\|--only-stuck] [--stuck-after MIN]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. Threads whose last event is `in_progress` and older than the stuck threshold (default 10 min, configurable via `AGENT_BUS_STUCK_AFTER_MIN` env) appear with `[stuck Xm]`. |
 | `agent-done <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
 | `agent-cancel <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |
@@ -119,6 +119,24 @@ agent-done <thread-id> "did it myself, see commit abc123"
 
 The bus is never mutated retroactively — every action is a new event
 appended to the chain. Past state is always inspectable.
+
+## Broadcast asks
+
+Use broadcast when you want independent opinions from multiple agents:
+
+```sh
+agent-send all ask "Review this approach and reply GO/NO-GO"
+agent-send claude,deepseek ask "Compare these two options"
+```
+
+Broadcast is intentionally a fan-out: it appends one normal root event per
+recipient and returns one id per line. The on-disk schema stays unchanged
+(`to` is always a string), so each recipient owns a separate thread and can
+ack, block, or done without affecting the others.
+
+Broadcast is only supported for `ask`. `handoff` is deliberately excluded
+because broadcasting the same `paths_claimed` would make file ownership
+ambiguous.
 
 ## Event schema
 

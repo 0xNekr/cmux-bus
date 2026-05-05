@@ -46,6 +46,32 @@ partial JSON into `bus.jsonl`.
 When `ref` is not `null`, it must point to an existing event id in the
 same `bus.jsonl`. Writers should refuse orphan references.
 
+## Broadcast asks
+
+`agent-send` may broadcast an `ask` to multiple peers:
+
+```sh
+agent-send all ask "Review this and reply GO/NO-GO"
+agent-send claude,deepseek ask "Compare these options"
+```
+
+Broadcast is a command-level fan-out, not a new event shape. It appends one
+normal root event per recipient, each with a string `to` field, and returns
+one event id per line. This preserves the existing thread model: every peer
+gets an independent thread, so one peer's `ack`, `done`, or `block` cannot
+hide or close another peer's work.
+
+Rules:
+
+- Broadcast is only supported for `type=ask`.
+- `all` expands to registered agents except the sender.
+- Comma-separated recipients are trimmed, deduplicated, and self is removed.
+- If no recipients remain after expansion, the command fails.
+- If any recipient is unknown or stale, the whole command fails without
+  appending events or sending signals.
+- `user` may appear in a comma-separated broadcast. It gets a normal event
+  with no cmux signal.
+
 ## Routing defaults
 
 These are conventions, not enforced rules:

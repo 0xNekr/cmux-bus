@@ -26,6 +26,7 @@ if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-he
     cat <<'OUT'
 surface:1 s1 type=terminal in_window=true
 surface:2 s2 type=terminal in_window=true
+surface:3 s3 type=terminal in_window=true
 OUT
     exit 0
 fi
@@ -71,7 +72,7 @@ new_workspace() {
 
 write_agents() {
     mkdir -p .agents
-    printf '%s\n' '{"agents":{"codex":"s1","claude":"s2"}}' > .agents/agents.json
+    printf '%s\n' '{"agents":{"codex":"s1","claude":"s2","deepseek":"s3"}}' > .agents/agents.json
     touch .agents/bus.jsonl
 }
 
@@ -215,6 +216,114 @@ test_agent_send_peer_paths_status_and_signal() {
     )
 
     pass "agent-send records paths/status and signals peer"
+}
+
+test_agent_send_broadcast_fanout() {
+    local fakebin workspace cmux_log ids
+    fakebin="$tmp_root/fakebin-send-broadcast"
+    workspace="$(new_workspace send-broadcast)"
+    cmux_log="$tmp_root/cmux-send-broadcast.log"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        ids=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" all ask "broadcast task")
+        [ "$(printf '%s\n' "$ids" | wc -l | tr -d ' ')" = "2" ] || fail "broadcast did not print two ids"
+        [ "$(jq -s length .agents/bus.jsonl)" = "2" ] || fail "broadcast did not append two events"
+        jq -s -e '
+            length == 2
+            and ([.[].to] | sort) == ["claude","deepseek"]
+            and all(.[]; .from == "codex" and .type == "ask" and .status == "open" and .body == "broadcast task")
+        ' .agents/bus.jsonl >/dev/null
+        grep -q "send --surface s2 new ask id=" "$cmux_log"
+        grep -q "send --surface s3 new ask id=" "$cmux_log"
+    )
+
+    pass "agent-send broadcasts to all peers as fan-out events"
+}
+
+test_agent_send_broadcast_rejects_invalid_batch() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-send-broadcast-invalid"
+    workspace="$(new_workspace send-broadcast-invalid)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude,missing ask "bad broadcast" >/dev/null 2>&1; then
+            fail "broadcast accepted an unknown recipient"
+        fi
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"user",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"root"}' > .agents/bus.jsonl
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude,deepseek ask --ref root1234 "bad broadcast" 2>err.out; then
+            fail "broadcast accepted --ref"
+        fi
+        grep -q "broadcast with --ref is not supported" err.out
+        : > .agents/bus.jsonl
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude,deepseek handoff "bad broadcast" >/dev/null 2>&1; then
+            fail "broadcast accepted a non-ask type"
+        fi
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "0" ] || fail "invalid broadcast appended to bus"
+    )
+
+    pass "agent-send rejects invalid broadcast batches without appending"
+}
+
+test_agent_send_broadcast_normalizes_recipients() {
+    local fakebin workspace ids
+    fakebin="$tmp_root/fakebin-send-broadcast-normalize"
+    workspace="$(new_workspace send-broadcast-normalize)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        ids=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" "codex, claude, claude" ask "normalized")
+        [ "$(printf '%s\n' "$ids" | wc -l | tr -d ' ')" = "1" ] || fail "normalized broadcast did not print one id"
+        jq -s -e 'length == 1 and .[0].to == "claude" and .[0].from == "codex"' .agents/bus.jsonl >/dev/null
+    )
+
+    pass "agent-send filters self and deduplicates broadcast recipients"
+}
+
+test_agent_send_broadcast_allows_user_in_csv() {
+    local fakebin workspace cmux_log ids
+    fakebin="$tmp_root/fakebin-send-broadcast-user"
+    workspace="$(new_workspace send-broadcast-user)"
+    cmux_log="$tmp_root/cmux-send-broadcast-user.log"
+    make_fake_cmux "$fakebin"
+    : > "$cmux_log"
+
+    (
+        cd "$workspace"
+        write_agents
+        ids=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude,user ask "agent plus user")
+        [ "$(printf '%s\n' "$ids" | wc -l | tr -d ' ')" = "2" ] || fail "agent+user broadcast did not print two ids"
+        jq -s -e 'length == 2 and ([.[].to] | sort) == ["claude","user"]' .agents/bus.jsonl >/dev/null
+        grep -q "send --surface s2 new ask id=" "$cmux_log"
+        [ "$(grep -c "send --surface" "$cmux_log")" = "1" ] || fail "user recipient should not receive a cmux signal"
+    )
+
+    pass "agent-send broadcasts to agents and user without signaling user"
+}
+
+test_agent_send_broadcast_rejects_stale_batch() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-send-broadcast-stale"
+    workspace="$(new_workspace send-broadcast-stale)"
+    make_fake_cmux_live_s1_only "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" all ask "stale broadcast" >/dev/null 2>&1; then
+            fail "broadcast accepted stale recipients"
+        fi
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "0" ] || fail "stale broadcast appended to bus"
+    )
+
+    pass "agent-send rejects stale broadcast batches without appending"
 }
 
 test_agent_send_rejects_invalid_recipient_type_and_status() {
@@ -507,6 +616,11 @@ test_agent_init_is_idempotent
 test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal
+test_agent_send_broadcast_fanout
+test_agent_send_broadcast_rejects_invalid_batch
+test_agent_send_broadcast_normalizes_recipients
+test_agent_send_broadcast_allows_user_in_csv
+test_agent_send_broadcast_rejects_stale_batch
 test_agent_send_rejects_invalid_recipient_type_and_status
 test_agent_send_user_does_not_signal
 test_agent_send_rejects_stale_recipient
