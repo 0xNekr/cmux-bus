@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# agent-watch [--once] [--me] [--lines N] [--interval SEC]
+# Watch bus events as they are appended.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: agent-watch [--once] [--me] [--lines N] [--interval SEC]" >&2
+    exit 2
+}
+
+once=0
+me_only=0
+lines=20
+interval=1
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --once) once=1; shift;;
+        --me) me_only=1; shift;;
+        --lines)
+            [ $# -ge 2 ] || usage
+            lines="$2"
+            shift 2
+            ;;
+        --interval)
+            [ $# -ge 2 ] || usage
+            interval="$2"
+            shift 2
+            ;;
+        --*) echo "agent-watch: unknown flag '$1'" >&2; exit 2;;
+        *) usage;;
+    esac
+done
+
+case "$lines" in ''|*[!0-9]*) echo "agent-watch: --lines must be a non-negative integer" >&2; exit 2;; esac
+case "$interval" in ''|*[!0-9.]*) echo "agent-watch: --interval must be a positive number" >&2; exit 2;; esac
+if ! jq -en --arg interval "$interval" '($interval | tonumber) > 0' >/dev/null 2>&1; then
+    echo "agent-watch: --interval must be a positive number" >&2
+    exit 2
+fi
+
+[ -f .agents/bus.jsonl ] || {
+    echo "agent-watch: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+
+me=""
+if [ "$me_only" -eq 1 ]; then
+    [ -f .agents/agents.json ] || {
+        echo "agent-watch: no .agents/agents.json — run 'agent-init <your_name>' first" >&2
+        exit 1
+    }
+    my_surface="${CMUX_SURFACE_ID:-}"
+    [ -n "$my_surface" ] || {
+        echo "agent-watch: CMUX_SURFACE_ID not set" >&2
+        exit 1
+    }
+    me=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' .agents/agents.json | head -n1)
+    [ -n "$me" ] || {
+        echo "agent-watch: this surface is not registered — run 'agent-init <your_name>' first" >&2
+        exit 1
+    }
+fi
+
+print_events() {
+    jq -r --arg me "$me" '
+        select(type=="object" and .id)
+        | select(($me == "") or (.from == $me) or (.to == $me))
+        | [
+            .ts,
+            .id,
+            .type,
+            .status,
+            (.from + "->" + .to),
+            (.body | gsub("[\r\n]+";" "))
+          ]
+        | @tsv
+    ' | while IFS=$'\t' read -r ts id type status route body; do
+        printf '%s %-8s %-12s %-10s %-21s %s\n' "$ts" "$id" "$type" "$status" "$route" "$body"
+    done
+}
+
+if [ "$once" -eq 1 ]; then
+    if [ "$lines" -eq 0 ]; then
+        cat .agents/bus.jsonl | print_events
+    else
+        tail -n "$lines" .agents/bus.jsonl | print_events
+    fi
+    exit 0
+fi
+
+tail -n "$lines" .agents/bus.jsonl | print_events
+seen_lines=$(wc -l < .agents/bus.jsonl | tr -d ' ')
+while :; do
+    sleep "$interval"
+    current_lines=$(wc -l < .agents/bus.jsonl | tr -d ' ')
+    if [ "$current_lines" -gt "$seen_lines" ]; then
+        tail -n $((current_lines - seen_lines)) .agents/bus.jsonl | print_events
+        seen_lines="$current_lines"
+    elif [ "$current_lines" -lt "$seen_lines" ]; then
+        seen_lines="$current_lines"
+    fi
+done

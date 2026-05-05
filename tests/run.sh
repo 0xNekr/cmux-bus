@@ -161,7 +161,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-thread; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-thread agent-watch; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -648,6 +648,61 @@ test_agent_thread_json_and_unknown_id() {
     pass "agent-thread supports JSON output and rejects unknown ids"
 }
 
+test_agent_watch_snapshot() {
+    local workspace output
+    workspace="$(new_workspace watch-snapshot)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"first"}' > .agents/bus.jsonl
+        jq -nc '{id:"ack12345",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"ack",ref:"root1234",status:"in_progress",paths_claimed:[],body:"second line"}' >> .agents/bus.jsonl
+        output=$("$repo_root/bin/agent-watch" --once --lines 1)
+        printf '%s\n' "$output" | grep -q "ack12345"
+        printf '%s\n' "$output" | grep -q "codex->claude"
+        printf '%s\n' "$output" | grep -q "second line"
+        if printf '%s\n' "$output" | grep -q "root1234"; then
+            fail "agent-watch --lines 1 printed older events"
+        fi
+    )
+
+    pass "agent-watch renders a bounded snapshot"
+}
+
+test_agent_watch_filters_current_agent() {
+    local workspace output
+    workspace="$(new_workspace watch-me)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"forcodex",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"for codex"}' > .agents/bus.jsonl
+        jq -nc '{id:"otherone",ts:"2026-05-05T00:01:00Z",from:"claude",to:"deepseek",type:"ask",ref:null,status:"open",paths_claimed:[],body:"for other"}' >> .agents/bus.jsonl
+        output=$(CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-watch" --once --me --lines 0)
+        printf '%s\n' "$output" | grep -q "forcodex"
+        if printf '%s\n' "$output" | grep -q "otherone"; then
+            fail "agent-watch --me printed unrelated events"
+        fi
+    )
+
+    pass "agent-watch filters events for the current agent"
+}
+
+test_agent_watch_rejects_zero_interval() {
+    local workspace
+    workspace="$(new_workspace watch-zero-interval)"
+
+    (
+        cd "$workspace"
+        write_agents
+        if "$repo_root/bin/agent-watch" --interval 0 >/dev/null 2>&1; then
+            fail "agent-watch accepted zero interval"
+        fi
+    )
+
+    pass "agent-watch rejects zero polling interval"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_rejects_invalid_input
@@ -676,5 +731,8 @@ test_agent_doctor_reports_bus_problems
 test_agent_doctor_reports_malformed_jsonl
 test_agent_thread_shows_history
 test_agent_thread_json_and_unknown_id
+test_agent_watch_snapshot
+test_agent_watch_filters_current_agent
+test_agent_watch_rejects_zero_interval
 
 echo "passed $pass_count tests"
