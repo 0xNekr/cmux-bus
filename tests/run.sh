@@ -161,7 +161,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-thread; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -609,6 +609,45 @@ test_agent_doctor_reports_malformed_jsonl() {
     pass "agent-doctor reports malformed JSONL"
 }
 
+test_agent_thread_shows_history() {
+    local workspace output
+    workspace="$(new_workspace thread-history)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"handoff",ref:null,status:"open",paths_claimed:["src/a.ts"],body:"root body"}' > .agents/bus.jsonl
+        jq -nc '{id:"ack12345",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"ack",ref:"root1234",status:"in_progress",paths_claimed:[],body:"working"}' >> .agents/bus.jsonl
+        jq -nc '{id:"done1234",ts:"2026-05-05T00:02:00Z",from:"codex",to:"claude",type:"done",ref:"root1234",status:"done",paths_claimed:[],body:"done body"}' >> .agents/bus.jsonl
+        output=$("$repo_root/bin/agent-thread" ack12345)
+        printf '%s\n' "$output" | grep -q "thread: root1234"
+        printf '%s\n' "$output" | grep -q "events: 3"
+        printf '%s\n' "$output" | grep -q "status: done"
+        printf '%s\n' "$output" | grep -q "root body"
+        printf '%s\n' "$output" | grep -q "done body"
+    )
+
+    pass "agent-thread shows full thread history"
+}
+
+test_agent_thread_json_and_unknown_id() {
+    local workspace
+    workspace="$(new_workspace thread-json)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"question"}' > .agents/bus.jsonl
+        "$repo_root/bin/agent-thread" --json root1234 > thread.json
+        jq -e 'length == 1 and .[0].id == "root1234" and .[0].root == "root1234"' thread.json >/dev/null
+        if "$repo_root/bin/agent-thread" missing99 >/dev/null 2>&1; then
+            fail "agent-thread accepted unknown id"
+        fi
+    )
+
+    pass "agent-thread supports JSON output and rejects unknown ids"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_rejects_invalid_input
@@ -635,5 +674,7 @@ test_agent_inbox_stale_and_stuck
 test_agent_doctor_ok_and_summary
 test_agent_doctor_reports_bus_problems
 test_agent_doctor_reports_malformed_jsonl
+test_agent_thread_shows_history
+test_agent_thread_json_and_unknown_id
 
 echo "passed $pass_count tests"
