@@ -40,6 +40,28 @@ CMUX
     chmod +x "$dir/cmux"
 }
 
+make_fake_cmux_live_s1_only() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    cat <<'OUT'
+surface:1 s1 type=terminal in_window=true
+OUT
+    exit 0
+fi
+if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
+    if [ -n "${CMUX_LOG:-}" ]; then
+        printf '%s\n' "$*" >> "$CMUX_LOG"
+    fi
+    exit 0
+fi
+exit 0
+CMUX
+    chmod +x "$dir/cmux"
+}
+
 new_workspace() {
     local name="$1"
     local dir="$tmp_root/$name"
@@ -89,6 +111,45 @@ test_agent_init_via_symlink() {
     )
 
     pass "agent-init resolves repo files through symlink"
+}
+
+test_agent_init_rejects_invalid_input() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-init-invalid"
+    workspace="$(new_workspace init-invalid)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        for name in 1foo Foo 'foo!' aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; do
+            if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" "$name" >/dev/null 2>&1; then
+                fail "agent-init accepted invalid name $name"
+            fi
+        done
+        if PATH="$fakebin:$PATH" env -u CMUX_SURFACE_ID "$repo_root/bin/agent-init" codex >/dev/null 2>&1; then
+            fail "agent-init accepted missing CMUX_SURFACE_ID"
+        fi
+    )
+
+    pass "agent-init rejects invalid names and missing surface"
+}
+
+test_agent_init_is_idempotent() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-init-idempotent"
+    workspace="$(new_workspace init-idempotent)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" codex >/dev/null
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" codex >/dev/null
+        [ "$(grep -c 'agent-bus:start v1' AGENTS.md)" = "1" ] || fail "AGENTS block duplicated"
+        [ "$(grep -cFx ".agents/" .gitignore)" = "1" ] || fail ".gitignore duplicated .agents/"
+        jq -e '.agents == {"codex":"s1"}' .agents/agents.json >/dev/null
+    )
+
+    pass "agent-init keeps AGENTS.md and .gitignore idempotent"
 }
 
 test_install_links_all_commands() {
@@ -156,6 +217,67 @@ test_agent_send_peer_paths_status_and_signal() {
     pass "agent-send records paths/status and signals peer"
 }
 
+test_agent_send_rejects_invalid_recipient_type_and_status() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-send-invalid"
+    workspace="$(new_workspace send-invalid)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" unknown ask "body" >/dev/null 2>&1; then
+            fail "agent-send accepted unknown recipient"
+        fi
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude bogus "body" >/dev/null 2>&1; then
+            fail "agent-send accepted invalid type"
+        fi
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude ask --status weird "body" >/dev/null 2>&1; then
+            fail "agent-send accepted invalid status"
+        fi
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "0" ] || fail "invalid agent-send calls appended to bus"
+    )
+
+    pass "agent-send rejects invalid recipient, type, and status"
+}
+
+test_agent_send_user_does_not_signal() {
+    local fakebin workspace cmux_log
+    fakebin="$tmp_root/fakebin-send-user"
+    workspace="$(new_workspace send-user)"
+    cmux_log="$tmp_root/cmux-send-user.log"
+    make_fake_cmux "$fakebin"
+    : > "$cmux_log"
+
+    (
+        cd "$workspace"
+        write_agents
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" user block "to user" >/dev/null
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "1" ] || fail "send to user did not append"
+        [ ! -s "$cmux_log" ] || fail "send to user signaled cmux"
+    )
+
+    pass "agent-send to user appends without cmux signal"
+}
+
+test_agent_send_rejects_stale_recipient() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-send-stale"
+    workspace="$(new_workspace send-stale)"
+    make_fake_cmux_live_s1_only "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude ask "body" >/dev/null 2>&1; then
+            fail "agent-send accepted stale recipient"
+        fi
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "0" ] || fail "stale recipient appended to bus"
+    )
+
+    pass "agent-send rejects stale recipients without appending"
+}
+
 test_agent_send_multiline_body() {
     local workspace
     workspace="$(new_workspace multiline)"
@@ -197,6 +319,22 @@ test_agent_done_smoke() {
     )
 
     pass "agent-done appends done event and signals originator"
+}
+
+test_agent_done_rejects_unknown_id() {
+    local workspace
+    workspace="$(new_workspace done-missing)"
+
+    (
+        cd "$workspace"
+        write_agents
+        if CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-done" missing99 "done" >/dev/null 2>&1; then
+            fail "agent-done accepted unknown id"
+        fi
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "0" ] || fail "agent-done unknown id appended to bus"
+    )
+
+    pass "agent-done rejects unknown ids without appending"
 }
 
 test_concurrent_writes_stay_valid() {
@@ -250,6 +388,40 @@ test_agent_cancel_and_resume_smoke() {
     pass "agent-resume and agent-cancel append expected recovery events"
 }
 
+test_agent_cancel_and_resume_negative_cases() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-recovery-negative"
+    workspace="$(new_workspace recovery-negative)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"do work"}' > .agents/bus.jsonl
+        jq -nc '{id:"done1234",ts:"2026-05-05T00:01:00Z",from:"claude",to:"codex",type:"done",ref:"root1234",status:"done",paths_claimed:[],body:"done"}' >> .agents/bus.jsonl
+        jq -nc '{id:"userroot",ts:"2026-05-05T00:02:00Z",from:"codex",to:"user",type:"block",ref:null,status:"blocked",paths_claimed:[],body:"user root"}' >> .agents/bus.jsonl
+
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-cancel" missing99 >/dev/null 2>&1; then
+            fail "agent-cancel accepted unknown id"
+        fi
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-resume" missing99 >/dev/null 2>&1; then
+            fail "agent-resume accepted unknown id"
+        fi
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-cancel" root1234 >/dev/null 2>&1; then
+            fail "agent-cancel accepted done thread without --force"
+        fi
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-resume" root1234 >/dev/null 2>&1; then
+            fail "agent-resume accepted done thread without --force"
+        fi
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-resume" userroot >/dev/null 2>&1; then
+            fail "agent-resume accepted user recipient"
+        fi
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "3" ] || fail "negative recovery calls appended to bus"
+    )
+
+    pass "agent-cancel and agent-resume reject invalid recovery cases"
+}
+
 test_agent_inbox_stale_and_stuck() {
     local workspace old_ts
     workspace="$(new_workspace inbox)"
@@ -271,14 +443,21 @@ test_agent_inbox_stale_and_stuck() {
 
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
+test_agent_init_rejects_invalid_input
+test_agent_init_is_idempotent
 test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal
+test_agent_send_rejects_invalid_recipient_type_and_status
+test_agent_send_user_does_not_signal
+test_agent_send_rejects_stale_recipient
 test_agent_send_multiline_body
 test_agent_done_smoke
+test_agent_done_rejects_unknown_id
 test_concurrent_writes_stay_valid
 test_agent_inbox_empty_bus
 test_agent_cancel_and_resume_smoke
+test_agent_cancel_and_resume_negative_cases
 test_agent_inbox_stale_and_stuck
 
 echo "passed $pass_count tests"
