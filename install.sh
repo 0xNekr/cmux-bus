@@ -6,7 +6,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src_bin="$repo_root/bin"
-tools=(agent-init agent-send agent-inbox agent-done agent-cancel agent-resume)
+tools=(agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor)
 
 missing=()
 command -v jq >/dev/null 2>&1 || missing+=("jq")

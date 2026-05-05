@@ -96,6 +96,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | `agent-done <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
 | `agent-cancel <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |
 | `agent-resume <id> [--force] [body]` | Re-open a stuck/crashed thread by appending a fresh `handoff` to its **original recipient**. Default body: `RESUME: <previous>`. Refuses if the thread is already done/blocked unless `--force`. |
+| `agent-doctor` | Validate the local bus and registry without mutating anything. Reports malformed JSONL, schema errors, duplicate ids, orphan refs, and open/stale/stuck thread counts. |
 
 ## Recovery — what to do when a peer crashes
 

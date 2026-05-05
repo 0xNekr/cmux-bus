@@ -20,6 +20,7 @@ Covered areas:
 - `agent-done` signaling and unknown ids
 - `agent-cancel` and `agent-resume` recovery events and rejection paths
 - `agent-inbox` empty, stale, and stuck cases
+- `agent-doctor` ok summaries, duplicate ids, orphan refs, and malformed JSONL
 
 The fake `cmux` implements only the contract the scripts need:
 

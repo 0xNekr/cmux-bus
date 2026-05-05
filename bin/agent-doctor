@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# agent-doctor
+# Read-only diagnostics for a cmux-bus workspace.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: agent-doctor" >&2
+    exit 2
+}
+
+[ $# -eq 0 ] || usage
+
+problem_count=0
+event_tmp=""
+cleanup() {
+    [ -n "$event_tmp" ] && rm -f "$event_tmp"
+}
+trap cleanup EXIT
+
+problem() {
+    problem_count=$((problem_count + 1))
+    echo "problem: $*"
+}
+
+[ -d .agents ] || {
+    echo "agent-doctor: no .agents/ here — run 'agent-init <your_name>' first" >&2
+    exit 2
+}
+
+agents_file=".agents/agents.json"
+bus_file=".agents/bus.jsonl"
+
+if [ ! -f "$agents_file" ]; then
+    problem "missing $agents_file"
+else
+    if ! jq -e '.agents and (.agents | type == "object")' "$agents_file" >/dev/null 2>&1; then
+        problem "$agents_file is malformed or missing .agents object"
+    fi
+fi
+
+if [ ! -f "$bus_file" ]; then
+    problem "missing $bus_file"
+fi
+
+if [ "$problem_count" -gt 0 ]; then
+    echo "agent-doctor: $problem_count problem(s) found"
+    exit 1
+fi
+
+event_tmp="$(mktemp)"
+line_no=0
+while IFS= read -r line || [ -n "$line" ]; do
+    line_no=$((line_no + 1))
+    [ -n "$line" ] || {
+        problem "line $line_no: empty line"
+        continue
+    }
+    if ! printf '%s\n' "$line" | jq -e '
+        type == "object"
+        and (.id | type == "string" and length > 0)
+        and (.ts | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+        and (.from | type == "string" and length > 0)
+        and (.to | type == "string" and length > 0)
+        and (.type | IN("ask","handoff","done","block","ack"))
+        and ((.ref == null) or (.ref | type == "string" and length > 0))
+        and (.status | IN("open","in_progress","done","blocked"))
+        and (.paths_claimed | type == "array" and all(.[]; type == "string"))
+        and (.body | type == "string")
+    ' >/dev/null 2>&1; then
+        problem "line $line_no: invalid event JSON/schema"
+        continue
+    fi
+    printf '%s\n' "$line" >> "$event_tmp"
+done < "$bus_file"
+
+if [ -s "$event_tmp" ]; then
+    duplicate_ids=$(jq -rs '[.[].id] | group_by(.) | map(select(length > 1) | .[0]) | .[]' "$event_tmp")
+    if [ -n "$duplicate_ids" ]; then
+        while IFS= read -r id; do
+            problem "duplicate event id $id"
+        done <<EOF
+$duplicate_ids
+EOF
+    fi
+
+    orphan_refs=$(jq -rs '
+        (map(.id) | unique) as $ids |
+        map(select(.ref != null and (.ref as $ref | (($ids | index($ref)) | not))) | [.id, .ref] | @tsv) | .[]
+    ' "$event_tmp")
+    if [ -n "$orphan_refs" ]; then
+        while IFS=$'\t' read -r id ref; do
+            problem "event $id references missing id $ref"
+        done <<EOF
+$orphan_refs
+EOF
+    fi
+fi
+
+if [ "$problem_count" -gt 0 ]; then
+    echo "agent-doctor: $problem_count problem(s) found"
+    exit 1
+fi
+
+event_count=0
+open_count=0
+stale_count=0
+stuck_count=0
+
+if [ -s "$event_tmp" ]; then
+    agents_json=$(jq -c '.agents' "$agents_file")
+    now=$(date -u +%s)
+    summary=$(jq -rs --argjson agents "$agents_json" --argjson now "$now" '
+        def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
+        def epoch($ts): ($ts|strptime("%Y-%m-%dT%H:%M:%SZ")|mktime);
+        (map({key:.id,value:.})|from_entries) as $m |
+        (map(.+{root:root($m;.)}) | group_by(.root) | map({root:.[0].root,last:.[-1]})) as $threads |
+        {
+            events: length,
+            open_threads: ($threads | map(select(.last.status | IN("done","blocked") | not)) | length),
+            stale_threads: ($threads | map(select((.last.status | IN("done","blocked") | not) and ($agents[.last.from] == null))) | length),
+            stuck_threads: ($threads | map(select(.last.status == "in_progress" and ((($now - epoch(.last.ts)) / 60 | floor) >= 10))) | length)
+        }
+    ' "$event_tmp")
+    event_count=$(printf '%s' "$summary" | jq -r .events)
+    open_count=$(printf '%s' "$summary" | jq -r .open_threads)
+    stale_count=$(printf '%s' "$summary" | jq -r .stale_threads)
+    stuck_count=$(printf '%s' "$summary" | jq -r .stuck_threads)
+fi
+
+echo "agent-doctor: ok"
+echo "events: $event_count"
+echo "open_threads: $open_count"
+echo "stale_threads: $stale_count"
+echo "stuck_threads: $stuck_count"

@@ -160,7 +160,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -441,6 +441,65 @@ test_agent_inbox_stale_and_stuck() {
     pass "agent-inbox reports stale and stuck threads"
 }
 
+test_agent_doctor_ok_and_summary() {
+    local workspace old_ts output
+    workspace="$(new_workspace doctor-ok)"
+    old_ts="$(date -u -v-20M +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date -u -d '20 minutes ago' +"%Y-%m-%dT%H:%M:%SZ")"
+
+    (
+        cd "$workspace"
+        mkdir -p .agents
+        printf '%s\n' '{"agents":{"codex":"s1"}}' > .agents/agents.json
+        jq -nc --arg ts "$old_ts" '{id:"root1234",ts:$ts,from:"ghost",to:"codex",type:"ack",ref:null,status:"in_progress",paths_claimed:[],body:"working"}' > .agents/bus.jsonl
+        output=$("$repo_root/bin/agent-doctor")
+        printf '%s\n' "$output" | grep -q "agent-doctor: ok"
+        printf '%s\n' "$output" | grep -q "events: 1"
+        printf '%s\n' "$output" | grep -q "open_threads: 1"
+        printf '%s\n' "$output" | grep -q "stale_threads: 1"
+        printf '%s\n' "$output" | grep -q "stuck_threads: 1"
+    )
+
+    pass "agent-doctor reports ok summary"
+}
+
+test_agent_doctor_reports_bus_problems() {
+    local workspace
+    workspace="$(new_workspace doctor-problems)"
+
+    (
+        cd "$workspace"
+        mkdir -p .agents
+        printf '%s\n' '{"agents":{"codex":"s1"}}' > .agents/agents.json
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"root"}' > .agents/bus.jsonl
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"dupe"}' >> .agents/bus.jsonl
+        jq -nc '{id:"child123",ts:"2026-05-05T00:02:00Z",from:"codex",to:"claude",type:"ask",ref:"missing99",status:"open",paths_claimed:[],body:"orphan"}' >> .agents/bus.jsonl
+        if "$repo_root/bin/agent-doctor" > doctor.out; then
+            fail "agent-doctor accepted duplicate/orphan refs"
+        fi
+        grep -q "duplicate event id root1234" doctor.out
+        grep -q "event child123 references missing id missing99" doctor.out
+    )
+
+    pass "agent-doctor reports duplicate ids and orphan refs"
+}
+
+test_agent_doctor_reports_malformed_jsonl() {
+    local workspace
+    workspace="$(new_workspace doctor-malformed)"
+
+    (
+        cd "$workspace"
+        write_agents
+        printf '%s\n' '{"id":"broken"' > .agents/bus.jsonl
+        if "$repo_root/bin/agent-doctor" > doctor.out; then
+            fail "agent-doctor accepted malformed JSONL"
+        fi
+        grep -q "line 1: invalid event JSON/schema" doctor.out
+    )
+
+    pass "agent-doctor reports malformed JSONL"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_rejects_invalid_input
@@ -459,5 +518,8 @@ test_agent_inbox_empty_bus
 test_agent_cancel_and_resume_smoke
 test_agent_cancel_and_resume_negative_cases
 test_agent_inbox_stale_and_stuck
+test_agent_doctor_ok_and_summary
+test_agent_doctor_reports_bus_problems
+test_agent_doctor_reports_malformed_jsonl
 
 echo "passed $pass_count tests"
