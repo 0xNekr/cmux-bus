@@ -156,7 +156,11 @@ fi
 agents_md="AGENTS.md"
 mark_start="<!-- agent-bus:start v1 -->"
 mark_end="<!-- agent-bus:end v1 -->"
-block=$(cat <<'BLOCK'
+agents_block_src="$repo_root/templates/AGENTS-block.md"
+if [ -f "$agents_block_src" ]; then
+    block=$(cat "$agents_block_src")
+else
+    block=$(cat <<'BLOCK'
 <!-- agent-bus:start v1 -->
 ## Multi-agent bus (cmux)
 
@@ -179,6 +183,7 @@ Peers and surfaces are listed in `.agents/agents.json`.
 <!-- agent-bus:end v1 -->
 BLOCK
 )
+fi
 
 if [ ! -f "$agents_md" ]; then
     printf '%s\n' "$block" > "$agents_md"

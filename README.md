@@ -62,9 +62,10 @@ agent-init codex
 
 That's the bootstrap. Each pane registers its `CMUX_SURFACE_ID` in
 `.agents/agents.json`, the bus file is created, and an `AGENTS.md` is
-written at the workspace root so any agent starting fresh in this project
-sees the protocol. The `.agents/` directory is runtime state — it is
-added to your `.gitignore` automatically and should not be committed.
+written from `templates/AGENTS-block.md` at the workspace root so any agent
+starting fresh in this project sees the protocol. The `.agents/` directory
+is runtime state — it is added to your `.gitignore` automatically and
+should not be committed.
 
 Now from Claude:
 
