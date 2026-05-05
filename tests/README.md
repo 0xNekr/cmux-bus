@@ -23,6 +23,7 @@ Covered areas:
 - `agent-doctor` ok summaries, duplicate ids, orphan refs, and malformed JSONL
 - `agent-thread` text and JSON history rendering
 - `agent-watch` snapshots and current-agent filtering
+- `agent-wait` final-status waits, timeouts, and unknown ids
 
 The fake `cmux` implements only the contract the scripts need:
 

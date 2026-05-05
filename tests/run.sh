@@ -161,7 +161,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-thread agent-watch; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-thread agent-watch agent-wait; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -703,6 +703,42 @@ test_agent_watch_rejects_zero_interval() {
     pass "agent-watch rejects zero polling interval"
 }
 
+test_agent_wait_returns_final_event() {
+    local workspace
+    workspace="$(new_workspace wait-final)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"question"}' > .agents/bus.jsonl
+        jq -nc '{id:"done1234",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"done",ref:"root1234",status:"done",paths_claimed:[],body:"answer"}' >> .agents/bus.jsonl
+        "$repo_root/bin/agent-wait" root1234 > wait.json
+        jq -e '.id == "done1234" and .status == "done" and .root == "root1234" and .body == "answer"' wait.json >/dev/null
+        "$repo_root/bin/agent-wait" --status done done1234 | jq -e '.id == "done1234"' >/dev/null
+    )
+
+    pass "agent-wait returns the final event for a completed thread"
+}
+
+test_agent_wait_timeout_and_unknown_id() {
+    local workspace
+    workspace="$(new_workspace wait-timeout)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"question"}' > .agents/bus.jsonl
+        if "$repo_root/bin/agent-wait" --timeout 0 --interval 0.1 root1234 >/dev/null 2>&1; then
+            fail "agent-wait did not time out"
+        fi
+        if "$repo_root/bin/agent-wait" missing99 >/dev/null 2>&1; then
+            fail "agent-wait accepted unknown id"
+        fi
+    )
+
+    pass "agent-wait times out and rejects unknown ids"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_rejects_invalid_input
@@ -734,5 +770,7 @@ test_agent_thread_json_and_unknown_id
 test_agent_watch_snapshot
 test_agent_watch_filters_current_agent
 test_agent_watch_rejects_zero_interval
+test_agent_wait_returns_final_event
+test_agent_wait_timeout_and_unknown_id
 
 echo "passed $pass_count tests"

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# agent-wait [--timeout SEC] [--interval SEC] [--status done|blocked|final] <id>
+# Wait until a thread reaches a target status.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: agent-wait [--timeout SEC] [--interval SEC] [--status done|blocked|final] <id>" >&2
+    exit 2
+}
+
+timeout=600
+interval=1
+target_status=final
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --timeout)
+            [ $# -ge 2 ] || usage
+            timeout="$2"
+            shift 2
+            ;;
+        --interval)
+            [ $# -ge 2 ] || usage
+            interval="$2"
+            shift 2
+            ;;
+        --status)
+            [ $# -ge 2 ] || usage
+            target_status="$2"
+            shift 2
+            ;;
+        --*) echo "agent-wait: unknown flag '$1'" >&2; exit 2;;
+        *) break;;
+    esac
+done
+
+[ $# -eq 1 ] || usage
+id="$1"
+
+case "$timeout" in ''|*[!0-9]*) echo "agent-wait: --timeout must be a non-negative integer" >&2; exit 2;; esac
+case "$interval" in ''|*[!0-9.]*) echo "agent-wait: --interval must be a positive number" >&2; exit 2;; esac
+if ! jq -en --arg interval "$interval" '($interval | tonumber) > 0' >/dev/null 2>&1; then
+    echo "agent-wait: --interval must be a positive number" >&2
+    exit 2
+fi
+case "$target_status" in
+    done|blocked|final) ;;
+    *) echo "agent-wait: --status must be done, blocked, or final" >&2; exit 2;;
+esac
+
+[ -f .agents/bus.jsonl ] || {
+    echo "agent-wait: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+
+thread_last() {
+    jq -s --arg id "$id" '
+        def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
+        map(select(type=="object" and .id)) as $events |
+        ($events | map({key:.id,value:.}) | from_entries) as $m |
+        if $m[$id] == null then
+            null
+        else
+            root($m;$m[$id]) as $root |
+            $events
+            | map(. + {root: root($m;.)})
+            | map(select(.root == $root))
+            | last
+        end
+    ' .agents/bus.jsonl
+}
+
+matches_target() {
+    local status="$1"
+    case "$target_status" in
+        final) [ "$status" = done ] || [ "$status" = blocked ];;
+        *) [ "$status" = "$target_status" ];;
+    esac
+}
+
+deadline=$(( $(date +%s) + timeout ))
+while :; do
+    last="$(thread_last)"
+    [ "$last" != null ] || {
+        echo "agent-wait: unknown event id '$id'" >&2
+        exit 1
+    }
+    status="$(printf '%s' "$last" | jq -r .status)"
+    if matches_target "$status"; then
+        printf '%s\n' "$last"
+        exit 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+        echo "agent-wait: timed out waiting for '$id' to reach $target_status (last status: $status)" >&2
+        exit 1
+    fi
+    sleep "$interval"
+done
