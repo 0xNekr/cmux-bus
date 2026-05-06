@@ -64,7 +64,9 @@ if [ "$me_only" -eq 1 ]; then
 fi
 
 print_events() {
-    jq -r --arg me "$me" '
+    jq -Rr --arg me "$me" '
+        fromjson?
+        |
         select(type=="object" and .id)
         | select(($me == "") or (.from == $me) or (.to == $me))
         | [

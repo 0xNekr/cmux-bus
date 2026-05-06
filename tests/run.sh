@@ -703,6 +703,23 @@ test_agent_watch_rejects_zero_interval() {
     pass "agent-watch rejects zero polling interval"
 }
 
+test_agent_watch_skips_malformed_lines() {
+    local workspace output
+    workspace="$(new_workspace watch-malformed)"
+
+    (
+        cd "$workspace"
+        write_agents
+        printf '%s\n' 'not json' > .agents/bus.jsonl
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"valid event"}' >> .agents/bus.jsonl
+        output=$("$repo_root/bin/agent-watch" --once --lines 0)
+        printf '%s\n' "$output" | grep -q "root1234"
+        printf '%s\n' "$output" | grep -q "valid event"
+    )
+
+    pass "agent-watch skips malformed bus lines"
+}
+
 test_agent_wait_returns_final_event() {
     local workspace
     workspace="$(new_workspace wait-final)"
@@ -770,6 +787,7 @@ test_agent_thread_json_and_unknown_id
 test_agent_watch_snapshot
 test_agent_watch_filters_current_agent
 test_agent_watch_rejects_zero_interval
+test_agent_watch_skips_malformed_lines
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
 
