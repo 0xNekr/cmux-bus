@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# agent-repair [--dry-run]
+# Repair a bus.jsonl file that contains events split by raw newlines.
+
+set -euo pipefail
+
+usage() {
+    echo "usage: agent-repair [--dry-run]" >&2
+    exit 2
+}
+
+dry_run=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dry-run) dry_run=1; shift;;
+        --*) echo "agent-repair: unknown flag '$1'" >&2; exit 2;;
+        *) usage;;
+    esac
+done
+
+[ -d .agents ] || {
+    echo "agent-repair: no .agents/ here — run 'agent-init <your_name>' first" >&2
+    exit 2
+}
+[ -f .agents/bus.jsonl ] || {
+    echo "agent-repair: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
+    exit 2
+}
+
+bus_file=".agents/bus.jsonl"
+tmp_dir="$(mktemp -d)"
+raw_file="$tmp_dir/reconstructed.jsonl"
+fixed_file="$tmp_dir/fixed.jsonl"
+report_file="$tmp_dir/report"
+
+cleanup() {
+    rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+
+awk -v out="$raw_file" -v report="$report_file" '
+function reset_state() {
+    buf = ""
+    depth = 0
+    in_string = 0
+    escaped = 0
+    start_line = 0
+}
+
+function scan(text,    i, ch) {
+    for (i = 1; i <= length(text); i++) {
+        ch = substr(text, i, 1)
+        if (in_string) {
+            if (escaped) {
+                escaped = 0
+            } else if (ch == "\\") {
+                escaped = 1
+            } else if (ch == "\"") {
+                in_string = 0
+            }
+        } else {
+            if (ch == "\"") {
+                in_string = 1
+            } else if (ch == "{") {
+                depth++
+            } else if (ch == "}") {
+                depth--
+            }
+        }
+    }
+}
+
+function emit() {
+    print buf > out
+    records++
+    reset_state()
+}
+
+BEGIN {
+    reset_state()
+}
+
+{
+    if (buf == "") {
+        if ($0 !~ /^[[:space:]]*{/) {
+            dropped++
+            printf("drop line %d: does not start with JSON object\n", NR) >> report
+            next
+        }
+        buf = $0
+        start_line = NR
+    } else {
+        buf = buf "\\n" $0
+        joined++
+    }
+
+    scan($0)
+    if (depth == 0 && !in_string && buf != "") {
+        emit()
+    }
+}
+
+END {
+    if (buf != "") {
+        dropped++
+        printf("drop lines %d-%d: unterminated JSON object\n", start_line, NR) >> report
+    }
+    printf("records=%d\njoined=%d\ndropped=%d\n", records, joined, dropped) >> report
+}
+' "$bus_file"
+
+valid_count=0
+invalid_count=0
+while IFS= read -r line || [ -n "$line" ]; do
+    if fixed=$(printf '%s\n' "$line" | jq -c '
+        . as $event |
+        (
+            type == "object"
+            and (.id | type == "string" and length > 0)
+            and (.ts | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"))
+            and (.from | type == "string" and length > 0)
+            and (.to | type == "string" and length > 0)
+            and (.type | IN("ask","handoff","done","block","ack"))
+            and ((.ref == null) or (.ref | type == "string" and length > 0))
+            and (.status | IN("open","in_progress","done","blocked"))
+            and (.paths_claimed | type == "array" and all(.[]; type == "string"))
+            and (.body | type == "string")
+        )
+        | if . then $event else empty end
+    ' 2>/dev/null); then
+        printf '%s\n' "$fixed" >> "$fixed_file"
+        valid_count=$((valid_count + 1))
+    else
+        invalid_count=$((invalid_count + 1))
+    fi
+done < "$raw_file"
+
+joined_count=$(awk -F= '$1=="joined"{print $2}' "$report_file")
+dropped_count=$(awk -F= '$1=="dropped"{print $2}' "$report_file")
+total_changes=$((joined_count + dropped_count + invalid_count))
+
+echo "agent-repair: valid_events: $valid_count"
+echo "agent-repair: joined_lines: $joined_count"
+echo "agent-repair: dropped_fragments: $dropped_count"
+echo "agent-repair: invalid_events: $invalid_count"
+
+if [ "$total_changes" -eq 0 ]; then
+    echo "agent-repair: no repairs needed"
+    exit 0
+fi
+
+if [ "$dry_run" -eq 1 ]; then
+    echo "agent-repair: dry-run only; bus was not modified"
+    exit 1
+fi
+
+backup="$bus_file.bak-$(date -u +"%Y%m%dT%H%M%SZ")"
+cp "$bus_file" "$backup"
+mv "$fixed_file" "$bus_file"
+
+echo "agent-repair: wrote repaired bus"
+echo "agent-repair: backup: $backup"

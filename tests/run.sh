@@ -161,7 +161,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-thread agent-watch agent-wait; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-thread agent-watch agent-wait; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -610,6 +610,55 @@ test_agent_doctor_reports_malformed_jsonl() {
     pass "agent-doctor reports malformed JSONL"
 }
 
+test_agent_repair_dry_run_and_fix() {
+    local workspace output
+    workspace="$(new_workspace repair)"
+
+    (
+        cd "$workspace"
+        write_agents
+        printf '%s\n' '{"id":"root1234","ts":"2026-05-05T00:00:00Z","from":"claude","to":"codex","type":"ask","ref":null,"status":"open","paths_claimed":[],"body":"line 1' > .agents/bus.jsonl
+        printf '%s\n' 'line 2"}' >> .agents/bus.jsonl
+        jq -nc '{id:"done1234",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"done",ref:"root1234",status:"done",paths_claimed:[],body:"done"}' >> .agents/bus.jsonl
+
+        if "$repo_root/bin/agent-repair" --dry-run > repair.out; then
+            fail "agent-repair dry-run should report pending repairs with non-zero exit"
+        fi
+        grep -q "joined_lines: 1" repair.out
+        if "$repo_root/bin/agent-doctor" > doctor.out; then
+            fail "agent-doctor accepted malformed bus before repair"
+        fi
+
+        output=$("$repo_root/bin/agent-repair")
+        printf '%s\n' "$output" | grep -q "wrote repaired bus"
+        [ "$(ls .agents/bus.jsonl.bak-* | wc -l | tr -d ' ')" = "1" ] || fail "agent-repair did not create a backup"
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "2" ] || fail "agent-repair did not rewrite two events"
+        jq -s -e 'length == 2 and .[0].body == "line 1\nline 2" and .[1].ref == "root1234"' .agents/bus.jsonl >/dev/null
+        "$repo_root/bin/agent-doctor" >/dev/null
+    )
+
+    pass "agent-repair dry-runs and fixes multiline bus events"
+}
+
+test_agent_repair_noop() {
+    local workspace output before after
+    workspace="$(new_workspace repair-noop)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"ok"}' > .agents/bus.jsonl
+        before=$(cat .agents/bus.jsonl)
+        output=$("$repo_root/bin/agent-repair")
+        after=$(cat .agents/bus.jsonl)
+        printf '%s\n' "$output" | grep -q "no repairs needed"
+        [ "$before" = "$after" ] || fail "agent-repair changed a clean bus"
+        [ "$(find .agents -name 'bus.jsonl.bak-*' | wc -l | tr -d ' ')" = "0" ] || fail "agent-repair created backup for clean bus"
+    )
+
+    pass "agent-repair leaves clean buses untouched"
+}
+
 test_agent_thread_shows_history() {
     local workspace output
     workspace="$(new_workspace thread-history)"
@@ -819,6 +868,8 @@ test_agent_inbox_stale_and_stuck
 test_agent_doctor_ok_and_summary
 test_agent_doctor_reports_bus_problems
 test_agent_doctor_reports_malformed_jsonl
+test_agent_repair_dry_run_and_fix
+test_agent_repair_noop
 test_agent_thread_shows_history
 test_agent_thread_json_and_unknown_id
 test_agent_watch_snapshot
