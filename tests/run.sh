@@ -177,15 +177,16 @@ test_agent_send_ref_validation() {
     (
         cd "$workspace"
         write_agents
-        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"user",to:"codex",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"root"}' > .agents/bus.jsonl
+        printf '%s\n' 'not json' > .agents/bus.jsonl
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"user",to:"codex",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"root"}' >> .agents/bus.jsonl
         CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" user done --ref root1234 "valid ref" >/dev/null
-        [ "$(jq -s length .agents/bus.jsonl)" = "2" ] || fail "valid ref did not append"
-        jq -s -e '.[1].ref == "root1234"' .agents/bus.jsonl >/dev/null
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "3" ] || fail "valid ref did not append"
+        tail -n 1 .agents/bus.jsonl | jq -e '.ref == "root1234"' >/dev/null
 
         if CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" user done --ref missing99 "bad ref" 2>"$err_file"; then
             fail "invalid ref unexpectedly succeeded"
         fi
-        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "2" ] || fail "invalid ref appended to bus"
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "3" ] || fail "invalid ref appended to bus"
         grep -q "unknown --ref 'missing99'" "$err_file"
     )
 
@@ -412,18 +413,18 @@ test_agent_done_smoke() {
     (
         cd "$workspace"
         write_agents
-        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"root"}' > .agents/bus.jsonl
+        printf '%s\n' 'not json' > .agents/bus.jsonl
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"root"}' >> .agents/bus.jsonl
         done_id=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-done" root1234 "done body")
         [ -n "$done_id" ] || fail "agent-done did not print event id"
-        jq -s -e '
-            length == 2
-            and .[1].id == $id
-            and .[1].type == "done"
-            and .[1].ref == "root1234"
-            and .[1].to == "claude"
-            and .[1].status == "done"
-            and .[1].body == "done body"
-        ' --arg id "$done_id" .agents/bus.jsonl >/dev/null
+        tail -n 1 .agents/bus.jsonl | jq -e '
+            .id == $id
+            and .type == "done"
+            and .ref == "root1234"
+            and .to == "claude"
+            and .status == "done"
+            and .body == "done body"
+        ' --arg id "$done_id" >/dev/null
         grep -q "send --surface s2 new done id=$done_id from=codex" "$cmux_log"
     )
 

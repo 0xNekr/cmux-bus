@@ -52,8 +52,9 @@ ref="$1"; shift; body="${*:-done}"
 my_surface="${CMUX_SURFACE_ID:-}"; [ -n "$my_surface" ] || { echo "agent-done: CMUX_SURFACE_ID not set" >&2; exit 1; }
 from=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' .agents/agents.json | head -n1)
 [ -n "$from" ] || { echo "agent-done: this surface is not registered — run 'agent-init <your_name>' first" >&2; exit 1; }
-thread=$(jq -s --arg ref "$ref" '
+thread=$(jq -Rsr --arg ref "$ref" '
   def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
+  split("\n") | map(fromjson?) |
   map(select(type=="object" and .id)) as $events | ($events|map({key:.id,value:.})|from_entries) as $m |
   if $m[$ref]==null then null else ($events|map(.+{root:root($m;.)})|map(select(.root==root($m;$m[$ref])))|last) end
 ' .agents/bus.jsonl)

@@ -121,11 +121,11 @@ esac
 }
 
 if [ -n "$ref" ]; then
-    jq empty .agents/bus.jsonl >/dev/null || {
-        echo "agent-send: cannot validate --ref because .agents/bus.jsonl is malformed" >&2
-        exit 1
-    }
-    jq -e --arg ref "$ref" 'select(type == "object" and .id == $ref) | halt' .agents/bus.jsonl >/dev/null || {
+    jq -Rer --arg ref "$ref" '
+        fromjson?
+        | select(type == "object" and .id == $ref)
+        | true
+    ' .agents/bus.jsonl >/dev/null || {
         echo "agent-send: unknown --ref '$ref' — cannot append an orphan event" >&2
         exit 1
     }
