@@ -98,7 +98,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | `agent-resume <id> [--force] [body]` | Re-open a stuck/crashed thread by appending a fresh `handoff` to its **original recipient**. Default body: `RESUME: <previous>`. Refuses if the thread is already done/blocked unless `--force`. |
 | `agent-doctor` | Validate the local bus and registry without mutating anything. Reports malformed JSONL, schema errors, duplicate ids, orphan refs, and open/stale/stuck thread counts. |
 | `agent-thread [--json] <id>` | Show the full event history for any event id in a thread. |
-| `agent-watch [--once] [--me] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot and `--me` to show only events involving the current registered surface. |
+| `agent-watch [--once] [--me] [--full] [--no-color] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, and `--full` to avoid body truncation. |
 | `agent-wait [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON and exits non-zero on timeout or unknown id. |
 
 ## Recovery — what to do when a peer crashes

@@ -741,6 +741,22 @@ test_agent_watch_truncates_long_bodies_unless_full() {
     pass "agent-watch truncates long bodies unless --full is used"
 }
 
+test_agent_watch_accepts_no_color() {
+    local workspace output
+    workspace="$(new_workspace watch-no-color)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"plain"}' > .agents/bus.jsonl
+        output=$("$repo_root/bin/agent-watch" --once --no-color --lines 0)
+        printf '%s\n' "$output" | grep -q "root1234"
+        printf '%s\n' "$output" | grep -q "ask  /open"
+    )
+
+    pass "agent-watch accepts no-color mode"
+}
+
 test_agent_wait_returns_final_event() {
     local workspace
     workspace="$(new_workspace wait-final)"
@@ -810,6 +826,7 @@ test_agent_watch_filters_current_agent
 test_agent_watch_rejects_zero_interval
 test_agent_watch_skips_malformed_lines
 test_agent_watch_truncates_long_bodies_unless_full
+test_agent_watch_accepts_no_color
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
 
