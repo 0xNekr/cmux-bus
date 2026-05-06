@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# agent-guard check [--json] [--staged] [--agent NAME|--all] [PATH...]
+# Detect edits that would overlap paths claimed by open bus threads.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+usage:
+  agent-guard check [--json] [--staged] [--agent NAME|--all] [PATH...]
+  agent-guard install [--force]
+
+check:
+  --staged       check currently staged git paths
+  --agent NAME   ignore claims owned by NAME
+  --all          include claims owned by the current agent too
+  --json         print conflicts as JSON
+
+install:
+  install a git pre-commit hook that runs: agent-guard check --staged
+EOF
+    exit 2
+}
+
+need_bus() {
+    [ -f .agents/bus.jsonl ] || {
+        echo "agent-guard: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
+        exit 1
+    }
+}
+
+current_agent() {
+    local surface="${CMUX_SURFACE_ID:-}"
+    [ -n "$surface" ] || return 0
+    [ -f .agents/agents.json ] || return 0
+    jq -r --arg s "$surface" '.agents | to_entries[] | select(.value == $s) | .key' .agents/agents.json | head -n1
+}
+
+open_claims() {
+    jq -Rsr '
+        def root($m;$e):
+            if ($e.ref == null or ($m[$e.ref] == null)) then $e.id else root($m;$m[$e.ref]) end;
+
+        split("\n")
+        | map(fromjson?)
+        | map(select(type == "object" and (.id | type == "string"))) as $events
+        | ($events | map({key:.id, value:.}) | from_entries) as $m
+        | ($events
+            | map(. + {root: root($m;.)})
+            | group_by(.root)
+            | map({root: .[0].root, last: .[-1], events: .})
+          )
+        | map(select(.last.status | IN("done","blocked") | not))
+        | .[] as $thread
+        | $thread.events[]
+        | select(.type == "handoff")
+        | select((.paths_claimed | type == "array") and (.paths_claimed | length > 0))
+        | . as $event
+        | .paths_claimed[]
+        | select(type == "string" and length > 0)
+        | [
+            $thread.root,
+            $event.id,
+            (if $event.to == "user" then $event.from else $event.to end),
+            .
+          ]
+        | @tsv
+    ' .agents/bus.jsonl
+}
+
+path_matches() {
+    local path="$1"
+    local pattern="$2"
+
+    path="${path#./}"
+    pattern="${pattern#./}"
+
+    [ "$path" = "$pattern" ] && return 0
+    case "$path" in
+        $pattern) return 0;;
+    esac
+    return 1
+}
+
+check_cmd() {
+    local json=0 staged=0 include_self=0 ignore_agent="" paths=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1;;
+            --staged) staged=1;;
+            --all) include_self=1; ignore_agent="";;
+            --agent)
+                [ $# -ge 2 ] || { echo "agent-guard: --agent needs a name" >&2; exit 2; }
+                ignore_agent="$2"; shift;;
+            --*) echo "agent-guard: unknown flag '$1'" >&2; exit 2;;
+            *) paths+=("$1");;
+        esac
+        shift
+    done
+
+    need_bus
+
+    if [ "$staged" -eq 1 ]; then
+        while IFS= read -r path; do
+            [ -n "$path" ] && paths+=("$path")
+        done < <(git diff --cached --name-only --diff-filter=ACMR)
+    fi
+
+    if [ "${#paths[@]}" -eq 0 ]; then
+        [ "$json" -eq 1 ] && { printf '[]\n'; exit 0; }
+        echo "agent-guard: no paths to check"
+        exit 0
+    fi
+
+    if [ "$include_self" -eq 0 ] && [ -z "$ignore_agent" ]; then
+        ignore_agent="$(current_agent)"
+    fi
+
+    local conflicts=0
+    guard_tmp="$(mktemp)"
+    trap 'rm -f "$guard_tmp"' EXIT
+    printf '[' > "$guard_tmp"
+
+    while IFS=$'\t' read -r root event owner claim; do
+        [ -n "$root" ] || continue
+        [ -n "$ignore_agent" ] && [ "$owner" = "$ignore_agent" ] && continue
+        for path in "${paths[@]}"; do
+            if path_matches "$path" "$claim"; then
+                conflicts=$((conflicts + 1))
+                if [ "$json" -eq 1 ]; then
+                    [ "$conflicts" -gt 1 ] && printf ',' >> "$guard_tmp"
+                    jq -nc --arg path "$path" --arg claim "$claim" --arg owner "$owner" --arg root "$root" --arg event "$event" \
+                        '{path:$path, claim:$claim, owner:$owner, root:$root, event:$event}' >> "$guard_tmp"
+                else
+                    printf 'agent-guard: conflict: %s matches %s claimed by %s in thread %s (event %s)\n' \
+                        "$path" "$claim" "$owner" "$root" "$event" >&2
+                fi
+            fi
+        done
+    done < <(open_claims)
+
+    if [ "$json" -eq 1 ]; then
+        printf ']\n' >> "$guard_tmp"
+        cat "$guard_tmp"
+    fi
+
+    if [ "$conflicts" -gt 0 ]; then
+        [ "$json" -eq 1 ] || echo "agent-guard: $conflicts conflict(s) found" >&2
+        exit 1
+    fi
+
+    [ "$json" -eq 1 ] || echo "agent-guard: ok"
+}
+
+install_cmd() {
+    local force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=1;;
+            --*) echo "agent-guard: unknown flag '$1'" >&2; exit 2;;
+            *) usage;;
+        esac
+        shift
+    done
+
+    local git_root hook
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+        echo "agent-guard: not inside a git repository" >&2
+        exit 1
+    }
+    hook="$git_root/.git/hooks/pre-commit"
+    if [ -e "$hook" ]; then
+        if grep -q "agent-guard check --staged" "$hook"; then
+            echo "agent-guard: hook already installed at $hook"
+            exit 0
+        fi
+        if [ "$force" -ne 1 ]; then
+            echo "agent-guard: $hook already exists; use --force to replace it" >&2
+            exit 1
+        fi
+    fi
+
+    cat > "$hook" <<'HOOK'
+#!/usr/bin/env bash
+set -euo pipefail
+agent-guard check --staged >/dev/null
+HOOK
+    chmod +x "$hook"
+    echo "agent-guard: installed pre-commit hook at $hook"
+}
+
+[ $# -ge 1 ] || usage
+cmd="$1"; shift
+case "$cmd" in
+    check) check_cmd "$@";;
+    install) install_cmd "$@";;
+    *) usage;;
+esac

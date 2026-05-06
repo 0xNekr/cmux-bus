@@ -161,7 +161,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-thread agent-watch agent-wait; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-thread agent-watch agent-wait; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -680,6 +680,114 @@ test_agent_repair_noop() {
     pass "agent-repair leaves clean buses untouched"
 }
 
+test_agent_guard_reports_open_claim_conflicts() {
+    local workspace
+    workspace="$(new_workspace guard-conflict)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["src/api.ts","src/*.css"],body:"edit"}' > .agents/bus.jsonl
+        if "$repo_root/bin/agent-guard" check --agent codex src/api.ts >/dev/null 2>&1; then
+            fail "agent-guard missed exact claim conflict"
+        fi
+        if "$repo_root/bin/agent-guard" check --agent codex src/main.css >/dev/null 2>&1; then
+            fail "agent-guard missed glob claim conflict"
+        fi
+        "$repo_root/bin/agent-guard" check --agent claude src/api.ts >/dev/null
+        "$repo_root/bin/agent-guard" check --agent codex README.md >/dev/null
+    )
+
+    pass "agent-guard reports open exact and glob claim conflicts"
+}
+
+test_agent_guard_ignores_closed_threads_and_outputs_json() {
+    local workspace
+    workspace="$(new_workspace guard-closed)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["src/api.ts"],body:"edit"}' > .agents/bus.jsonl
+        jq -nc '{id:"done1234",ts:"2026-05-05T00:01:00Z",from:"claude",to:"codex",type:"done",ref:"root1234",status:"done",paths_claimed:[],body:"done"}' >> .agents/bus.jsonl
+        "$repo_root/bin/agent-guard" check --json --all src/api.ts | jq -e 'length == 0' >/dev/null
+    )
+
+    pass "agent-guard ignores closed threads and supports JSON output"
+}
+
+test_agent_guard_checks_staged_paths() {
+    local workspace
+    workspace="$(new_workspace guard-staged)"
+
+    (
+        cd "$workspace"
+        git init -q
+        git config user.email test@example.com
+        git config user.name Test
+        write_agents
+        mkdir -p src
+        printf '%s\n' "initial" > src/api.ts
+        git add src/api.ts
+        git commit -qm initial
+        printf '%s\n' "changed" > src/api.ts
+        git add src/api.ts
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["src/api.ts"],body:"edit"}' > .agents/bus.jsonl
+        if "$repo_root/bin/agent-guard" check --staged --agent codex >/dev/null 2>&1; then
+            fail "agent-guard missed staged claim conflict"
+        fi
+    )
+
+    pass "agent-guard checks staged git paths"
+}
+
+test_agent_guard_normalizes_dot_slash_and_ignores_ack_claims() {
+    local workspace
+    workspace="$(new_workspace guard-normalize)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["./src/api.ts"],body:"edit"}' > .agents/bus.jsonl
+        if "$repo_root/bin/agent-guard" check --agent codex src/api.ts >/dev/null 2>&1; then
+            fail "agent-guard did not normalize ./ claim prefixes"
+        fi
+
+        jq -nc '{id:"root2222",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"edit"}' > .agents/bus.jsonl
+        jq -nc '{id:"ack2222",ts:"2026-05-05T00:01:00Z",from:"claude",to:"codex",type:"ack",ref:"root2222",status:"in_progress",paths_claimed:["src/ack.ts"],body:"ack"}' >> .agents/bus.jsonl
+        "$repo_root/bin/agent-guard" check --agent codex src/ack.ts >/dev/null
+    )
+
+    pass "agent-guard normalizes ./ prefixes and ignores non-handoff claims"
+}
+
+test_agent_guard_install_preserves_existing_hooks() {
+    local workspace
+    workspace="$(new_workspace guard-install)"
+
+    (
+        cd "$workspace"
+        git init -q
+        mkdir -p .git/hooks
+        printf '%s\n' '#!/usr/bin/env bash' 'echo lint' > .git/hooks/pre-commit
+        chmod +x .git/hooks/pre-commit
+        if "$repo_root/bin/agent-guard" install >/dev/null 2>&1; then
+            fail "agent-guard install overwrote existing hook without --force"
+        fi
+        grep -q "echo lint" .git/hooks/pre-commit
+
+        "$repo_root/bin/agent-guard" install --force >/dev/null
+        grep -q "agent-guard check --staged >/dev/null" .git/hooks/pre-commit
+        if ! "$repo_root/bin/agent-guard" install > install.out; then
+            fail "agent-guard install was not idempotent"
+        fi
+        grep -q "hook already installed" install.out
+        [ "$(grep -c "agent-guard check --staged" .git/hooks/pre-commit)" = "1" ] || fail "agent-guard duplicated hook command"
+    )
+
+    pass "agent-guard install preserves and idempotently detects hooks"
+}
+
 test_agent_thread_shows_history() {
     local workspace output
     workspace="$(new_workspace thread-history)"
@@ -894,6 +1002,11 @@ test_agent_doctor_reports_bus_problems
 test_agent_doctor_reports_malformed_jsonl
 test_agent_repair_dry_run_and_fix
 test_agent_repair_noop
+test_agent_guard_reports_open_claim_conflicts
+test_agent_guard_ignores_closed_threads_and_outputs_json
+test_agent_guard_checks_staged_paths
+test_agent_guard_normalizes_dot_slash_and_ignores_ack_claims
+test_agent_guard_install_preserves_existing_hooks
 test_agent_thread_shows_history
 test_agent_thread_json_and_unknown_id
 test_agent_watch_snapshot
