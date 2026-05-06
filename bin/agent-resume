@@ -38,9 +38,11 @@ done
     exit 1
 }
 
-root=$(jq -rs --arg id "$id" '
-    (map(select(.id == $id)) | .[0]) as $e
-    | if $e then ($e.ref // $e.id) else "" end
+root=$(jq -Rrs --arg id "$id" '
+    def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
+    split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events |
+    ($events | map({key:.id,value:.}) | from_entries) as $m |
+    if $m[$id] == null then "" else root($m;$m[$id]) end
 ' .agents/bus.jsonl)
 
 [ -n "$root" ] || {
@@ -48,8 +50,8 @@ root=$(jq -rs --arg id "$id" '
     exit 1
 }
 
-root_event=$(jq -cs --arg root "$root" '
-    map(select(.id == $root)) | .[0]
+root_event=$(jq -Rcs --arg root "$root" '
+    split("\n") | map(fromjson?) | map(select(type=="object" and .id == $root)) | .[0]
 ' .agents/bus.jsonl)
 
 orig_recipient=$(echo "$root_event" | jq -r '.to')
@@ -66,8 +68,11 @@ if [ "$orig_recipient" = "user" ]; then
     exit 1
 fi
 
-last_status=$(jq -rs --arg root "$root" '
-    map(select((.ref // .id) == $root)) | last | .status
+last_status=$(jq -Rrs --arg root "$root" '
+    def thread_root($m;$e): if $e.ref==null then $e.id else thread_root($m;$m[$e.ref]) end;
+    split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events |
+    ($events | map({key:.id,value:.}) | from_entries) as $m |
+    $events | map(select(thread_root($m;.) == $root)) | last | .status
 ' .agents/bus.jsonl)
 
 if [ "$last_status" = "done" ] || [ "$last_status" = "blocked" ]; then

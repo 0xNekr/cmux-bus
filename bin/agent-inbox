@@ -19,9 +19,10 @@ my_surface="${CMUX_SURFACE_ID:-}"; [ -n "$my_surface" ] || { echo "agent-inbox: 
 me=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' .agents/agents.json | head -n1)
 [ -n "$me" ] || { echo "agent-inbox: this surface is not registered — run 'agent-init <your_name>' first" >&2; exit 1; }
 agents=$(jq -c '.agents' .agents/agents.json); now=$(date -u +%s)
-items=$(jq -s --arg me "$me" --argjson agents "$agents" --arg stale_filter "$stale_filter" --arg stuck_filter "$stuck_filter" --argjson now "$now" --argjson stuck_after "$stuck_after" '
+items=$(jq -Rsr --arg me "$me" --argjson agents "$agents" --arg stale_filter "$stale_filter" --arg stuck_filter "$stuck_filter" --argjson now "$now" --argjson stuck_after "$stuck_after" '
   def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
   def epoch($ts): ($ts|strptime("%Y-%m-%dT%H:%M:%SZ")|mktime);
+  split("\n") | map(fromjson?) |
   map(select(type=="object" and .id)) as $events |
   ($events|map({key:.id,value:.})|from_entries) as $m |
   ($events|map(.+{root:root($m;.)})|group_by(.root)|map({root:.[0].root,last:.[-1]})) |

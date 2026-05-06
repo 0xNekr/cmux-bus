@@ -55,8 +55,9 @@ esac
 }
 
 thread_last() {
-    jq -s --arg id "$id" '
+    jq -Rsr --arg id "$id" '
         def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
+        split("\n") | map(fromjson?) |
         map(select(type=="object" and .id)) as $events |
         ($events | map({key:.id,value:.}) | from_entries) as $m |
         if $m[$id] == null then

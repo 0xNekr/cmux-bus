@@ -488,11 +488,12 @@ test_agent_cancel_and_resume_smoke() {
     (
         cd "$workspace"
         write_agents
-        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["src/a.ts"],body:"do work"}' > .agents/bus.jsonl
+        printf '%s\n' 'not json' > .agents/bus.jsonl
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["src/a.ts"],body:"do work"}' >> .agents/bus.jsonl
         PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-resume" root1234 >/dev/null
-        jq -s -e 'length == 2 and .[1].type == "handoff" and .[1].to == "claude" and .[1].ref == "root1234"' .agents/bus.jsonl >/dev/null
+        tail -n 1 .agents/bus.jsonl | jq -e '.type == "handoff" and .to == "claude" and .ref == "root1234"' >/dev/null
         PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-cancel" root1234 "dropping" >/dev/null
-        jq -s -e 'length == 3 and .[2].type == "block" and .[2].to == "user" and .[2].status == "blocked"' .agents/bus.jsonl >/dev/null
+        tail -n 1 .agents/bus.jsonl | jq -e '.type == "block" and .to == "user" and .status == "blocked"' >/dev/null
     )
 
     pass "agent-resume and agent-cancel append expected recovery events"
@@ -532,6 +533,25 @@ test_agent_cancel_and_resume_negative_cases() {
     pass "agent-cancel and agent-resume reject invalid recovery cases"
 }
 
+test_agent_cancel_resolves_deep_thread_root() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-recovery-deep"
+    workspace="$(new_workspace recovery-deep)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"root"}' > .agents/bus.jsonl
+        jq -nc '{id:"ack12345",ts:"2026-05-05T00:01:00Z",from:"claude",to:"codex",type:"ack",ref:"root1234",status:"in_progress",paths_claimed:[],body:"ack"}' >> .agents/bus.jsonl
+        jq -nc '{id:"note1234",ts:"2026-05-05T00:02:00Z",from:"codex",to:"claude",type:"ask",ref:"ack12345",status:"open",paths_claimed:[],body:"nested"}' >> .agents/bus.jsonl
+        PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-cancel" note1234 "deep cancel" >/dev/null
+        tail -n 1 .agents/bus.jsonl | jq -e '.type == "block" and .to == "user" and .ref == "root1234" and .status == "blocked"' >/dev/null
+    )
+
+    pass "agent-cancel resolves deep thread roots"
+}
+
 test_agent_inbox_stale_and_stuck() {
     local workspace old_ts
     workspace="$(new_workspace inbox)"
@@ -541,7 +561,8 @@ test_agent_inbox_stale_and_stuck() {
         cd "$workspace"
         mkdir -p .agents
         printf '%s\n' '{"agents":{"codex":"s1"}}' > .agents/agents.json
-        jq -nc --arg ts "$old_ts" '{id:"root1234",ts:$ts,from:"ghost",to:"codex",type:"ack",ref:null,status:"in_progress",paths_claimed:[],body:"working"}' > .agents/bus.jsonl
+        printf '%s\n' 'not json' > .agents/bus.jsonl
+        jq -nc --arg ts "$old_ts" '{id:"root1234",ts:$ts,from:"ghost",to:"codex",type:"ack",ref:null,status:"in_progress",paths_claimed:[],body:"working"}' >> .agents/bus.jsonl
         CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-inbox" --json > inbox.json
         jq -e 'length == 1 and .[0].stale == true and .[0].stuck == true and .[0].age_minutes >= 10' inbox.json >/dev/null
         CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-inbox" --only-stale --json | jq -e 'length == 1' >/dev/null
@@ -666,7 +687,8 @@ test_agent_thread_shows_history() {
     (
         cd "$workspace"
         write_agents
-        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"handoff",ref:null,status:"open",paths_claimed:["src/a.ts"],body:"root body"}' > .agents/bus.jsonl
+        printf '%s\n' 'not json' > .agents/bus.jsonl
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"handoff",ref:null,status:"open",paths_claimed:["src/a.ts"],body:"root body"}' >> .agents/bus.jsonl
         jq -nc '{id:"ack12345",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"ack",ref:"root1234",status:"in_progress",paths_claimed:[],body:"working"}' >> .agents/bus.jsonl
         jq -nc '{id:"done1234",ts:"2026-05-05T00:02:00Z",from:"codex",to:"claude",type:"done",ref:"root1234",status:"done",paths_claimed:[],body:"done body"}' >> .agents/bus.jsonl
         output=$("$repo_root/bin/agent-thread" ack12345)
@@ -813,7 +835,8 @@ test_agent_wait_returns_final_event() {
     (
         cd "$workspace"
         write_agents
-        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"question"}' > .agents/bus.jsonl
+        printf '%s\n' 'not json' > .agents/bus.jsonl
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"question"}' >> .agents/bus.jsonl
         jq -nc '{id:"done1234",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"done",ref:"root1234",status:"done",paths_claimed:[],body:"answer"}' >> .agents/bus.jsonl
         "$repo_root/bin/agent-wait" root1234 > wait.json
         jq -e '.id == "done1234" and .status == "done" and .root == "root1234" and .body == "answer"' wait.json >/dev/null
@@ -864,6 +887,7 @@ test_concurrent_writes_stay_valid
 test_agent_inbox_empty_bus
 test_agent_cancel_and_resume_smoke
 test_agent_cancel_and_resume_negative_cases
+test_agent_cancel_resolves_deep_thread_root
 test_agent_inbox_stale_and_stuck
 test_agent_doctor_ok_and_summary
 test_agent_doctor_reports_bus_problems
