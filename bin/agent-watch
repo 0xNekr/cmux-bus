@@ -142,6 +142,8 @@ print_events() {
         if [ "$color_enabled" -eq 1 ]; then
             type_color="$(color_for_type "$type")"
             status_color="$(color_for_status "$status")"
+            [ "${printed_event:-0}" -eq 0 ] || printf '\n'
+            printed_event=1
             printf '%b%s%b  %b%s%b  %b%s%b/%b%s%b  %b%s%b\n' \
                 "$c_dim" "$ts" "$c_reset" \
                 "$c_bold" "$route" "$c_reset" \
