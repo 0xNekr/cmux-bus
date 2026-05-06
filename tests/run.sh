@@ -63,6 +63,72 @@ CMUX
     chmod +x "$dir/cmux"
 }
 
+make_fake_cmux_auto_done() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    cat <<'OUT'
+surface:1 s1 type=terminal in_window=true
+surface:2 s2 type=terminal in_window=true
+surface:3 s3 type=terminal in_window=true
+OUT
+    exit 0
+fi
+if [ "$1" = "send" ]; then
+    if [ -n "${CMUX_LOG:-}" ]; then
+        printf '%s\n' "$*" >> "$CMUX_LOG"
+    fi
+    surface=""
+    event_id=""
+    from_agent=""
+    prev=""
+    message=""
+    for arg in "$@"; do
+        if [ "$prev" = "--surface" ]; then
+            surface="$arg"
+        elif [ "$prev" = "$surface" ] && [ -n "$surface" ]; then
+            message="$arg"
+        fi
+        prev="$arg"
+    done
+    for word in $message; do
+        case "$word" in
+            id=*) event_id="${word#id=}";;
+            from=*) from_agent="${word#from=}";;
+        esac
+    done
+    case "$surface" in
+        s2) responder="claude";;
+        s3) responder="deepseek";;
+        *) responder="peer";;
+    esac
+    status="${CMUX_AUTO_DONE_STATUS:-done}"
+    body="${CMUX_AUTO_DONE_BODY:-rpc answer}"
+    done_id="${event_id}d"
+    jq -nc \
+        --arg id "$done_id" \
+        --arg ts "2026-05-05T00:01:00Z" \
+        --arg from "$responder" \
+        --arg to "$from_agent" \
+        --arg ref "$event_id" \
+        --arg status "$status" \
+        --arg body "$body" \
+        '{id:$id,ts:$ts,from:$from,to:$to,type:(if $status=="blocked" then "block" else "done" end),ref:$ref,status:$status,paths_claimed:[],body:$body}' >> .agents/bus.jsonl
+    exit 0
+fi
+if [ "$1" = "send-key" ]; then
+    if [ -n "${CMUX_LOG:-}" ]; then
+        printf '%s\n' "$*" >> "$CMUX_LOG"
+    fi
+    exit 0
+fi
+exit 0
+CMUX
+    chmod +x "$dir/cmux"
+}
+
 new_workspace() {
     local name="$1"
     local dir="$tmp_root/$name"
@@ -161,7 +227,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-thread agent-watch agent-wait; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-thread agent-watch agent-wait; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -973,6 +1039,82 @@ test_agent_wait_timeout_and_unknown_id() {
     pass "agent-wait times out and rejects unknown ids"
 }
 
+test_agent_rpc_prints_response_body() {
+    local fakebin workspace output
+    fakebin="$tmp_root/fakebin-rpc-body"
+    workspace="$(new_workspace rpc-body)"
+    make_fake_cmux_auto_done "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        output=$(PATH="$repo_root/bin:$fakebin:$PATH" CMUX_AUTO_DONE_BODY="rpc ok" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-rpc" claude "please answer")
+        [ "$output" = "rpc ok" ] || fail "agent-rpc did not print final body"
+        jq -s -e '
+            length == 2
+            and .[0].type == "ask"
+            and .[0].from == "codex"
+            and .[0].to == "claude"
+            and .[0].body == "please answer"
+            and .[1].status == "done"
+            and .[1].ref == .[0].id
+        ' .agents/bus.jsonl >/dev/null
+    )
+
+    pass "agent-rpc sends an ask and prints the response body"
+}
+
+test_agent_rpc_json_and_blocked_status() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-rpc-json"
+    workspace="$(new_workspace rpc-json)"
+    make_fake_cmux_auto_done "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        PATH="$repo_root/bin:$fakebin:$PATH" CMUX_AUTO_DONE_BODY="json ok" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-rpc" --json claude "json please" |
+            jq -e '.status == "done" and .body == "json ok" and .root' >/dev/null
+
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_AUTO_DONE_STATUS=blocked CMUX_AUTO_DONE_BODY="blocked reason" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-rpc" claude "may block" > blocked.out; then
+            fail "agent-rpc returned success for blocked final status"
+        fi
+        grep -qxF "blocked reason" blocked.out
+
+        PATH="$repo_root/bin:$fakebin:$PATH" CMUX_AUTO_DONE_STATUS=blocked CMUX_AUTO_DONE_BODY="expected block" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-rpc" --status blocked claude "expect block" > expected-block.out
+        grep -qxF "expected block" expected-block.out
+    )
+
+    pass "agent-rpc supports JSON output and fails on blocked replies"
+}
+
+test_agent_rpc_rejects_invalid_recipients() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-rpc-invalid"
+    workspace="$(new_workspace rpc-invalid)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-rpc" all "bad" >/dev/null 2>&1; then
+            fail "agent-rpc accepted broadcast recipient"
+        fi
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-rpc" claude,deepseek "bad" >/dev/null 2>&1; then
+            fail "agent-rpc accepted CSV broadcast recipient"
+        fi
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-rpc" user "bad" >/dev/null 2>&1; then
+            fail "agent-rpc accepted user recipient"
+        fi
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-rpc" unknown "bad" >/dev/null 2>err.out; then
+            fail "agent-rpc accepted unknown recipient"
+        fi
+        grep -q "unknown recipient 'unknown'" err.out
+    )
+
+    pass "agent-rpc rejects broadcast and user recipients"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_rejects_invalid_input
@@ -1017,5 +1159,8 @@ test_agent_watch_truncates_long_bodies_unless_full
 test_agent_watch_accepts_no_color
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
+test_agent_rpc_prints_response_body
+test_agent_rpc_json_and_blocked_status
+test_agent_rpc_rejects_invalid_recipients
 
 echo "passed $pass_count tests"

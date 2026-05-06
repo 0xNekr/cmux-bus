@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# agent-rpc [--timeout SEC] [--interval SEC] [--status done|blocked|final] [--json] <agent> <body...>
+# Send an ask to one peer, wait for the thread to finish, and print the reply.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-rpc [--timeout SEC] [--interval SEC] [--status done|blocked|final] [--json] <agent> <body...>
+
+Sends an ask event to <agent>, waits for the thread, then prints the final
+body by default. Use --json to print the final event object instead.
+EOF
+    exit 2
+}
+
+timeout=600
+interval=1
+status=final
+json=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --timeout)
+            [ $# -ge 2 ] || usage
+            timeout="$2"
+            shift 2
+            ;;
+        --interval)
+            [ $# -ge 2 ] || usage
+            interval="$2"
+            shift 2
+            ;;
+        --status)
+            [ $# -ge 2 ] || usage
+            status="$2"
+            shift 2
+            ;;
+        --json)
+            json=1
+            shift
+            ;;
+        --*) echo "agent-rpc: unknown flag '$1'" >&2; exit 2;;
+        *) break;;
+    esac
+done
+
+[ $# -ge 2 ] || usage
+to="$1"; shift
+body="$*"
+
+case "$to" in
+    all|*,*)
+        echo "agent-rpc: recipient must be a single agent, not a broadcast" >&2
+        exit 2
+        ;;
+    user)
+        echo "agent-rpc: recipient must be an agent, not user" >&2
+        exit 2
+        ;;
+esac
+
+case "$status" in
+    done|blocked|final) ;;
+    *) echo "agent-rpc: --status must be done, blocked, or final" >&2; exit 2;;
+esac
+
+id="$(agent-send "$to" ask "$body")" || exit 1
+case "$id" in
+    *$'\n'*)
+        echo "agent-rpc: expected one event id, got multiple" >&2
+        exit 1
+        ;;
+esac
+
+final="$(agent-wait --timeout "$timeout" --interval "$interval" --status "$status" "$id")" || exit 1
+
+if [ "$json" -eq 1 ]; then
+    printf '%s\n' "$final"
+else
+    printf '%s\n' "$final" | jq -r '.body'
+fi
+
+final_status="$(printf '%s\n' "$final" | jq -r '.status')"
+case "$status" in
+    final)
+        [ "$final_status" = "blocked" ] && exit 1
+        exit 0
+        ;;
+    blocked)
+        [ "$final_status" = "blocked" ] && exit 0
+        exit 1
+        ;;
+    done)
+        [ "$final_status" = "done" ] && exit 0
+        exit 1
+        ;;
+esac
