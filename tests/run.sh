@@ -227,7 +227,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-thread agent-watch agent-wait; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -1206,6 +1206,58 @@ test_agent_playbook_rejects_invalid_inputs() {
     pass "agent-playbook rejects missing playbooks and invalid inputs"
 }
 
+test_agent_synthesize_collects_threads() {
+    local fakebin workspace output
+    fakebin="$tmp_root/fakebin-synthesize"
+    workspace="$(new_workspace synthesize)"
+    make_fake_cmux_auto_done "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1111",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"ask",ref:null,status:"open",paths_claimed:[],body:"opinion?"}' > .agents/bus.jsonl
+        jq -nc '{id:"done1111",ts:"2026-05-05T00:01:00Z",from:"claude",to:"codex",type:"done",ref:"root1111",status:"done",paths_claimed:[],body:"claude says playbook"}' >> .agents/bus.jsonl
+        jq -nc '{id:"root2222",ts:"2026-05-05T00:00:00Z",from:"codex",to:"deepseek",type:"ask",ref:null,status:"open",paths_claimed:[],body:"opinion?"}' >> .agents/bus.jsonl
+        jq -nc '{id:"done2222",ts:"2026-05-05T00:01:00Z",from:"deepseek",to:"codex",type:"done",ref:"root2222",status:"done",paths_claimed:[],body:"deepseek says guard"}' >> .agents/bus.jsonl
+
+        output=$(PATH="$repo_root/bin:$fakebin:$PATH" CMUX_AUTO_DONE_BODY="synth result" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-synthesize" --agent deepseek root1111 root2222)
+        [ "$output" = "synth result" ] || fail "agent-synthesize did not print synthesis body"
+        jq -s -e '
+            length == 6
+            and .[4].to == "deepseek"
+            and (. [4].body | contains("claude says playbook"))
+            and (. [4].body | contains("deepseek says guard"))
+            and (. [4].body | contains("Consensus"))
+            and (. [4].body | contains("<<<THREAD root=root1111 from=claude status=done>>>"))
+            and (. [4].body | contains("<<<END_THREAD>>>"))
+        ' .agents/bus.jsonl >/dev/null
+    )
+
+    pass "agent-synthesize collects final thread replies"
+}
+
+test_agent_synthesize_json_and_unknown_id() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-synthesize-json"
+    workspace="$(new_workspace synthesize-json)"
+    make_fake_cmux_auto_done "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1111",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"ask",ref:null,status:"open",paths_claimed:[],body:"opinion?"}' > .agents/bus.jsonl
+        jq -nc '{id:"done1111",ts:"2026-05-05T00:01:00Z",from:"claude",to:"codex",type:"done",ref:"root1111",status:"done",paths_claimed:[],body:"claude answer"}' >> .agents/bus.jsonl
+
+        PATH="$repo_root/bin:$fakebin:$PATH" CMUX_AUTO_DONE_BODY="json synth" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-synthesize" --json root1111 |
+            jq -e '.status == "done" and .body == "json synth"' >/dev/null
+        if PATH="$repo_root/bin:$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-synthesize" missing99 >/dev/null 2>&1; then
+            fail "agent-synthesize accepted unknown thread id"
+        fi
+    )
+
+    pass "agent-synthesize supports JSON output and rejects unknown ids"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_rejects_invalid_input
@@ -1256,5 +1308,7 @@ test_agent_rpc_rejects_invalid_recipients
 test_agent_playbook_runs_json_workflow
 test_agent_playbook_send_wait_and_path_file
 test_agent_playbook_rejects_invalid_inputs
+test_agent_synthesize_collects_threads
+test_agent_synthesize_json_and_unknown_id
 
 echo "passed $pass_count tests"

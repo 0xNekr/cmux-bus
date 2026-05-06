@@ -28,6 +28,8 @@ Covered areas:
   recipients
 - `agent-playbook` JSON workflows with variable interpolation, send/wait/rpc,
   print output, and invalid playbooks
+- `agent-synthesize` multi-thread collection, custom synthesis agent, JSON
+  output, and unknown thread failures
 - `agent-watch` snapshots and current-agent filtering
 - `agent-wait` final-status waits, timeouts, and unknown ids
 
