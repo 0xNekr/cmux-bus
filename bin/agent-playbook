@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# agent-playbook run <name-or-path> [KEY=VALUE...]
+# Run a small JSON workflow that composes agent-send, agent-wait, and agent-rpc.
+
+set -euo pipefail
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-playbook run <name-or-path> [KEY=VALUE...]
+
+Looks for <name> at .agents/playbooks/<name>.json unless a readable path is
+provided. Variables are referenced in string fields as {{key}}.
+EOF
+    exit 2
+}
+
+resolve_playbook() {
+    local name="$1"
+    if [ -f "$name" ]; then
+        printf '%s\n' "$name"
+    elif [ -f ".agents/playbooks/$name.json" ]; then
+        printf '%s\n' ".agents/playbooks/$name.json"
+    else
+        echo "agent-playbook: playbook not found: $name" >&2
+        exit 1
+    fi
+}
+
+set_var() {
+    local key="$1"
+    local value="$2"
+    vars="$(printf '%s\n' "$vars" | jq -c --arg k "$key" --arg v "$value" '. + {($k): $v}')"
+}
+
+get_var() {
+    local key="$1"
+    printf '%s\n' "$vars" | jq -r --arg k "$key" '.[$k] // ""'
+}
+
+render() {
+    local template="$1"
+    local out="$template"
+    local keys key value
+    keys="$(printf '%s\n' "$vars" | jq -r 'keys[]')"
+    while IFS= read -r key; do
+        [ -n "$key" ] || continue
+        value="$(get_var "$key")"
+        out="${out//\{\{$key\}\}/$value}"
+    done <<EOF
+$keys
+EOF
+    printf '%s\n' "$out"
+}
+
+step_obj() {
+    local index="$1"
+    jq -c --argjson i "$index" '.steps[$i]' "$playbook"
+}
+
+field() {
+    local obj="$1"
+    local expr="$2"
+    printf '%s\n' "$obj" | jq -r "$expr // empty"
+}
+
+save_event() {
+    local save="$1"
+    local event="$2"
+    [ -n "$save" ] || return 0
+    set_var "${save}_id" "$(printf '%s\n' "$event" | jq -r '.id')"
+    set_var "${save}_status" "$(printf '%s\n' "$event" | jq -r '.status')"
+    set_var "${save}_body" "$(printf '%s\n' "$event" | jq -r '.body')"
+}
+
+run_send() {
+    local cfg="$1"
+    local to type body paths status save id
+    to="$(render "$(field "$cfg" '.to')")"
+    type="$(field "$cfg" '.type')"
+    [ -n "$type" ] || type="ask"
+    body="$(render "$(field "$cfg" '.body')")"
+    paths="$(render "$(field "$cfg" '.paths')")"
+    status="$(field "$cfg" '.status')"
+    save="$(field "$cfg" '.save')"
+    [ -n "$to" ] || { echo "agent-playbook: send step missing to" >&2; exit 1; }
+    [ -n "$body" ] || { echo "agent-playbook: send step missing body" >&2; exit 1; }
+
+    if [ -n "$paths" ] && [ -n "$status" ]; then
+        id="$(agent-send "$to" "$type" --paths "$paths" --status "$status" "$body")" || exit 1
+    elif [ -n "$paths" ]; then
+        id="$(agent-send "$to" "$type" --paths "$paths" "$body")" || exit 1
+    elif [ -n "$status" ]; then
+        id="$(agent-send "$to" "$type" --status "$status" "$body")" || exit 1
+    else
+        id="$(agent-send "$to" "$type" "$body")" || exit 1
+    fi
+
+    [ -z "$save" ] || set_var "$save" "$id"
+}
+
+run_wait() {
+    local cfg="$1"
+    local id timeout interval status save event
+    id="$(render "$(field "$cfg" '.id')")"
+    timeout="$(field "$cfg" '.timeout')"
+    interval="$(field "$cfg" '.interval')"
+    status="$(field "$cfg" '.status')"
+    save="$(field "$cfg" '.save')"
+    [ -n "$id" ] || { echo "agent-playbook: wait step missing id" >&2; exit 1; }
+    [ -n "$timeout" ] || timeout=600
+    [ -n "$interval" ] || interval=1
+    [ -n "$status" ] || status=final
+    event="$(agent-wait --timeout "$timeout" --interval "$interval" --status "$status" "$id")" || exit 1
+    save_event "$save" "$event"
+}
+
+run_rpc() {
+    local cfg="$1"
+    local to body timeout interval status save event
+    to="$(render "$(field "$cfg" '.to')")"
+    body="$(render "$(field "$cfg" '.body')")"
+    timeout="$(field "$cfg" '.timeout')"
+    interval="$(field "$cfg" '.interval')"
+    status="$(field "$cfg" '.status')"
+    save="$(field "$cfg" '.save')"
+    [ -n "$to" ] || { echo "agent-playbook: rpc step missing to" >&2; exit 1; }
+    [ -n "$body" ] || { echo "agent-playbook: rpc step missing body" >&2; exit 1; }
+    [ -n "$timeout" ] || timeout=600
+    [ -n "$interval" ] || interval=1
+    [ -n "$status" ] || status=final
+    event="$(agent-rpc --json --timeout "$timeout" --interval "$interval" --status "$status" "$to" "$body")" || exit 1
+    save_event "$save" "$event"
+}
+
+[ $# -ge 2 ] || usage
+cmd="$1"; shift
+[ "$cmd" = run ] || usage
+
+playbook="$(resolve_playbook "$1")"; shift
+jq -e '.steps | type == "array"' "$playbook" >/dev/null || {
+    echo "agent-playbook: playbook must contain a steps array" >&2
+    exit 1
+}
+
+vars='{}'
+while [ $# -gt 0 ]; do
+    case "$1" in
+        *=*) set_var "${1%%=*}" "${1#*=}";;
+        *) echo "agent-playbook: variables must be KEY=VALUE: $1" >&2; exit 2;;
+    esac
+    shift
+done
+
+count="$(jq '.steps | length' "$playbook")"
+i=0
+while [ "$i" -lt "$count" ]; do
+    step="$(step_obj "$i")"
+    step_types="$(printf '%s\n' "$step" | jq '[keys[] | select(. == "send" or . == "wait" or . == "rpc" or . == "print")] | length')"
+    [ "$step_types" -eq 1 ] || {
+        echo "agent-playbook: step $i must have exactly one type (send, wait, rpc, or print)" >&2
+        exit 1
+    }
+    if printf '%s\n' "$step" | jq -e 'has("send")' >/dev/null; then
+        run_send "$(printf '%s\n' "$step" | jq -c '.send')"
+    elif printf '%s\n' "$step" | jq -e 'has("wait")' >/dev/null; then
+        run_wait "$(printf '%s\n' "$step" | jq -c '.wait')"
+    elif printf '%s\n' "$step" | jq -e 'has("rpc")' >/dev/null; then
+        run_rpc "$(printf '%s\n' "$step" | jq -c '.rpc')"
+    elif printf '%s\n' "$step" | jq -e 'has("print")' >/dev/null; then
+        render "$(field "$step" '.print')"
+    else
+        echo "agent-playbook: unsupported step at index $i" >&2
+        exit 1
+    fi
+    i=$((i + 1))
+done

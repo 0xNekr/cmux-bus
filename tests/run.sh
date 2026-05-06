@@ -227,7 +227,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-thread agent-watch agent-wait; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-thread agent-watch agent-wait; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -1115,6 +1115,97 @@ test_agent_rpc_rejects_invalid_recipients() {
     pass "agent-rpc rejects broadcast and user recipients"
 }
 
+test_agent_playbook_runs_json_workflow() {
+    local fakebin workspace output
+    fakebin="$tmp_root/fakebin-playbook-run"
+    workspace="$(new_workspace playbook-run)"
+    make_fake_cmux_auto_done "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        mkdir -p .agents/playbooks
+        cat > .agents/playbooks/review-qa.json <<'JSON'
+{
+  "steps": [
+    {"rpc": {"to": "claude", "body": "Review {{task}}", "save": "review"}},
+    {"rpc": {"to": "deepseek", "body": "QA {{task}} after {{review_body}}", "save": "qa"}},
+    {"print": "review={{review_body}}\nqa={{qa_body}}"}
+  ]
+}
+JSON
+        output=$(PATH="$repo_root/bin:$fakebin:$PATH" CMUX_AUTO_DONE_BODY="agent reply" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-playbook" run review-qa task="ship rpc")
+        printf '%s\n' "$output" | grep -qxF "review=agent reply"
+        printf '%s\n' "$output" | grep -qxF "qa=agent reply"
+        jq -s -e '
+            length == 4
+            and .[0].to == "claude"
+            and .[0].body == "Review ship rpc"
+            and .[2].to == "deepseek"
+            and .[2].body == "QA ship rpc after agent reply"
+        ' .agents/bus.jsonl >/dev/null
+    )
+
+    pass "agent-playbook runs JSON rpc workflows with interpolation"
+}
+
+test_agent_playbook_send_wait_and_path_file() {
+    local fakebin workspace output playbook_path
+    fakebin="$tmp_root/fakebin-playbook-send"
+    workspace="$(new_workspace playbook-send)"
+    make_fake_cmux_auto_done "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        playbook_path="$workspace/direct.json"
+        cat > "$playbook_path" <<'JSON'
+{
+  "steps": [
+    {"send": {"to": "claude", "type": "ask", "body": "Question {{topic}}", "save": "question_id"}},
+    {"wait": {"id": "{{question_id}}", "save": "answer"}},
+    {"print": "{{answer_status}}:{{answer_body}}"}
+  ]
+}
+JSON
+        output=$(PATH="$repo_root/bin:$fakebin:$PATH" CMUX_AUTO_DONE_BODY="wait reply" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-playbook" run "$playbook_path" topic="guards")
+        [ "$output" = "done:wait reply" ] || fail "agent-playbook did not print waited answer"
+    )
+
+    pass "agent-playbook supports send/wait and explicit playbook paths"
+}
+
+test_agent_playbook_rejects_invalid_inputs() {
+    local workspace
+    workspace="$(new_workspace playbook-invalid)"
+
+    (
+        cd "$workspace"
+        write_agents
+        mkdir -p .agents/playbooks
+        printf '%s\n' '{"steps":[{"bogus":{}}]}' > .agents/playbooks/bogus.json
+        printf '%s\n' '{"steps":[{"send":{},"rpc":{}}]}' > .agents/playbooks/multi-key.json
+        printf '%s\n' '{"no_steps":[]}' > .agents/playbooks/no-steps.json
+        if "$repo_root/bin/agent-playbook" run missing >/dev/null 2>&1; then
+            fail "agent-playbook accepted missing playbook"
+        fi
+        if "$repo_root/bin/agent-playbook" run no-steps >/dev/null 2>&1; then
+            fail "agent-playbook accepted playbook without steps"
+        fi
+        if "$repo_root/bin/agent-playbook" run bogus >/dev/null 2>&1; then
+            fail "agent-playbook accepted unsupported step"
+        fi
+        if "$repo_root/bin/agent-playbook" run multi-key >/dev/null 2>&1; then
+            fail "agent-playbook accepted multi-key step"
+        fi
+        if "$repo_root/bin/agent-playbook" run bogus badvar >/dev/null 2>&1; then
+            fail "agent-playbook accepted malformed variable"
+        fi
+    )
+
+    pass "agent-playbook rejects missing playbooks and invalid inputs"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_rejects_invalid_input
@@ -1162,5 +1253,8 @@ test_agent_wait_timeout_and_unknown_id
 test_agent_rpc_prints_response_body
 test_agent_rpc_json_and_blocked_status
 test_agent_rpc_rejects_invalid_recipients
+test_agent_playbook_runs_json_workflow
+test_agent_playbook_send_wait_and_path_file
+test_agent_playbook_rejects_invalid_inputs
 
 echo "passed $pass_count tests"

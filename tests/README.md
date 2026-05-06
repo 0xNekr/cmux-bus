@@ -26,6 +26,8 @@ Covered areas:
   git paths, path normalization, and pre-commit hook installation
 - `agent-rpc` request/response output, JSON output, blocked status, and invalid
   recipients
+- `agent-playbook` JSON workflows with variable interpolation, send/wait/rpc,
+  print output, and invalid playbooks
 - `agent-watch` snapshots and current-agent filtering
 - `agent-wait` final-status waits, timeouts, and unknown ids
 

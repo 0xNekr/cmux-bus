@@ -101,6 +101,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | `agent-guard check [--json] [--staged] [--agent NAME\|--all] [PATH...]` | Detect files that overlap `paths_claimed` by open threads. By default it ignores claims owned by the current registered surface; use `--agent NAME` outside cmux or `--all` to include every claim. `--staged` checks staged git paths for pre-commit usage. |
 | `agent-guard install [--force]` | Install a git pre-commit hook that runs `agent-guard check --staged` and blocks commits touching files claimed by another open thread. |
 | `agent-rpc [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] [--json] <agent> <body...>` | Send one `ask` to a single agent, wait for the thread to finish, and print the final body. Use `--json` to print the final event object. A blocked final event is printed and exits non-zero. |
+| `agent-playbook run <name-or-path> [KEY=VALUE...]` | Run a JSON workflow from `.agents/playbooks/<name>.json` or an explicit path. Supports `send`, `wait`, `rpc`, and `print` steps with `{{variable}}` interpolation. |
 | `agent-thread [--json] <id>` | Show the full event history for any event id in a thread. |
 | `agent-watch [--once] [--me] [--full] [--no-color] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, and `--full` to avoid body truncation. |
 | `agent-wait [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON and exits non-zero on timeout or unknown id. |
@@ -109,6 +110,28 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 Claims use Bash pattern matching, so glob characters such as `*`, `?`, and
 `[...]` are active. `**` is not recursive. A leading `./` is ignored when
 comparing paths.
+
+`agent-playbook` files are JSON and live well as local runtime state under
+`.agents/playbooks/`. `send.paths` uses the same comma-separated string format
+as `agent-send --paths`. `send.save` stores the event id directly; `wait.save`
+and `rpc.save` expose `<name>_id`, `<name>_status`, and `<name>_body`.
+Example:
+
+```json
+{
+  "steps": [
+    {"rpc": {"to": "claude", "body": "Review {{task}}", "save": "review"}},
+    {"rpc": {"to": "deepseek", "body": "QA {{task}}\nClaude said: {{review_body}}", "save": "qa"}},
+    {"print": "Claude: {{review_body}}\nDeepSeek: {{qa_body}}"}
+  ]
+}
+```
+
+Run it with:
+
+```sh
+agent-playbook run review-qa task="add agent-broadcast"
+```
 
 ## Recovery — what to do when a peer crashes
 
