@@ -720,6 +720,26 @@ test_agent_watch_skips_malformed_lines() {
     pass "agent-watch skips malformed bus lines"
 }
 
+test_agent_watch_truncates_long_bodies_unless_full() {
+    local workspace output full_output
+    workspace="$(new_workspace watch-truncate)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:("x" * 140)}' > .agents/bus.jsonl
+        output=$("$repo_root/bin/agent-watch" --once --lines 0)
+        printf '%s\n' "$output" | grep -q "xxx..."
+        if printf '%s\n' "$output" | grep -q "$(printf 'x%.0s' $(seq 1 140))"; then
+            fail "agent-watch printed full long body by default"
+        fi
+        full_output=$("$repo_root/bin/agent-watch" --once --full --lines 0)
+        printf '%s\n' "$full_output" | grep -q "$(printf 'x%.0s' $(seq 1 140))"
+    )
+
+    pass "agent-watch truncates long bodies unless --full is used"
+}
+
 test_agent_wait_returns_final_event() {
     local workspace
     workspace="$(new_workspace wait-final)"
@@ -788,6 +808,7 @@ test_agent_watch_snapshot
 test_agent_watch_filters_current_agent
 test_agent_watch_rejects_zero_interval
 test_agent_watch_skips_malformed_lines
+test_agent_watch_truncates_long_bodies_unless_full
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
 
