@@ -1,18 +1,39 @@
 #!/usr/bin/env bash
-# agent-watch [--once] [--me] [--full] [--no-color] [--lines N] [--interval SEC]
+# agent-watch [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]
 # Watch bus events as they are appended.
 
 set -euo pipefail
 
 usage() {
-    echo "usage: agent-watch [--once] [--me] [--full] [--no-color] [--lines N] [--interval SEC]" >&2
+    echo "usage: agent-watch [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]" >&2
     exit 2
+}
+
+clear_bus() {
+    local bus=".agents/bus.jsonl"
+    local lock=".agents/bus.lock"
+    local tries=0
+
+    trap 'rmdir ".agents/bus.lock" 2>/dev/null || true' EXIT INT TERM
+    while ! mkdir "$lock" 2>/dev/null; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            echo "agent-watch: timed out waiting for bus lock ($lock)" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+
+    : > "$bus"
+    rmdir "$lock"
+    trap - EXIT INT TERM
 }
 
 once=0
 me_only=0
 full=0
 no_color=0
+clear=0
 lines=20
 interval=1
 
@@ -22,6 +43,7 @@ while [ $# -gt 0 ]; do
         --me) me_only=1; shift;;
         --full) full=1; shift;;
         --no-color) no_color=1; shift;;
+        --clear) clear=1; shift;;
         --lines)
             [ $# -ge 2 ] || usage
             lines="$2"
@@ -48,6 +70,10 @@ fi
     echo "agent-watch: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
     exit 1
 }
+
+if [ "$clear" -eq 1 ]; then
+    clear_bus
+fi
 
 me=""
 if [ "$me_only" -eq 1 ]; then

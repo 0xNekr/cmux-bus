@@ -104,7 +104,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | `agent-playbook run <name-or-path> [KEY=VALUE...]` | Run a JSON workflow from `.agents/playbooks/<name>.json` or an explicit path. Supports `send`, `wait`, `rpc`, and `print` steps with `{{variable}}` interpolation. |
 | `agent-synthesize [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>` | Wait for multiple threads to finish, bundle their final replies, and ask the synthesis agent (default `claude`) for consensus, disagreements, and a recommendation. |
 | `agent-thread [--json] <id>` | Show the full event history for any event id in a thread. |
-| `agent-watch [--once] [--me] [--full] [--no-color] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, and `--full` to avoid body truncation. |
+| `agent-watch [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, `--full` to avoid body truncation, and `--clear` to truncate `.agents/bus.jsonl` before watching. |
 | `agent-wait [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON and exits non-zero on timeout or unknown id. |
 
 `agent-guard` treats `paths_claimed` as meaningful on open `handoff` events.

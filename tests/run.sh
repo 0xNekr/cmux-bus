@@ -1002,6 +1002,24 @@ test_agent_watch_accepts_no_color() {
     pass "agent-watch accepts no-color mode"
 }
 
+test_agent_watch_clear_truncates_bus_before_snapshot() {
+    local workspace output
+    workspace="$(new_workspace watch-clear)"
+
+    (
+        cd "$workspace"
+        write_agents
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"old event"}' > .agents/bus.jsonl
+        output=$("$repo_root/bin/agent-watch" --once --clear --lines 0)
+        if printf '%s\n' "$output" | grep -q "root1234"; then
+            fail "agent-watch --clear printed old events"
+        fi
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "0" ] || fail "agent-watch --clear did not truncate bus"
+    )
+
+    pass "agent-watch --clear truncates the bus before watching"
+}
+
 test_agent_wait_returns_final_event() {
     local workspace
     workspace="$(new_workspace wait-final)"
@@ -1300,6 +1318,7 @@ test_agent_watch_rejects_zero_interval
 test_agent_watch_skips_malformed_lines
 test_agent_watch_truncates_long_bodies_unless_full
 test_agent_watch_accepts_no_color
+test_agent_watch_clear_truncates_bus_before_snapshot
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
 test_agent_rpc_prints_response_body
