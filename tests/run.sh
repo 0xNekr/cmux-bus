@@ -452,6 +452,27 @@ test_agent_init_is_idempotent() {
     pass "agent-init keeps AGENTS.md and .gitignore idempotent"
 }
 
+test_agent_init_enforces_one_name_per_surface() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-rename"
+    workspace="$(new_workspace init-rename)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        # Register, then re-register a different name in the SAME pane (surface).
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" jean >/dev/null
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" leo)
+        jq -e '.agents == {"leo":"s1"}' .agents/agents.json >/dev/null || fail "rename left a ghost name on the surface"
+        printf '%s\n' "$out" | grep -q "replaced previous name(s) on this surface: jean" || fail "rename was not reported"
+        # A distinct surface keeps its own name; the renamed one is untouched.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-init" codex >/dev/null
+        jq -e '.agents == {"leo":"s1","codex":"s2"}' .agents/agents.json >/dev/null || fail "distinct surface registration affected"
+    )
+
+    pass "agent-init keeps one name per surface (rename replaces the old)"
+}
+
 test_install_links_all_commands() {
     local fakebin home tool
     fakebin="$tmp_root/fakebin-install"
@@ -1598,6 +1619,7 @@ test_agent_init_workspace_archives_closed_legacy_bus_files
 test_agent_init_workspace_refuses_open_legacy_bus_files
 test_agent_init_rejects_invalid_input
 test_agent_init_is_idempotent
+test_agent_init_enforces_one_name_per_surface
 test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal

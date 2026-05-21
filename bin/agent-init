@@ -128,8 +128,16 @@ if [ -n "$live" ]; then
     jq --argjson live "$live_json" '.agents = (.agents | with_entries(select(.value as $u | $live | index($u))))' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
 fi
 
+renamed=""
 tmp=$(mktemp)
-jq --arg n "$name" --arg s "$surface" '.agents[$n] = $s' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
+# A surface is one pane is one agent: enforce a 1:1 surface->name mapping. Drop
+# any other name already attached to this surface before registering, so
+# re-running agent-init with a new name in the same pane renames the agent
+# instead of leaving the old name behind as a ghost entry.
+renamed=$(jq -r --arg n "$name" --arg s "$surface" \
+    '.agents | to_entries | map(select(.value == $s and .key != $n)) | map(.key) | join(",")' "$agents_file")
+jq --arg n "$name" --arg s "$surface" \
+    '.agents |= (with_entries(select(.value != $s)) + {($n): $s})' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
 
 if [ "$AGENT_BUS_REPO_RUNTIME" -eq 1 ]; then
     ensure_agents_gitignore
@@ -302,6 +310,9 @@ if [ "$gitignore_action" != "skipped" ]; then
 fi
 if [ -n "$legacy_bus_action" ]; then
     echo "agent-init: $legacy_bus_action"
+fi
+if [ -n "$renamed" ]; then
+    echo "agent-init: replaced previous name(s) on this surface: $renamed"
 fi
 if [ -n "$purged" ]; then
     echo "agent-init: purged stale entries: $purged"
