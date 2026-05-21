@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+
+agent_script_path() {
+    local script_path="$1"
+    while [ -L "$script_path" ]; do
+        local script_dir link_target
+        script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+        link_target="$(readlink "$script_path")"
+        case "$link_target" in
+            /*) script_path="$link_target";;
+            *)  script_path="$script_dir/$link_target";;
+        esac
+    done
+    printf '%s\n' "$script_path"
+}
+
+AGENT_SCRIPT_PATH="$(agent_script_path "${BASH_SOURCE[1]}")"
+AGENT_BIN_DIR="$(cd "$(dirname "$AGENT_SCRIPT_PATH")" && pwd)"
+AGENT_REPO_ROOT="$(cd "$AGENT_BIN_DIR/.." && pwd)"
+
+AGENT_BUS_CLI_SCOPE=""
+AGENT_BUS_CLI_DIR=""
+AGENT_BUS_REMAINING_ARGS=()
+
+agent_bus_common_usage() {
+    cat <<'EOF'
+Common bus options:
+  --scope repo|workspace  select the bus scope for this invocation
+  --bus-dir DIR           use an explicit bus directory
+
+Environment:
+  AGENT_BUS_SCOPE=repo|workspace
+  AGENT_BUS_DIR=/path/to/bus
+
+Default scope is workspace.
+EOF
+}
+
+agent_bus_parse_common() {
+    AGENT_BUS_CLI_SCOPE=""
+    AGENT_BUS_CLI_DIR=""
+    AGENT_BUS_REMAINING_ARGS=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --scope)
+                [ $# -ge 2 ] || { echo "${AGENT_CMD}: --scope needs repo or workspace" >&2; exit 2; }
+                AGENT_BUS_CLI_SCOPE="$2"
+                shift 2
+                ;;
+            --scope=*)
+                AGENT_BUS_CLI_SCOPE="${1#--scope=}"
+                shift
+                ;;
+            --bus-dir)
+                [ $# -ge 2 ] || { echo "${AGENT_CMD}: --bus-dir needs a directory" >&2; exit 2; }
+                AGENT_BUS_CLI_DIR="$2"
+                shift 2
+                ;;
+            --bus-dir=*)
+                AGENT_BUS_CLI_DIR="${1#--bus-dir=}"
+                shift
+                ;;
+            --)
+                shift
+                while [ $# -gt 0 ]; do
+                    AGENT_BUS_REMAINING_ARGS+=("$1")
+                    shift
+                done
+                break
+                ;;
+            *)
+                AGENT_BUS_REMAINING_ARGS+=("$1")
+                shift
+                ;;
+        esac
+    done
+}
+
+agent_bus_scope() {
+    local scope="${AGENT_BUS_CLI_SCOPE:-${AGENT_BUS_SCOPE:-workspace}}"
+    case "$scope" in
+        repo|workspace) printf '%s\n' "$scope";;
+        *) echo "${AGENT_CMD}: invalid bus scope '$scope' (repo|workspace)" >&2; exit 2;;
+    esac
+}
+
+agent_bus_state_home() {
+    if [ -n "${XDG_STATE_HOME:-}" ]; then
+        printf '%s\n' "$XDG_STATE_HOME"
+    else
+        printf '%s\n' "$HOME/.local/state"
+    fi
+}
+
+agent_bus_workspace_id() {
+    local id="${CMUX_WORKSPACE_ID:-}"
+    if [ -z "$id" ] && command -v cmux >/dev/null 2>&1; then
+        # Resolve the *caller's* workspace from its surface, never the focused
+        # one. `cmux current-workspace` returns whichever workspace is currently
+        # selected in the UI, which is wrong for a background agent pane and
+        # would silently route it to a peer workspace's bus — the root cause of
+        # "agents on the wrong bus" when several workspaces share one folder.
+        # `cmux identify` is bound to this pane's CMUX_SURFACE_ID, so its
+        # caller.workspace_id is always the workspace this command runs in.
+        id="$(cmux identify --id-format both 2>/dev/null \
+            | jq -r '.caller.workspace_id // empty' 2>/dev/null)"
+    fi
+    [ -n "$id" ] || {
+        echo "${AGENT_CMD}: cannot determine cmux workspace id (CMUX_WORKSPACE_ID unset and 'cmux identify' gave no caller workspace); set AGENT_BUS_DIR or use --scope repo" >&2
+        exit 1
+    }
+    printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_'
+}
+
+agent_bus_resolve_dir() {
+    if [ -n "$AGENT_BUS_CLI_DIR" ]; then
+        printf '%s\n' "$AGENT_BUS_CLI_DIR"
+        return 0
+    fi
+    if [ -n "${AGENT_BUS_DIR:-}" ]; then
+        printf '%s\n' "$AGENT_BUS_DIR"
+        return 0
+    fi
+
+    case "$(agent_bus_scope)" in
+        repo) printf '%s\n' ".agents";;
+        workspace)
+            printf '%s/cmux-bus/workspaces/%s\n' "$(agent_bus_state_home)" "$(agent_bus_workspace_id)"
+            ;;
+    esac
+}
+
+agent_bus_set_paths() {
+    AGENT_BUS_SCOPE_EFFECTIVE="$(agent_bus_scope)"
+    AGENT_BUS_DIR_EFFECTIVE="$(agent_bus_resolve_dir)"
+    AGENT_BUS_FILE="$AGENT_BUS_DIR_EFFECTIVE/bus.jsonl"
+    AGENT_BUS_LOCK="$AGENT_BUS_DIR_EFFECTIVE/bus.lock"
+    AGENT_BUS_AGENTS_FILE="$AGENT_BUS_DIR_EFFECTIVE/agents.json"
+    AGENT_BUS_PROTOCOL_FILE="$AGENT_BUS_DIR_EFFECTIVE/PROTOCOL.md"
+    AGENT_BUS_REPO_RUNTIME=0
+    if [ "$AGENT_BUS_SCOPE_EFFECTIVE" = "repo" ] && [ -z "$AGENT_BUS_CLI_DIR" ] && [ -z "${AGENT_BUS_DIR:-}" ]; then
+        AGENT_BUS_REPO_RUNTIME=1
+    fi
+}
+
+agent_bus_export_env() {
+    export AGENT_BUS_SCOPE="$AGENT_BUS_SCOPE_EFFECTIVE"
+    export AGENT_BUS_DIR="$AGENT_BUS_DIR_EFFECTIVE"
+}
+
+agent_bus_need_existing() {
+    [ -d "$AGENT_BUS_DIR_EFFECTIVE" ] && [ -f "$AGENT_BUS_FILE" ] || {
+        echo "${AGENT_CMD}: no bus at $AGENT_BUS_DIR_EFFECTIVE — run 'agent-init <your_name>' first" >&2
+        exit 1
+    }
+}
+
+agent_bus_need_agents() {
+    [ -f "$AGENT_BUS_AGENTS_FILE" ] || {
+        echo "${AGENT_CMD}: no agents registry at $AGENT_BUS_AGENTS_FILE — run 'agent-init <your_name>' first" >&2
+        exit 1
+    }
+}
+
+agent_bus_append_event() {
+    local event="$1"
+    local tries=0
+
+    case "$event" in
+        *$'\n'*|*$'\r'*)
+            echo "${AGENT_CMD}: refusing to append event with raw newline/control characters" >&2
+            exit 1
+            ;;
+    esac
+
+    printf '%s\n' "$event" | jq -e '
+        type == "object"
+        and (.id | type == "string")
+        and (.ts | type == "string")
+        and (.from | type == "string")
+        and (.to | type == "string")
+        and (.type | IN("ask","handoff","done","block","ack"))
+        and ((.ref == null) or (.ref | type == "string"))
+        and (.status | IN("open","in_progress","done","blocked"))
+        and (.paths_claimed | type == "array")
+        and ((.cwd == null) or (.cwd | type == "string"))
+        and (.body | type == "string")
+    ' >/dev/null || {
+        echo "${AGENT_CMD}: generated event does not match the bus schema" >&2
+        exit 1
+    }
+
+    trap 'rmdir "$AGENT_BUS_LOCK" 2>/dev/null || true' EXIT INT TERM
+    while ! mkdir "$AGENT_BUS_LOCK" 2>/dev/null; do
+        tries=$((tries + 1))
+        if [ "$tries" -ge 100 ]; then
+            echo "${AGENT_CMD}: timed out waiting for bus lock ($AGENT_BUS_LOCK)" >&2
+            exit 1
+        fi
+        sleep 0.1
+    done
+
+    printf '%s\n' "$event" >> "$AGENT_BUS_FILE"
+    rmdir "$AGENT_BUS_LOCK"
+    trap - EXIT INT TERM
+}
+
+agent_bus_current_agent() {
+    local surface="${CMUX_SURFACE_ID:-}"
+    [ -n "$surface" ] || return 0
+    [ -f "$AGENT_BUS_AGENTS_FILE" ] || return 0
+    jq -r --arg s "$surface" '.agents | to_entries[] | select(.value == $s) | .key' "$AGENT_BUS_AGENTS_FILE" | head -n1
+}
+
+agent_bus_open_thread_count() {
+    local bus_file="$1"
+    [ -f "$bus_file" ] || { printf '0\n'; return 0; }
+    jq -Rsr '
+        def root($m;$e):
+            if ($e.ref == null or ($m[$e.ref] == null)) then $e.id else root($m;$m[$e.ref]) end;
+
+        split("\n")
+        | map(fromjson?)
+        | map(select(type == "object" and (.id | type == "string"))) as $events
+        | ($events | map({key:.id, value:.}) | from_entries) as $m
+        | ($events
+            | map(. + {root: root($m;.)})
+            | group_by(.root)
+            | map({root: .[0].root, last: .[-1]})
+          )
+        | map(select(.last.status | IN("done","blocked") | not))
+        | length
+    ' "$bus_file"
+}
+
+agent_bus_write_workspace_stub() {
+    local stub_dir="${1:-.agents}"
+    local archive_note="${2:-}"
+    mkdir -p "$stub_dir"
+
+    # This stub lives in the *folder*, but the bus is scoped per cmux
+    # *workspace*. One folder can be open in several workspaces at once, each
+    # with its own separate bus, so the stub must never hardcode a single
+    # resolved bus path — whichever workspace ran agent-init last would win and
+    # point every other workspace's agents at the wrong bus. Describe the
+    # resolution rule instead and let the agent commands resolve per pane.
+    local state_home
+    state_home="$(agent_bus_state_home)"
+
+    cat > "$stub_dir/PROTOCOL.md" <<EOF
+# cmux-bus workspace-scope stub
+
+This .agents directory is NOT the active bus. The active bus is scoped to your
+cmux workspace, not to this folder. This folder may be open in several cmux
+workspaces at once, each with its own separate bus, so a single file here cannot
+name the right one for everyone — it deliberately does not.
+
+Always use the agent commands. They resolve the bus for *your* pane from its
+CMUX_WORKSPACE_ID:
+
+\`\`\`sh
+agent-inbox
+agent-send <peer> <type> <body>
+agent-done <id> <body>
+\`\`\`
+
+Bus location (resolved per workspace — do not hardcode):
+
+\`\`\`txt
+$state_home/cmux-bus/workspaces/<your-cmux-workspace-id>/
+\`\`\`
+
+Do not read .agents/agents.json or .agents/bus.jsonl as the source of truth.
+Do not use cmux send as a fallback when a peer is missing; ask the peer to run
+\`agent-init <name>\` in their current pane.
+
+Use \`--scope repo\` only when you intentionally want a folder-local legacy bus
+shared by every workspace that opens this folder.
+$archive_note
+EOF
+
+    cat > "$stub_dir/README.md" <<EOF
+# cmux-bus stub
+
+The active bus is workspace-scoped: each cmux workspace that opens this folder
+gets its own bus under
+
+\`\`\`txt
+$state_home/cmux-bus/workspaces/<your-cmux-workspace-id>/
+\`\`\`
+
+Run \`agent-inbox\` and \`agent-send\` instead of reading files in this
+directory; they resolve the right workspace bus for your pane. This stub exists
+to prevent stale folder-local bus files from misleading agents.
+$archive_note
+EOF
+}

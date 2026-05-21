@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
-# agent-synthesize [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>
+# agent-synthesize [--scope repo|workspace] [--bus-dir DIR] [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>
 # Collect final replies from multiple threads and ask one agent to synthesize.
 
 set -euo pipefail
 
+AGENT_CMD="agent-synthesize"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
 usage() {
     cat >&2 <<EOF
-usage: agent-synthesize [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>
+usage: agent-synthesize [--scope repo|workspace] [--bus-dir DIR] [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>
 
 Waits for each thread id to reach a final state, then asks the synthesis agent
 to produce consensus, disagreements, and a recommendation.
 EOF
+    agent_bus_common_usage >&2
     exit 2
 }
 
@@ -18,6 +31,15 @@ agent="claude"
 timeout=600
 interval=1
 json=0
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+agent_bus_set_paths
+agent_bus_export_env
 
 while [ $# -gt 0 ]; do
     case "$1" in

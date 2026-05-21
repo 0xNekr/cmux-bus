@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agent-resume <id> [--force] [body]
+# agent-resume [--scope repo|workspace] [--bus-dir DIR] <id> [--force] [body]
 # Re-handoff a thread to its original recipient (the 'to' of the root event).
 # Useful when the peer crashed mid-task: the thread chain stays intact, a new
 # handoff event becomes the latest state, and the peer's inbox sees it again.
@@ -7,17 +7,37 @@
 
 set -euo pipefail
 
+AGENT_CMD="agent-resume"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
 usage() {
     cat >&2 <<EOF
-usage: agent-resume <id> [--force] [body]
+usage: agent-resume [--scope repo|workspace] [--bus-dir DIR] <id> [--force] [body]
   id       any event id in the thread (resolves to thread root automatically)
   body     new handoff body (default: "RESUME: <previous root body>")
   --force  allow resuming a thread already done/blocked
 
 prints the new event id on stdout
 EOF
+    agent_bus_common_usage >&2
     exit 2
 }
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
 
 [ $# -ge 1 ] || usage
 id="$1"; shift
@@ -33,17 +53,15 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-[ -d .agents ] && [ -f .agents/bus.jsonl ] || {
-    echo "agent-resume: no .agents/ here — run 'agent-init <your_name>' first" >&2
-    exit 1
-}
+agent_bus_set_paths
+agent_bus_need_existing
 
 root=$(jq -Rrs --arg id "$id" '
     def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
     split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events |
     ($events | map({key:.id,value:.}) | from_entries) as $m |
     if $m[$id] == null then "" else root($m;$m[$id]) end
-' .agents/bus.jsonl)
+' "$AGENT_BUS_FILE")
 
 [ -n "$root" ] || {
     echo "agent-resume: event id '$id' not found in bus" >&2
@@ -52,7 +70,7 @@ root=$(jq -Rrs --arg id "$id" '
 
 root_event=$(jq -Rcs --arg root "$root" '
     split("\n") | map(fromjson?) | map(select(type=="object" and .id == $root)) | .[0]
-' .agents/bus.jsonl)
+' "$AGENT_BUS_FILE")
 
 orig_recipient=$(echo "$root_event" | jq -r '.to')
 prev_body=$(echo "$root_event" | jq -r '.body')
@@ -73,7 +91,7 @@ last_status=$(jq -Rrs --arg root "$root" '
     split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events |
     ($events | map({key:.id,value:.}) | from_entries) as $m |
     $events | map(select(thread_root($m;.) == $root)) | last | .status
-' .agents/bus.jsonl)
+' "$AGENT_BUS_FILE")
 
 if [ "$last_status" = "done" ] || [ "$last_status" = "blocked" ]; then
     if [ $force -ne 1 ]; then
@@ -86,4 +104,5 @@ if [ -z "$body" ]; then
     body="RESUME: $prev_body"
 fi
 
+agent_bus_export_env
 agent-send "$orig_recipient" handoff --ref "$root" "$body"

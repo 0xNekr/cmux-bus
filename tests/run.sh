@@ -6,6 +6,7 @@ tmp_root="$(mktemp -d)"
 trap 'rm -rf "$tmp_root"' EXIT
 
 pass_count=0
+export AGENT_BUS_SCOPE=repo
 
 fail() {
     echo "not ok - $1" >&2
@@ -36,6 +37,14 @@ if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
     fi
     exit 0
 fi
+if [ "$1" = "identify" ]; then
+    printf '{"caller":{"workspace_id":"%s"}}\n' "${FAKE_CALLER_WS:-}"
+    exit 0
+fi
+if [ "$1" = "current-workspace" ]; then
+    printf 'workspace:test\n'
+    exit 0
+fi
 exit 0
 CMUX
     chmod +x "$dir/cmux"
@@ -56,6 +65,14 @@ if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
     if [ -n "${CMUX_LOG:-}" ]; then
         printf '%s\n' "$*" >> "$CMUX_LOG"
     fi
+    exit 0
+fi
+if [ "$1" = "identify" ]; then
+    printf '{"caller":{"workspace_id":"%s"}}\n' "${FAKE_CALLER_WS:-}"
+    exit 0
+fi
+if [ "$1" = "current-workspace" ]; then
+    printf 'workspace:test\n'
     exit 0
 fi
 exit 0
@@ -124,6 +141,14 @@ if [ "$1" = "send-key" ]; then
     fi
     exit 0
 fi
+if [ "$1" = "identify" ]; then
+    printf '{"caller":{"workspace_id":"%s"}}\n' "${FAKE_CALLER_WS:-}"
+    exit 0
+fi
+if [ "$1" = "current-workspace" ]; then
+    printf 'workspace:test\n'
+    exit 0
+fi
 exit 0
 CMUX
     chmod +x "$dir/cmux"
@@ -180,6 +205,214 @@ test_agent_init_via_symlink() {
     pass "agent-init resolves repo files through symlink"
 }
 
+test_agent_init_defaults_to_workspace_scope() {
+    local fakebin home workspace bus output
+    fakebin="$tmp_root/fakebin-init-workspace"
+    home="$tmp_root/home-init-workspace"
+    workspace="$(new_workspace init-workspace)"
+    bus="$home/.local/state/cmux-bus/workspaces/ws-default"
+    make_fake_cmux "$fakebin"
+    mkdir -p "$home"
+
+    (
+        cd "$workspace"
+        env -u AGENT_BUS_SCOPE PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-default CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" codex >/dev/null
+        [ -f "$bus/bus.jsonl" ] || fail "workspace bus.jsonl missing"
+        [ -f "$bus/agents.json" ] || fail "workspace agents.json missing"
+        [ -f "$bus/PROTOCOL.md" ] || fail "workspace PROTOCOL.md missing"
+        grep -q "workspace-scope stub" .agents/PROTOCOL.md
+        [ ! -e .agents/bus.jsonl ] || fail "workspace scope created a folder-local bus.jsonl"
+        [ ! -e .agents/agents.json ] || fail "workspace scope created a folder-local agents.json"
+        jq -e '.agents.codex == "s1"' "$bus/agents.json" >/dev/null
+        output=$(env -u AGENT_BUS_SCOPE HOME="$home" CMUX_WORKSPACE_ID=ws-default CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-inbox")
+        [ "$output" = "agent-inbox: no open threads for codex" ] || fail "workspace inbox did not use default workspace bus: $output"
+        env -u AGENT_BUS_SCOPE PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-default CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" codex >/dev/null
+        [ "$(find . -maxdepth 1 -type d -name '.agents.repo-legacy-*' | wc -l | tr -d ' ')" = "0" ] || fail "workspace stub was re-archived on second init"
+    )
+
+    pass "agent-init defaults to cmux workspace bus"
+}
+
+test_scope_cli_overrides_env() {
+    local fakebin home workspace bus
+    fakebin="$tmp_root/fakebin-scope-override"
+    home="$tmp_root/home-scope-override"
+    workspace="$(new_workspace scope-override)"
+    bus="$home/.local/state/cmux-bus/workspaces/ws-override"
+    make_fake_cmux "$fakebin"
+    mkdir -p "$home"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-override CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" --scope workspace codex >/dev/null
+        [ -f "$bus/bus.jsonl" ] || fail "--scope workspace did not override AGENT_BUS_SCOPE=repo"
+        grep -q "workspace-scope stub" .agents/PROTOCOL.md
+        [ ! -e .agents/bus.jsonl ] || fail "--scope workspace unexpectedly created a folder-local bus"
+    )
+
+    pass "command-line scope overrides AGENT_BUS_SCOPE"
+}
+
+test_agent_init_isolates_same_folder_across_workspaces() {
+    local fakebin home workspace bus_a bus_b cmux_log out_a
+    fakebin="$tmp_root/fakebin-multiws"
+    home="$tmp_root/home-multiws"
+    workspace="$(new_workspace multiws)"
+    bus_a="$home/.local/state/cmux-bus/workspaces/ws-a"
+    bus_b="$home/.local/state/cmux-bus/workspaces/ws-b"
+    cmux_log="$tmp_root/cmux-multiws.log"
+    mkdir -p "$fakebin" "$home"
+
+    # One folder open in two cmux workspaces; surfaces of both are live.
+    cat > "$fakebin/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    cat <<'OUT'
+surface:1 sa1 type=terminal in_window=true
+surface:2 sa2 type=terminal in_window=true
+surface:3 sb1 type=terminal in_window=true
+surface:4 sb2 type=terminal in_window=true
+OUT
+    exit 0
+fi
+if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
+    [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+    exit 0
+fi
+exit 0
+CMUX
+    chmod +x "$fakebin/cmux"
+
+    (
+        cd "$workspace"
+        # Each workspace registers an agent named "claude" (and a "codex" peer).
+        for spec in "ws-a:claude:sa1" "ws-a:codex:sa2" "ws-b:claude:sb1" "ws-b:codex:sb2"; do
+            wsid="${spec%%:*}"; rest="${spec#*:}"; agent="${rest%%:*}"; surf="${rest#*:}"
+            env -u AGENT_BUS_SCOPE PATH="$fakebin:$PATH" HOME="$home" \
+                CMUX_WORKSPACE_ID="$wsid" CMUX_SURFACE_ID="$surf" \
+                "$repo_root/bin/agent-init" "$agent" >/dev/null
+        done
+
+        # Two separate buses, no name collision: each "claude" keeps its own surface.
+        jq -e '.agents.claude == "sa1"' "$bus_a/agents.json" >/dev/null || fail "ws-a claude surface clobbered"
+        jq -e '.agents.claude == "sb1"' "$bus_b/agents.json" >/dev/null || fail "ws-b claude surface clobbered"
+
+        # The shared folder stub must not hardcode either workspace's bus path.
+        grep -q "workspace-scope stub" .agents/PROTOCOL.md || fail "stub header missing"
+        ! grep -q "workspaces/ws-a" .agents/PROTOCOL.md || fail "stub leaked ws-a bus path"
+        ! grep -q "workspaces/ws-b" .agents/PROTOCOL.md || fail "stub leaked ws-b bus path"
+
+        # Each pane's inbox resolves its own workspace bus.
+        out_a=$(env -u AGENT_BUS_SCOPE PATH="$fakebin:$PATH" HOME="$home" \
+            CMUX_WORKSPACE_ID=ws-a CMUX_SURFACE_ID=sa1 "$repo_root/bin/agent-inbox")
+        [ "$out_a" = "agent-inbox: no open threads for claude" ] || fail "ws-a inbox resolved wrong bus: $out_a"
+
+        # Signalling stays inside the workspace: claude@ws-a reaches codex@ws-a (sa2),
+        # never the same-named peer in ws-b (sb2).
+        env -u AGENT_BUS_SCOPE PATH="$fakebin:$PATH" HOME="$home" CMUX_LOG="$cmux_log" \
+            CMUX_WORKSPACE_ID=ws-a CMUX_SURFACE_ID=sa1 \
+            "$repo_root/bin/agent-send" codex handoff "ping" >/dev/null
+        grep -q "send --surface sa2 " "$cmux_log" || fail "ws-a send did not target its own peer surface"
+        ! grep -q "surface sb2" "$cmux_log" || fail "ws-a send leaked into ws-b peer surface"
+
+        # ws-a only knows ws-a peers (codex); ws-b's bus is invisible from here.
+        if env -u AGENT_BUS_SCOPE PATH="$fakebin:$PATH" HOME="$home" \
+            CMUX_WORKSPACE_ID=ws-a CMUX_SURFACE_ID=sa1 \
+            "$repo_root/bin/agent-send" deepseek ask "x" >/dev/null 2>&1; then
+            fail "ws-a reached an agent it never registered"
+        fi
+    )
+
+    pass "agent-init isolates buses when one folder is open in multiple workspaces"
+}
+
+test_workspace_id_resolves_caller_not_focused() {
+    local fakebin home workspace bus_caller bus_focused
+    fakebin="$tmp_root/fakebin-fallback"
+    home="$tmp_root/home-fallback"
+    workspace="$(new_workspace fallback-ws)"
+    bus_caller="$home/.local/state/cmux-bus/workspaces/ws-caller"
+    bus_focused="$home/.local/state/cmux-bus/workspaces/test"
+    make_fake_cmux "$fakebin"
+    mkdir -p "$home"
+
+    (
+        cd "$workspace"
+        # CMUX_WORKSPACE_ID unset: resolution must use the caller's workspace via
+        # `cmux identify` (ws-caller), not the focused workspace that
+        # `cmux current-workspace` reports (workspace:test).
+        env -u AGENT_BUS_SCOPE -u CMUX_WORKSPACE_ID PATH="$fakebin:$PATH" HOME="$home" \
+            FAKE_CALLER_WS=ws-caller CMUX_SURFACE_ID=s1 \
+            "$repo_root/bin/agent-init" codex >/dev/null
+        [ -f "$bus_caller/agents.json" ] || fail "fallback did not resolve caller workspace bus"
+        [ ! -e "$bus_focused/agents.json" ] || fail "fallback wrongly used focused workspace"
+    )
+
+    pass "workspace id resolves the caller workspace, not the focused one"
+}
+
+test_agent_init_workspace_archives_closed_legacy_bus_files() {
+    local fakebin home workspace archive
+    fakebin="$tmp_root/fakebin-init-archive"
+    home="$tmp_root/home-init-archive"
+    workspace="$(new_workspace init-archive)"
+    make_fake_cmux "$fakebin"
+    mkdir -p "$home"
+
+    (
+        cd "$workspace"
+        mkdir -p .agents/skills/local
+        printf '%s\n' "keep me" > .agents/skills/local/README.md
+        printf '%s\n' '{"agents":{"codex":"old-surface"}}' > .agents/agents.json
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"old"}' > .agents/bus.jsonl
+        jq -nc '{id:"done1234",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"done",ref:"root1234",status:"done",paths_claimed:[],body:"done"}' >> .agents/bus.jsonl
+        printf '%s\n' "legacy protocol" > .agents/PROTOCOL.md
+
+        PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-archive CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" --scope workspace codex > init.out
+
+        [ ! -e .agents/bus.jsonl ] || fail "legacy bus.jsonl was not archived"
+        [ ! -e .agents/agents.json ] || fail "legacy agents.json was not archived"
+        grep -q "workspace-scope stub" .agents/PROTOCOL.md
+        grep -q "active bus" .agents/README.md
+        [ -f .agents/skills/local/README.md ] || fail "non-bus .agents content was moved"
+        archive="$(find . -maxdepth 1 -type d -name '.agents.repo-legacy-*' | head -n1)"
+        [ -n "$archive" ] || fail "legacy archive directory missing"
+        [ -f "$archive/bus.jsonl" ] || fail "archive missing bus.jsonl"
+        [ -f "$archive/agents.json" ] || fail "archive missing agents.json"
+        grep -q "archived legacy repo bus files" init.out
+    )
+
+    pass "agent-init workspace archives closed legacy bus files and writes stub"
+}
+
+test_agent_init_workspace_refuses_open_legacy_bus_files() {
+    local fakebin home workspace bus
+    fakebin="$tmp_root/fakebin-init-refuse-open"
+    home="$tmp_root/home-init-refuse-open"
+    workspace="$(new_workspace init-refuse-open)"
+    bus="$home/.local/state/cmux-bus/workspaces/ws-refuse-open"
+    make_fake_cmux "$fakebin"
+    mkdir -p "$home"
+
+    (
+        cd "$workspace"
+        mkdir -p .agents
+        printf '%s\n' '{"agents":{"codex":"old-surface"}}' > .agents/agents.json
+        jq -nc '{id:"root1234",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"ask",ref:null,status:"open",paths_claimed:[],body:"old"}' > .agents/bus.jsonl
+        printf '%s\n' "legacy protocol" > .agents/PROTOCOL.md
+
+        if PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-refuse-open CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" --scope workspace codex > init.out 2> init.err; then
+            fail "agent-init switched scope with open legacy threads"
+        fi
+        grep -q "legacy .agents/bus.jsonl has 1 open thread" init.err
+        [ -f .agents/bus.jsonl ] || fail "open legacy bus was moved"
+        [ ! -e "$bus/bus.jsonl" ] || fail "workspace bus was created despite refusal"
+        ! grep -q "workspace-scope stub" .agents/PROTOCOL.md || fail "stub overwrote open legacy protocol"
+    )
+
+    pass "agent-init workspace refuses open legacy bus files"
+}
+
 test_agent_init_rejects_invalid_input() {
     local fakebin workspace
     fakebin="$tmp_root/fakebin-init-invalid"
@@ -227,7 +460,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait; do
+    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -415,6 +648,26 @@ test_agent_send_rejects_invalid_recipient_type_and_status() {
     )
 
     pass "agent-send rejects invalid recipient, type, and status"
+}
+
+test_agent_send_unknown_recipient_warns_against_cmux_fallback() {
+    local fakebin workspace err_file
+    fakebin="$tmp_root/fakebin-send-unknown-message"
+    workspace="$(new_workspace send-unknown-message)"
+    err_file="$tmp_root/send-unknown-message.err"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" missing ask "body" 2>"$err_file"; then
+            fail "agent-send accepted missing recipient"
+        fi
+        grep -q "do not use 'cmux send' as a fallback" "$err_file"
+        grep -q "agent-init missing" "$err_file"
+    )
+
+    pass "agent-send unknown recipient warns against cmux fallback"
 }
 
 test_agent_send_user_does_not_signal() {
@@ -697,6 +950,31 @@ test_agent_doctor_reports_malformed_jsonl() {
     pass "agent-doctor reports malformed JSONL"
 }
 
+test_agent_doctor_reports_workspace_split_brain() {
+    local workspace bus
+    workspace="$(new_workspace doctor-split-brain)"
+    bus="$workspace/workspace-bus"
+
+    (
+        cd "$workspace"
+        mkdir -p "$bus" .agents
+        printf '%s\n' '{"agents":{"codex":"s1"}}' > "$bus/agents.json"
+        : > "$bus/bus.jsonl"
+        printf '%s\n' '{"agents":{"codex":"old"}}' > .agents/agents.json
+        : > .agents/bus.jsonl
+        printf '%s\n' "legacy protocol" > .agents/PROTOCOL.md
+
+        if "$repo_root/bin/agent-doctor" --bus-dir "$bus" > doctor.out; then
+            fail "agent-doctor accepted split-brain workspace/repo bus"
+        fi
+        grep -q "legacy .agents/bus.jsonl exists" doctor.out
+        grep -q "legacy .agents/agents.json exists" doctor.out
+        grep -q "legacy .agents/PROTOCOL.md exists" doctor.out
+    )
+
+    pass "agent-doctor reports workspace/repo split-brain"
+}
+
 test_agent_repair_dry_run_and_fix() {
     local workspace output
     workspace="$(new_workspace repair)"
@@ -825,6 +1103,40 @@ test_agent_guard_normalizes_dot_slash_and_ignores_ack_claims() {
     )
 
     pass "agent-guard normalizes ./ prefixes and ignores non-handoff claims"
+}
+
+test_agent_guard_uses_event_cwd_in_workspace_scope() {
+    local fakebin home root_a root_b
+    fakebin="$tmp_root/fakebin-guard-cwd"
+    home="$tmp_root/home-guard-cwd"
+    root_a="$(new_workspace guard-cwd-a)"
+    root_b="$(new_workspace guard-cwd-b)"
+    make_fake_cmux "$fakebin"
+    mkdir -p "$home"
+
+    (
+        cd "$root_a"
+        PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-guard-cwd CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" --scope workspace codex >/dev/null
+    )
+    (
+        cd "$root_b"
+        PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-guard-cwd CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-init" --scope workspace claude >/dev/null
+    )
+
+    (
+        cd "$root_a"
+        PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-guard-cwd CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" --scope workspace claude handoff --paths "src/api.ts" "edit a" >/dev/null
+        if PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-guard-cwd CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-guard" --scope workspace check --agent codex src/api.ts >/dev/null 2>&1; then
+            fail "agent-guard missed same-cwd workspace claim"
+        fi
+    )
+
+    (
+        cd "$root_b"
+        PATH="$fakebin:$PATH" HOME="$home" CMUX_WORKSPACE_ID=ws-guard-cwd CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-guard" --scope workspace check --agent codex src/api.ts >/dev/null
+    )
+
+    pass "agent-guard interprets workspace claims relative to event cwd"
 }
 
 test_agent_guard_install_preserves_existing_hooks() {
@@ -1278,6 +1590,12 @@ test_agent_synthesize_json_and_unknown_id() {
 
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
+test_agent_init_defaults_to_workspace_scope
+test_scope_cli_overrides_env
+test_agent_init_isolates_same_folder_across_workspaces
+test_workspace_id_resolves_caller_not_focused
+test_agent_init_workspace_archives_closed_legacy_bus_files
+test_agent_init_workspace_refuses_open_legacy_bus_files
 test_agent_init_rejects_invalid_input
 test_agent_init_is_idempotent
 test_install_links_all_commands
@@ -1289,6 +1607,7 @@ test_agent_send_broadcast_normalizes_recipients
 test_agent_send_broadcast_allows_user_in_csv
 test_agent_send_broadcast_rejects_stale_batch
 test_agent_send_rejects_invalid_recipient_type_and_status
+test_agent_send_unknown_recipient_warns_against_cmux_fallback
 test_agent_send_user_does_not_signal
 test_agent_send_rejects_stale_recipient
 test_agent_send_multiline_body
@@ -1303,12 +1622,14 @@ test_agent_inbox_stale_and_stuck
 test_agent_doctor_ok_and_summary
 test_agent_doctor_reports_bus_problems
 test_agent_doctor_reports_malformed_jsonl
+test_agent_doctor_reports_workspace_split_brain
 test_agent_repair_dry_run_and_fix
 test_agent_repair_noop
 test_agent_guard_reports_open_claim_conflicts
 test_agent_guard_ignores_closed_threads_and_outputs_json
 test_agent_guard_checks_staged_paths
 test_agent_guard_normalizes_dot_slash_and_ignores_ack_claims
+test_agent_guard_uses_event_cwd_in_workspace_scope
 test_agent_guard_install_preserves_existing_hooks
 test_agent_thread_shows_history
 test_agent_thread_json_and_unknown_id

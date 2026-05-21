@@ -1,21 +1,41 @@
 #!/usr/bin/env bash
-# agent-cancel <id> [--force] [reason]
+# agent-cancel [--scope repo|workspace] [--bus-dir DIR] <id> [--force] [reason]
 # Close a thread by appending a 'block' event to=user with the given reason.
 # Refuses to cancel a thread already done or blocked, unless --force is given.
 
 set -euo pipefail
 
+AGENT_CMD="agent-cancel"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
 usage() {
     cat >&2 <<EOF
-usage: agent-cancel <id> [--force] [reason]
+usage: agent-cancel [--scope repo|workspace] [--bus-dir DIR] <id> [--force] [reason]
   id       any event id in the thread (resolves to thread root automatically)
   reason   free text (default: "cancelled")
   --force  allow cancelling a thread already done/blocked
 
 prints the new event id on stdout
 EOF
+    agent_bus_common_usage >&2
     exit 2
 }
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
 
 [ $# -ge 1 ] || usage
 id="$1"; shift
@@ -33,17 +53,15 @@ done
 
 [ -z "$reason" ] && reason="cancelled"
 
-[ -d .agents ] && [ -f .agents/bus.jsonl ] || {
-    echo "agent-cancel: no .agents/ here — run 'agent-init <your_name>' first" >&2
-    exit 1
-}
+agent_bus_set_paths
+agent_bus_need_existing
 
 root=$(jq -Rrs --arg id "$id" '
     def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
     split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events |
     ($events | map({key:.id,value:.}) | from_entries) as $m |
     if $m[$id] == null then "" else root($m;$m[$id]) end
-' .agents/bus.jsonl)
+' "$AGENT_BUS_FILE")
 
 [ -n "$root" ] || {
     echo "agent-cancel: event id '$id' not found in bus" >&2
@@ -55,7 +73,7 @@ last_status=$(jq -Rrs --arg root "$root" '
     split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events |
     ($events | map({key:.id,value:.}) | from_entries) as $m |
     $events | map(select(thread_root($m;.) == $root)) | last | .status
-' .agents/bus.jsonl)
+' "$AGENT_BUS_FILE")
 
 if [ "$last_status" = "done" ] || [ "$last_status" = "blocked" ]; then
     if [ $force -ne 1 ]; then
@@ -64,4 +82,5 @@ if [ "$last_status" = "done" ] || [ "$last_status" = "blocked" ]; then
     fi
 fi
 
+agent_bus_export_env
 agent-send user block --ref "$root" "cancelled: $reason"

@@ -1,14 +1,26 @@
 #!/usr/bin/env bash
-# agent-guard check [--json] [--staged] [--agent NAME|--all] [PATH...]
+# agent-guard [--scope repo|workspace] [--bus-dir DIR] check [--json] [--staged] [--agent NAME|--all] [PATH...]
 # Detect edits that would overlap paths claimed by open bus threads.
 
 set -euo pipefail
 
+AGENT_CMD="agent-guard"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
 usage() {
     cat >&2 <<EOF
 usage:
-  agent-guard check [--json] [--staged] [--agent NAME|--all] [PATH...]
-  agent-guard install [--force]
+  agent-guard [--scope repo|workspace] [--bus-dir DIR] check [--json] [--staged] [--agent NAME|--all] [PATH...]
+  agent-guard [--scope repo|workspace] [--bus-dir DIR] install [--force]
 
 check:
   --staged       check currently staged git paths
@@ -19,21 +31,16 @@ check:
 install:
   install a git pre-commit hook that runs: agent-guard check --staged
 EOF
+    agent_bus_common_usage >&2
     exit 2
 }
 
 need_bus() {
-    [ -f .agents/bus.jsonl ] || {
-        echo "agent-guard: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
-        exit 1
-    }
+    agent_bus_need_existing
 }
 
 current_agent() {
-    local surface="${CMUX_SURFACE_ID:-}"
-    [ -n "$surface" ] || return 0
-    [ -f .agents/agents.json ] || return 0
-    jq -r --arg s "$surface" '.agents | to_entries[] | select(.value == $s) | .key' .agents/agents.json | head -n1
+    agent_bus_current_agent
 }
 
 open_claims() {
@@ -62,23 +69,52 @@ open_claims() {
             $thread.root,
             $event.id,
             (if $event.to == "user" then $event.from else $event.to end),
+            ($event.cwd // "__AGENT_BUS_NO_CWD__"),
             .
           ]
         | @tsv
-    ' .agents/bus.jsonl
+    ' "$AGENT_BUS_FILE"
+}
+
+normalize_path_for_match() {
+    local path="$1"
+    local base="${2:-}"
+
+    path="${path#./}"
+    case "$path" in
+        /*) printf '%s\n' "$path";;
+        *)
+            if [ -n "$base" ]; then
+                printf '%s/%s\n' "${base%/}" "$path"
+            else
+                printf '%s\n' "$path"
+            fi
+            ;;
+    esac
 }
 
 path_matches() {
     local path="$1"
     local pattern="$2"
+    local claim_cwd="${3:-}"
 
     path="${path#./}"
     pattern="${pattern#./}"
 
-    [ "$path" = "$pattern" ] && return 0
-    case "$path" in
-        $pattern) return 0;;
-    esac
+    if [ -n "$claim_cwd" ] || [[ "$pattern" = /* ]]; then
+        local abs_path abs_pattern
+        abs_path="$(normalize_path_for_match "$path" "$PWD")"
+        abs_pattern="$(normalize_path_for_match "$pattern" "$claim_cwd")"
+        [ "$abs_path" = "$abs_pattern" ] && return 0
+        case "$abs_path" in
+            $abs_pattern) return 0;;
+        esac
+    else
+        [ "$path" = "$pattern" ] && return 0
+        case "$path" in
+            $pattern) return 0;;
+        esac
+    fi
     return 1
 }
 
@@ -122,19 +158,25 @@ check_cmd() {
     trap 'rm -f "$guard_tmp"' EXIT
     printf '[' > "$guard_tmp"
 
-    while IFS=$'\t' read -r root event owner claim; do
+    while IFS=$'\t' read -r root event owner claim_cwd claim; do
         [ -n "$root" ] || continue
+        [ "$claim_cwd" = "__AGENT_BUS_NO_CWD__" ] && claim_cwd=""
         [ -n "$ignore_agent" ] && [ "$owner" = "$ignore_agent" ] && continue
         for path in "${paths[@]}"; do
-            if path_matches "$path" "$claim"; then
+            if path_matches "$path" "$claim" "$claim_cwd"; then
                 conflicts=$((conflicts + 1))
                 if [ "$json" -eq 1 ]; then
                     [ "$conflicts" -gt 1 ] && printf ',' >> "$guard_tmp"
-                    jq -nc --arg path "$path" --arg claim "$claim" --arg owner "$owner" --arg root "$root" --arg event "$event" \
-                        '{path:$path, claim:$claim, owner:$owner, root:$root, event:$event}' >> "$guard_tmp"
+                    jq -nc --arg path "$path" --arg claim "$claim" --arg claim_cwd "$claim_cwd" --arg owner "$owner" --arg root "$root" --arg event "$event" \
+                        '{path:$path, claim:$claim, claim_cwd:$claim_cwd, owner:$owner, root:$root, event:$event}' >> "$guard_tmp"
                 else
-                    printf 'agent-guard: conflict: %s matches %s claimed by %s in thread %s (event %s)\n' \
-                        "$path" "$claim" "$owner" "$root" "$event" >&2
+                    if [ -n "$claim_cwd" ]; then
+                        printf 'agent-guard: conflict: %s matches %s from %s claimed by %s in thread %s (event %s)\n' \
+                            "$path" "$claim" "$claim_cwd" "$owner" "$root" "$event" >&2
+                    else
+                        printf 'agent-guard: conflict: %s matches %s claimed by %s in thread %s (event %s)\n' \
+                            "$path" "$claim" "$owner" "$root" "$event" >&2
+                    fi
                 fi
             fi
         done
@@ -190,7 +232,15 @@ HOOK
     echo "agent-guard: installed pre-commit hook at $hook"
 }
 
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
 [ $# -ge 1 ] || usage
+agent_bus_set_paths
 cmd="$1"; shift
 case "$cmd" in
     check) check_cmd "$@";;

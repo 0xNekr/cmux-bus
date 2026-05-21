@@ -1,5 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+AGENT_CMD="agent-inbox"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
 json=0; stale_filter=all; stuck_filter=all; stuck_after="${AGENT_BUS_STUCK_AFTER_MIN:-10}"
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -9,16 +29,17 @@ while [ $# -gt 0 ]; do
     --no-stuck) [ "$stuck_filter" = all ] || { echo "agent-inbox: use only one stuck filter" >&2; exit 2; }; stuck_filter=no;;
     --only-stuck) [ "$stuck_filter" = all ] || { echo "agent-inbox: use only one stuck filter" >&2; exit 2; }; stuck_filter=only;;
     --stuck-after) [ $# -ge 2 ] || { echo "agent-inbox: --stuck-after needs minutes" >&2; exit 2; }; stuck_after="$2"; shift;;
-    *) echo "usage: agent-inbox [--json] [--no-stale|--only-stale] [--no-stuck|--only-stuck] [--stuck-after MIN]" >&2; exit 2;;
+    *) echo "usage: agent-inbox [--scope repo|workspace] [--bus-dir DIR] [--json] [--no-stale|--only-stale] [--no-stuck|--only-stuck] [--stuck-after MIN]" >&2; agent_bus_common_usage >&2; exit 2;;
   esac; shift
 done
 case "$stuck_after" in ''|*[!0-9-]*) echo "agent-inbox: stuck threshold must be an integer" >&2; exit 2;; esac
-[ -f .agents/agents.json ] || { echo "agent-inbox: no .agents/ here — run 'agent-init <your_name>' first" >&2; exit 1; }
-[ -f .agents/bus.jsonl ] || { echo "agent-inbox: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2; exit 1; }
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
 my_surface="${CMUX_SURFACE_ID:-}"; [ -n "$my_surface" ] || { echo "agent-inbox: CMUX_SURFACE_ID not set" >&2; exit 1; }
-me=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' .agents/agents.json | head -n1)
+me=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' "$AGENT_BUS_AGENTS_FILE" | head -n1)
 [ -n "$me" ] || { echo "agent-inbox: this surface is not registered — run 'agent-init <your_name>' first" >&2; exit 1; }
-agents=$(jq -c '.agents' .agents/agents.json); now=$(date -u +%s)
+agents=$(jq -c '.agents' "$AGENT_BUS_AGENTS_FILE"); now=$(date -u +%s)
 items=$(jq -Rsr --arg me "$me" --argjson agents "$agents" --arg stale_filter "$stale_filter" --arg stuck_filter "$stuck_filter" --argjson now "$now" --argjson stuck_after "$stuck_after" '
   def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
   def epoch($ts): ($ts|strptime("%Y-%m-%dT%H:%M:%SZ")|mktime);
@@ -31,7 +52,7 @@ items=$(jq -Rsr --arg me "$me" --argjson agents "$agents" --arg stale_filter "$s
     .+{stuck:(($stuck_after > 0) and (.last.status=="in_progress") and (.age_minutes >= $stuck_after))}) |
   if $stale_filter=="no" then map(select(.stale|not)) elif $stale_filter=="only" then map(select(.stale)) else . end |
   if $stuck_filter=="no" then map(select(.stuck|not)) elif $stuck_filter=="only" then map(select(.stuck)) else . end
-' .agents/bus.jsonl)
+' "$AGENT_BUS_FILE")
 [ "$json" -eq 1 ] && { printf '%s\n' "$items"; exit 0; }
 count=$(printf '%s' "$items" | jq 'length')
 [ "$count" -eq 0 ] && { echo "agent-inbox: no open threads for $me"; exit 0; }

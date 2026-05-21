@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# agent-update — pull the latest cmux-bus and refresh installed commands + rule.
+#
+# Runs from anywhere: it resolves its own symlink back to the repo it lives in,
+# fast-forwards that repo, then re-runs install.sh (idempotent: re-links every
+# agent-* command and rewrites the Claude protocol rule). Existing commands are
+# already live after the pull because ~/.local/bin symlinks point into the repo;
+# install.sh only adds links for new commands and refreshes the rule.
+#
+# Usage: agent-update [--no-pull]
+#   --no-pull   skip git pull, just re-run the installer (re-link + rule)
+
+set -euo pipefail
+
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+bin_dir="$(cd "$(dirname "$script_path")" && pwd)"
+repo_root="$(cd "$bin_dir/.." && pwd)"
+
+do_pull=1
+case "${1:-}" in
+    --no-pull) do_pull=0;;
+    "") ;;
+    *) echo "usage: agent-update [--no-pull]" >&2; exit 2;;
+esac
+
+if [ "$do_pull" -eq 1 ]; then
+    if [ -d "$repo_root/.git" ]; then
+        echo "agent-update: fast-forwarding $repo_root"
+        if ! git -C "$repo_root" pull --ff-only; then
+            echo "agent-update: 'git pull --ff-only' failed — local commits, uncommitted" >&2
+            echo "agent-update: changes, or a non-fast-forward history are in the way." >&2
+            echo "agent-update: resolve it in $repo_root, or re-run with --no-pull to only re-link." >&2
+            exit 1
+        fi
+    else
+        echo "agent-update: $repo_root is not a git repo; skipping pull" >&2
+    fi
+fi
+
+echo "agent-update: running $repo_root/install.sh"
+exec "$repo_root/install.sh"

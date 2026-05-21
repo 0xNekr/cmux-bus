@@ -1,71 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-append_event() {
-    local event="$1"
-    local bus=".agents/bus.jsonl"
-    local lock=".agents/bus.lock"
-    local tries=0
-
-    case "$event" in
-        *$'\n'*|*$'\r'*)
-            echo "agent-done: refusing to append event with raw newline/control characters" >&2
-            exit 1
-            ;;
+AGENT_CMD="agent-done"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
     esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
 
-    printf '%s\n' "$event" | jq -e '
-        type == "object"
-        and (.id | type == "string")
-        and (.ts | type == "string")
-        and (.from | type == "string")
-        and (.to | type == "string")
-        and (.type | IN("ask","handoff","done","block","ack"))
-        and ((.ref == null) or (.ref | type == "string"))
-        and (.status | IN("open","in_progress","done","blocked"))
-        and (.paths_claimed | type == "array")
-        and (.body | type == "string")
-    ' >/dev/null || {
-        echo "agent-done: generated event does not match the bus schema" >&2
-        exit 1
-    }
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
 
-    trap 'rmdir ".agents/bus.lock" 2>/dev/null || true' EXIT INT TERM
-    while ! mkdir "$lock" 2>/dev/null; do
-        tries=$((tries + 1))
-        if [ "$tries" -ge 100 ]; then
-            echo "agent-done: timed out waiting for bus lock ($lock)" >&2
-            exit 1
-        fi
-        sleep 0.1
-    done
-
-    printf '%s\n' "$event" >> "$bus"
-    rmdir "$lock"
-    trap - EXIT INT TERM
-}
-
-[ $# -ge 1 ] || { echo "usage: agent-done <id> [body...]" >&2; exit 2; }
+[ $# -ge 1 ] || { echo "usage: agent-done [--scope repo|workspace] [--bus-dir DIR] <id> [body...]" >&2; agent_bus_common_usage >&2; exit 2; }
 ref="$1"; shift; body="${*:-done}"
-[ -f .agents/agents.json ] || { echo "agent-done: no .agents/ here — run 'agent-init <your_name>' first" >&2; exit 1; }
-[ -f .agents/bus.jsonl ] || { echo "agent-done: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2; exit 1; }
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
 my_surface="${CMUX_SURFACE_ID:-}"; [ -n "$my_surface" ] || { echo "agent-done: CMUX_SURFACE_ID not set" >&2; exit 1; }
-from=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' .agents/agents.json | head -n1)
+from=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' "$AGENT_BUS_AGENTS_FILE" | head -n1)
 [ -n "$from" ] || { echo "agent-done: this surface is not registered — run 'agent-init <your_name>' first" >&2; exit 1; }
 thread=$(jq -Rsr --arg ref "$ref" '
   def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
   split("\n") | map(fromjson?) |
   map(select(type=="object" and .id)) as $events | ($events|map({key:.id,value:.})|from_entries) as $m |
   if $m[$ref]==null then null else ($events|map(.+{root:root($m;.)})|map(select(.root==root($m;$m[$ref])))|last) end
-' .agents/bus.jsonl)
+' "$AGENT_BUS_FILE")
 [ "$thread" != null ] || { echo "agent-done: unknown event id '$ref'" >&2; exit 1; }
 to=$(printf '%s' "$thread" | jq -r .from); root=$(printf '%s' "$thread" | jq -r .root)
 id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n'); ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-event=$(jq -nc --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" --arg ref "$root" --arg body "$body" \
-  '{id:$id,ts:$ts,from:$from,to:$to,type:"done",ref:$ref,status:"done",paths_claimed:[],body:$body}')
-append_event "$event"
+event=$(jq -nc --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" --arg ref "$root" --arg cwd "$PWD" --arg body "$body" \
+  '{id:$id,ts:$ts,from:$from,to:$to,type:"done",ref:$ref,status:"done",paths_claimed:[],cwd:$cwd,body:$body}')
+agent_bus_append_event "$event"
 if [ "$to" != user ]; then
-  target_surface=$(jq -r --arg n "$to" '.agents[$n]//empty' .agents/agents.json)
+  target_surface=$(jq -r --arg n "$to" '.agents[$n]//empty' "$AGENT_BUS_AGENTS_FILE")
   [ -n "$target_surface" ] && { cmux send --surface "$target_surface" "new done id=$id from=$from" >/dev/null; cmux send-key --surface "$target_surface" Enter >/dev/null; }
 fi
 echo "$id"

@@ -1,17 +1,37 @@
 #!/usr/bin/env bash
-# agent-wait [--timeout SEC] [--interval SEC] [--status done|blocked|final] <id>
+# agent-wait [--scope repo|workspace] [--bus-dir DIR] [--timeout SEC] [--interval SEC] [--status done|blocked|final] <id>
 # Wait until a thread reaches a target status.
 
 set -euo pipefail
 
+AGENT_CMD="agent-wait"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
 usage() {
-    echo "usage: agent-wait [--timeout SEC] [--interval SEC] [--status done|blocked|final] <id>" >&2
+    echo "usage: agent-wait [--scope repo|workspace] [--bus-dir DIR] [--timeout SEC] [--interval SEC] [--status done|blocked|final] <id>" >&2
+    agent_bus_common_usage >&2
     exit 2
 }
 
 timeout=600
 interval=1
 target_status=final
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -49,10 +69,8 @@ case "$target_status" in
     *) echo "agent-wait: --status must be done, blocked, or final" >&2; exit 2;;
 esac
 
-[ -f .agents/bus.jsonl ] || {
-    echo "agent-wait: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
-    exit 1
-}
+agent_bus_set_paths
+agent_bus_need_existing
 
 thread_last() {
     jq -Rsr --arg id "$id" '
@@ -69,7 +87,7 @@ thread_last() {
             | map(select(.root == $root))
             | last
         end
-    ' .agents/bus.jsonl
+    ' "$AGENT_BUS_FILE"
 }
 
 matches_target() {

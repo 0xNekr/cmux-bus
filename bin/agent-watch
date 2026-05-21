@@ -1,31 +1,42 @@
 #!/usr/bin/env bash
-# agent-watch [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]
+# agent-watch [--scope repo|workspace] [--bus-dir DIR] [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]
 # Watch bus events as they are appended.
 
 set -euo pipefail
 
+AGENT_CMD="agent-watch"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
 usage() {
-    echo "usage: agent-watch [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]" >&2
+    echo "usage: agent-watch [--scope repo|workspace] [--bus-dir DIR] [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]" >&2
+    agent_bus_common_usage >&2
     exit 2
 }
 
 clear_bus() {
-    local bus=".agents/bus.jsonl"
-    local lock=".agents/bus.lock"
     local tries=0
 
-    trap 'rmdir ".agents/bus.lock" 2>/dev/null || true' EXIT INT TERM
-    while ! mkdir "$lock" 2>/dev/null; do
+    trap 'rmdir "$AGENT_BUS_LOCK" 2>/dev/null || true' EXIT INT TERM
+    while ! mkdir "$AGENT_BUS_LOCK" 2>/dev/null; do
         tries=$((tries + 1))
         if [ "$tries" -ge 100 ]; then
-            echo "agent-watch: timed out waiting for bus lock ($lock)" >&2
+            echo "agent-watch: timed out waiting for bus lock ($AGENT_BUS_LOCK)" >&2
             exit 1
         fi
         sleep 0.1
     done
 
-    : > "$bus"
-    rmdir "$lock"
+    : > "$AGENT_BUS_FILE"
+    rmdir "$AGENT_BUS_LOCK"
     trap - EXIT INT TERM
 }
 
@@ -36,6 +47,13 @@ no_color=0
 clear=0
 lines=20
 interval=1
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -66,10 +84,8 @@ if ! jq -en --arg interval "$interval" '($interval | tonumber) > 0' >/dev/null 2
     exit 2
 fi
 
-[ -f .agents/bus.jsonl ] || {
-    echo "agent-watch: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
-    exit 1
-}
+agent_bus_set_paths
+agent_bus_need_existing
 
 if [ "$clear" -eq 1 ]; then
     clear_bus
@@ -77,16 +93,13 @@ fi
 
 me=""
 if [ "$me_only" -eq 1 ]; then
-    [ -f .agents/agents.json ] || {
-        echo "agent-watch: no .agents/agents.json — run 'agent-init <your_name>' first" >&2
-        exit 1
-    }
+    agent_bus_need_agents
     my_surface="${CMUX_SURFACE_ID:-}"
     [ -n "$my_surface" ] || {
         echo "agent-watch: CMUX_SURFACE_ID not set" >&2
         exit 1
     }
-    me=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' .agents/agents.json | head -n1)
+    me=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' "$AGENT_BUS_AGENTS_FILE" | head -n1)
     [ -n "$me" ] || {
         echo "agent-watch: this surface is not registered — run 'agent-init <your_name>' first" >&2
         exit 1
@@ -187,20 +200,20 @@ print_header
 
 if [ "$once" -eq 1 ]; then
     if [ "$lines" -eq 0 ]; then
-        cat .agents/bus.jsonl | print_events
+        cat "$AGENT_BUS_FILE" | print_events
     else
-        tail -n "$lines" .agents/bus.jsonl | print_events
+        tail -n "$lines" "$AGENT_BUS_FILE" | print_events
     fi
     exit 0
 fi
 
-tail -n "$lines" .agents/bus.jsonl | print_events
-seen_lines=$(wc -l < .agents/bus.jsonl | tr -d ' ')
+tail -n "$lines" "$AGENT_BUS_FILE" | print_events
+seen_lines=$(wc -l < "$AGENT_BUS_FILE" | tr -d ' ')
 while :; do
     sleep "$interval"
-    current_lines=$(wc -l < .agents/bus.jsonl | tr -d ' ')
+    current_lines=$(wc -l < "$AGENT_BUS_FILE" | tr -d ' ')
     if [ "$current_lines" -gt "$seen_lines" ]; then
-        tail -n $((current_lines - seen_lines)) .agents/bus.jsonl | print_events
+        tail -n $((current_lines - seen_lines)) "$AGENT_BUS_FILE" | print_events
         seen_lines="$current_lines"
     elif [ "$current_lines" -lt "$seen_lines" ]; then
         seen_lines="$current_lines"

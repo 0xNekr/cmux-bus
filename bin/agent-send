@@ -1,56 +1,24 @@
 #!/usr/bin/env bash
-# agent-send <to> <type> [--ref ID] [--paths "p1,p2"] [--status STATUS] <body...>
-# Append event(s) to .agents/bus.jsonl and signal recipient(s) via cmux send.
+# agent-send [--scope repo|workspace] [--bus-dir DIR] <to> <type> [--ref ID] [--paths "p1,p2"] [--status STATUS] <body...>
+# Append event(s) to the resolved bus and signal recipient(s) via cmux send.
 
 set -euo pipefail
 
-append_event() {
-    local event="$1"
-    local bus=".agents/bus.jsonl"
-    local lock=".agents/bus.lock"
-    local tries=0
-
-    case "$event" in
-        *$'\n'*|*$'\r'*)
-            echo "agent-send: refusing to append event with raw newline/control characters" >&2
-            exit 1
-            ;;
+AGENT_CMD="agent-send"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
     esac
-
-    printf '%s\n' "$event" | jq -e '
-        type == "object"
-        and (.id | type == "string")
-        and (.ts | type == "string")
-        and (.from | type == "string")
-        and (.to | type == "string")
-        and (.type | IN("ask","handoff","done","block","ack"))
-        and ((.ref == null) or (.ref | type == "string"))
-        and (.status | IN("open","in_progress","done","blocked"))
-        and (.paths_claimed | type == "array")
-        and (.body | type == "string")
-    ' >/dev/null || {
-        echo "agent-send: generated event does not match the bus schema" >&2
-        exit 1
-    }
-
-    trap 'rmdir ".agents/bus.lock" 2>/dev/null || true' EXIT INT TERM
-    while ! mkdir "$lock" 2>/dev/null; do
-        tries=$((tries + 1))
-        if [ "$tries" -ge 100 ]; then
-            echo "agent-send: timed out waiting for bus lock ($lock)" >&2
-            exit 1
-        fi
-        sleep 0.1
-    done
-
-    printf '%s\n' "$event" >> "$bus"
-    rmdir "$lock"
-    trap - EXIT INT TERM
-}
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
 
 usage() {
     cat >&2 <<EOF
-usage: agent-send <to> <type> [flags] <body...>
+usage: agent-send [--scope repo|workspace] [--bus-dir DIR] <to> <type> [flags] <body...>
   to       recipient agent name, comma-separated names, 'all', or 'user'
   type     ask | handoff | done | block | ack
   --ref ID         parent event id (chains the thread)
@@ -59,8 +27,16 @@ usage: agent-send <to> <type> [flags] <body...>
 
 prints new event id(s) on stdout, one per line
 EOF
+    agent_bus_common_usage >&2
     exit 2
 }
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
 
 [ $# -ge 3 ] || usage
 
@@ -110,22 +86,16 @@ case "$status" in open|in_progress|done|blocked) ;; *)
     echo "agent-send: invalid status '$status'" >&2; exit 1;;
 esac
 
-[ -d .agents ] && [ -f .agents/agents.json ] || {
-    echo "agent-send: no .agents/ here — run 'agent-init <your_name>' first" >&2
-    exit 1
-}
-
-[ -f .agents/bus.jsonl ] || {
-    echo "agent-send: no .agents/bus.jsonl — run 'agent-init <your_name>' first" >&2
-    exit 1
-}
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
 
 if [ -n "$ref" ]; then
     jq -Rer --arg ref "$ref" '
         fromjson?
         | select(type == "object" and .id == $ref)
         | true
-    ' .agents/bus.jsonl >/dev/null || {
+    ' "$AGENT_BUS_FILE" >/dev/null || {
         echo "agent-send: unknown --ref '$ref' — cannot append an orphan event" >&2
         exit 1
     }
@@ -134,14 +104,14 @@ fi
 my_surface="${CMUX_SURFACE_ID:-}"
 [ -n "$my_surface" ] || { echo "agent-send: CMUX_SURFACE_ID not set" >&2; exit 1; }
 
-from=$(jq -r --arg s "$my_surface" '.agents | to_entries[] | select(.value == $s) | .key' .agents/agents.json | head -n1)
+from=$(jq -r --arg s "$my_surface" '.agents | to_entries[] | select(.value == $s) | .key' "$AGENT_BUS_AGENTS_FILE" | head -n1)
 [ -n "$from" ] || {
     echo "agent-send: this surface is not registered — run 'agent-init <your_name>' first" >&2
     exit 1
 }
 
 if [ "$to" = "all" ]; then
-    recipients=$(jq -r --arg from "$from" '.agents | keys[] | select(. != $from)' .agents/agents.json)
+    recipients=$(jq -r --arg from "$from" '.agents | keys[] | select(. != $from)' "$AGENT_BUS_AGENTS_FILE")
 elif [ "$to" = "user" ]; then
     recipients="user"
 else
@@ -173,15 +143,18 @@ fi
 while IFS= read -r recipient; do
     [ -n "$recipient" ] || continue
     [ "$recipient" != "user" ] || continue
-    target_surface=$(jq -r --arg n "$recipient" '.agents[$n] // empty' .agents/agents.json)
+    target_surface=$(jq -r --arg n "$recipient" '.agents[$n] // empty' "$AGENT_BUS_AGENTS_FILE")
     [ -n "$target_surface" ] || {
-        echo "agent-send: unknown recipient '$recipient' — known agents:" >&2
-        jq -r '.agents | keys[]' .agents/agents.json | sed 's/^/  /' >&2
+        echo "agent-send: unknown recipient '$recipient' in bus $AGENT_BUS_DIR_EFFECTIVE — known agents:" >&2
+        jq -r '.agents | keys[]' "$AGENT_BUS_AGENTS_FILE" | sed 's/^/  /' >&2
+        echo "agent-send: ask them to run 'agent-init $recipient' in their current pane" >&2
+        echo "agent-send: do not use 'cmux send' as a fallback; use '--scope repo' only if you intentionally want the folder-local bus" >&2
         exit 1
     }
     if [ -n "$live" ] && ! printf '%s\n' "$live" | grep -qxF "$target_surface"; then
         echo "agent-send: recipient '$recipient' has a stale surface (pane closed or cmux restarted)" >&2
         echo "agent-send: ask them to run 'agent-init $recipient' from their current pane" >&2
+        echo "agent-send: do not use 'cmux send' as a fallback" >&2
         exit 1
     fi
 done <<EOF
@@ -206,16 +179,17 @@ while IFS= read -r recipient; do
         --arg from "$from" \
         --arg to "$recipient" \
         --arg type "$type" \
+        --arg cwd "$PWD" \
         --argjson ref "$ref_json" \
         --arg status "$status" \
         --argjson paths_claimed "$paths_json" \
         --arg body "$body" \
-        '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, body:$body}')
+        '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, cwd:$cwd, body:$body}')
 
-    append_event "$event"
+    agent_bus_append_event "$event"
 
     if [ "$recipient" != "user" ]; then
-        target_surface=$(jq -r --arg n "$recipient" '.agents[$n] // empty' .agents/agents.json)
+        target_surface=$(jq -r --arg n "$recipient" '.agents[$n] // empty' "$AGENT_BUS_AGENTS_FILE")
         cmux send --surface "$target_surface" "new $type id=$id from=$from" >/dev/null
         cmux send-key --surface "$target_surface" Enter >/dev/null
     fi

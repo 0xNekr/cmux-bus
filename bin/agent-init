@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# agent-init <agent_name>
+# agent-init [--scope repo|workspace] [--bus-dir DIR] <agent_name>
 # Bootstrap a workspace for the cmux multi-agent bus.
-# Creates .agents/{bus.jsonl,agents.json,PROTOCOL.md}, updates .gitignore,
+# Creates the resolved bus directory, writes bus files and AGENTS.md,
 # and registers <agent_name> -> $CMUX_SURFACE_ID in agents.json.
 
 set -euo pipefail
 
+AGENT_CMD="agent-init"
 script_path="${BASH_SOURCE[0]}"
 while [ -L "$script_path" ]; do
     script_dir="$(cd "$(dirname "$script_path")" && pwd)"
@@ -15,13 +16,22 @@ while [ -L "$script_path" ]; do
         *)  script_path="$script_dir/$link_target";;
     esac
 done
-repo_root="$(cd "$(dirname "$script_path")/.." && pwd)"
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+repo_root="$AGENT_REPO_ROOT"
 
 usage() {
-    echo "usage: agent-init <agent_name>" >&2
-    echo "  registers this pane as <agent_name> in .agents/agents.json" >&2
+    echo "usage: agent-init [--scope repo|workspace] [--bus-dir DIR] <agent_name>" >&2
+    echo "  registers this pane as <agent_name> in the resolved bus agents.json" >&2
+    agent_bus_common_usage >&2
     exit 2
 }
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
 
 [ $# -eq 1 ] || usage
 name="$1"
@@ -37,7 +47,72 @@ surface="${CMUX_SURFACE_ID:-}"
     exit 1
 }
 
-dir=".agents"
+gitignore_action="skipped"
+ensure_agents_gitignore() {
+    local gitignore=".gitignore"
+    if [ ! -f "$gitignore" ] || ! grep -qxF ".agents/" "$gitignore"; then
+        [ -f "$gitignore" ] && [ -n "$(tail -c1 "$gitignore" 2>/dev/null)" ] && echo >> "$gitignore"
+        echo ".agents/" >> "$gitignore"
+        gitignore_action="updated"
+    else
+        gitignore_action="unchanged"
+    fi
+}
+
+legacy_bus_action=""
+handle_workspace_stub() {
+    [ "$AGENT_BUS_REPO_RUNTIME" -eq 0 ] || return 0
+
+    local legacy_bus=".agents/bus.jsonl"
+    local open_threads=0
+    if [ -f "$legacy_bus" ]; then
+        open_threads="$(agent_bus_open_thread_count "$legacy_bus")"
+        if [ "$open_threads" -gt 0 ]; then
+            cat >&2 <<EOF
+agent-init: refusing to activate workspace scope while legacy .agents/bus.jsonl has $open_threads open thread(s)
+agent-init: close or migrate them first, for example:
+  agent-inbox --scope repo
+  agent-done --scope repo <id> "<result>"
+agent-init: this prevents agents from split-braining between .agents/ and the workspace bus
+EOF
+            exit 1
+        fi
+    fi
+
+    local has_legacy=0
+    local protocol_is_stub=0
+    local path
+    if [ -f .agents/PROTOCOL.md ] && grep -q "workspace-scope stub" .agents/PROTOCOL.md; then
+        protocol_is_stub=1
+    fi
+
+    for path in .agents/bus.jsonl .agents/agents.json .agents/bus.lock .agents/bus.jsonl.lock; do
+        [ -e "$path" ] && has_legacy=1
+    done
+    [ -f .agents/PROTOCOL.md ] && [ "$protocol_is_stub" -eq 0 ] && has_legacy=1
+
+    local archive=""
+    local archive_note=""
+    if [ "$has_legacy" -eq 1 ]; then
+        archive=".agents.repo-legacy-$(date -u +"%Y%m%dT%H%M%SZ")"
+        mkdir -p "$archive"
+        for path in .agents/bus.jsonl .agents/agents.json .agents/bus.lock .agents/bus.jsonl.lock; do
+            [ -e "$path" ] && mv "$path" "$archive/"
+        done
+        [ -f .agents/PROTOCOL.md ] && [ "$protocol_is_stub" -eq 0 ] && mv .agents/PROTOCOL.md "$archive/"
+        archive_note="Legacy repo-scoped bus files were archived to $archive."
+        legacy_bus_action="archived legacy repo bus files to $archive"
+    else
+        legacy_bus_action="wrote workspace-scope .agents stub"
+    fi
+
+    agent_bus_write_workspace_stub ".agents" "$archive_note"
+    ensure_agents_gitignore
+}
+
+agent_bus_set_paths
+handle_workspace_stub
+dir="$AGENT_BUS_DIR_EFFECTIVE"
 mkdir -p "$dir"
 touch "$dir/bus.jsonl"
 
@@ -56,10 +131,8 @@ fi
 tmp=$(mktemp)
 jq --arg n "$name" --arg s "$surface" '.agents[$n] = $s' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
 
-gitignore=".gitignore"
-if [ ! -f "$gitignore" ] || ! grep -qxF ".agents/" "$gitignore"; then
-    [ -f "$gitignore" ] && [ -n "$(tail -c1 "$gitignore" 2>/dev/null)" ] && echo >> "$gitignore"
-    echo ".agents/" >> "$gitignore"
+if [ "$AGENT_BUS_REPO_RUNTIME" -eq 1 ]; then
+    ensure_agents_gitignore
 fi
 
 protocol="$dir/PROTOCOL.md"
@@ -71,13 +144,14 @@ else
 # Multi-Agent Bus — Protocol v1
 
 This workspace coordinates two or more agents (e.g. Claude, Codex) running in
-adjacent cmux panes. Communication uses an append-only event-sourced log.
+adjacent cmux panes. Communication uses an append-only event-sourced log
+resolved by the agent-* commands.
 
 ## Files
 
-- `.agents/bus.jsonl` — append-only event log, one JSON per line
-- `.agents/agents.json` — `{agent_name: cmux_surface_id}` registry
-- `.agents/PROTOCOL.md` — this file
+- `<bus-dir>/bus.jsonl` — append-only event log, one JSON per line
+- `<bus-dir>/agents.json` — `{agent_name: cmux_surface_id}` registry
+- `<bus-dir>/PROTOCOL.md` — this file
 
 ## Event schema
 
@@ -91,6 +165,7 @@ adjacent cmux panes. Communication uses an append-only event-sourced log.
   "ref":            "id of parent event, or null",
   "status":         "open|in_progress|done|blocked",
   "paths_claimed":  ["glob", ...],
+  "cwd":            "sender working directory",
   "body":           "free text"
 }
 ```
@@ -116,11 +191,12 @@ prior events. The effective state of a thread is the **last** event whose
 
 Before starting any new task, every agent **must**:
 
-1. Read `.agents/bus.jsonl` (if it exists)
-2. Group events by thread root (`ref ?? id`)
-3. For each thread where the last event targets you (`to == me`) and the
+1. Resolve the active bus (default: current cmux workspace)
+2. Read `<bus-dir>/bus.jsonl` (if it exists)
+3. Group events by thread root (`ref ?? id`)
+4. For each thread where the last event targets you (`to == me`) and the
    declared status is not `done` or `blocked`: process it.
-4. Once caught up, take new work.
+5. Once caught up, take new work.
 
 ## Path ownership
 
@@ -166,20 +242,24 @@ else
 
 This workspace runs a multi-agent coordination protocol. Peer agents (typically
 Claude and Codex) work in adjacent cmux panes and communicate via an event log
-at `.agents/bus.jsonl`.
+resolved by the `agent-*` commands. By default the bus is scoped to the
+current cmux workspace, not the current folder. Use `AGENT_BUS_SCOPE=repo` or
+`--scope repo` only when you intentionally want a folder-local `.agents/` bus.
 
 **At session start:**
-1. Read `.agents/PROTOCOL.md` once — it defines the schema, types, inbox
-   routine, path-ownership rule, and disagreement escalation.
+1. Treat `agent-inbox` as the source of truth for the current bus. The protocol
+   copied by `agent-init` defines the schema, types, inbox routine,
+   path-ownership rule, and disagreement escalation.
 2. Run `agent-inbox` to see open threads addressed to you. Process them before
    taking new work.
 
 **To send or hand off:** `agent-send <to> <type> [--ref ID] [--paths "p1,p2"]
 <body>`. Types: `ask`, `handoff`, `done`, `block`, `ack`.
 **To close a thread:** `agent-done <id> [body]`.
+**To override scope for one command:** add `--scope repo` or `--scope workspace`.
 **Never edit a path another agent has claimed in an open thread.**
 
-Peers and surfaces are listed in `.agents/agents.json`.
+Peers and surfaces are listed in the resolved bus `agents.json`.
 <!-- agent-bus:end v1 -->
 BLOCK
 )
@@ -214,8 +294,15 @@ fi
 
 echo "agent-init: registered '$name' -> surface '$surface'"
 echo "agent-init: $(jq -c .agents "$agents_file")"
+echo "agent-init: scope $AGENT_BUS_SCOPE_EFFECTIVE"
 echo "agent-init: protocol at $protocol, bus at $dir/bus.jsonl"
 echo "agent-init: $agents_md $agents_md_action"
+if [ "$gitignore_action" != "skipped" ]; then
+    echo "agent-init: .gitignore $gitignore_action"
+fi
+if [ -n "$legacy_bus_action" ]; then
+    echo "agent-init: $legacy_bus_action"
+fi
 if [ -n "$purged" ]; then
     echo "agent-init: purged stale entries: $purged"
 fi

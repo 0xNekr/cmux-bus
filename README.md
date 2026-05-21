@@ -50,22 +50,47 @@ session start.
 ## Quick start
 
 In a cmux workspace with two panes (e.g. one running `claude`, one
-running `codex`), **from the workspace root in each pane**:
+running `codex`), run this once in each pane:
 
 ```sh
-# Pane A (Claude), cwd = workspace root
+# Pane A (Claude)
 agent-init claude
 
-# Pane B (Codex), cwd = workspace root
+# Pane B (Codex)
 agent-init codex
 ```
 
 That's the bootstrap. Each pane registers its `CMUX_SURFACE_ID` in
-`.agents/agents.json`, the bus file is created, and an `AGENTS.md` is
-written from `templates/AGENTS-block.md` at the workspace root so any agent
-starting fresh in this project sees the protocol. The `.agents/` directory
-is runtime state — it is added to your `.gitignore` automatically and
-should not be committed.
+the resolved bus `agents.json`, the bus file is created, and an `AGENTS.md`
+is written from `templates/AGENTS-block.md` in the current directory so any
+agent starting fresh there sees the protocol.
+
+By default, the bus is scoped to the current cmux workspace:
+
+```txt
+${XDG_STATE_HOME:-$HOME/.local/state}/cmux-bus/workspaces/<cmux-workspace-id>/
+```
+
+That means multiple git worktrees open inside the same cmux workspace share
+one bus. The mirror case also holds: when the **same folder** is open in
+several cmux workspaces at once (e.g. `Linear`, `Infra`, `Breeve` all on one
+repo), each workspace gets its **own separate bus** — agents never collide on a
+shared `.agents/agents.json`, and a signal stays inside the workspace it was
+sent from. Resolution is bound to the calling pane's `CMUX_WORKSPACE_ID`
+(falling back to the caller's workspace via `cmux identify`, never the focused
+one), so a background agent always lands on its own workspace bus.
+
+To force the old folder-local behavior for a command, use `--scope repo`; to
+make that persistent in a shell, export `AGENT_BUS_SCOPE=repo`.
+
+In workspace scope, `agent-init` also writes a small `.agents/` stub in the
+current folder. The stub is deliberately not a bus; it tells agents to use
+`agent-inbox` and `agent-send` instead of reading `.agents/agents.json` by
+hand. If a closed legacy repo bus is present, only the legacy bus files are
+archived to `.agents.repo-legacy-<timestamp>/`; non-bus content such as local
+skills under `.agents/skills/` is left in place. If the legacy repo bus still
+has open threads, `agent-init --scope workspace` refuses until those threads
+are closed or migrated.
 
 Now from Claude:
 
@@ -90,32 +115,35 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 
 | Command | What it does |
 |---|---|
-| `agent-init <name>` | Bootstrap or refresh this workspace for `<name>`. Creates `.agents/`, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, updates `.gitignore`. Purges stale entries from previous sessions. |
-| `agent-send <to> <type> [flags] <body>` | Append event(s) and signal recipient(s). Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. For `ask`, `<to>` may be `all` or comma-separated names (`claude,deepseek`); this fans out into one thread per peer. Refuses unknown refs and stale recipients. |
-| `agent-inbox [--json] [--no-stale\|--only-stale] [--no-stuck\|--only-stuck] [--stuck-after MIN]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. Threads whose last event is `in_progress` and older than the stuck threshold (default 10 min, configurable via `AGENT_BUS_STUCK_AFTER_MIN` env) appear with `[stuck Xm]`. |
-| `agent-done <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
-| `agent-cancel <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |
-| `agent-resume <id> [--force] [body]` | Re-open a stuck/crashed thread by appending a fresh `handoff` to its **original recipient**. Default body: `RESUME: <previous>`. Refuses if the thread is already done/blocked unless `--force`. |
-| `agent-doctor` | Validate the local bus and registry without mutating anything. Reports malformed JSONL, schema errors, duplicate ids, orphan refs, and open/stale/stuck thread counts. |
-| `agent-repair [--dry-run]` | Repair `.agents/bus.jsonl` when old malformed records contain raw newlines. Dry-run reports what would change; write mode creates a timestamped backup before replacing the bus. |
-| `agent-guard check [--json] [--staged] [--agent NAME\|--all] [PATH...]` | Detect files that overlap `paths_claimed` by open threads. By default it ignores claims owned by the current registered surface; use `--agent NAME` outside cmux or `--all` to include every claim. `--staged` checks staged git paths for pre-commit usage. |
-| `agent-guard install [--force]` | Install a git pre-commit hook that runs `agent-guard check --staged` and blocks commits touching files claimed by another open thread. |
-| `agent-rpc [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] [--json] <agent> <body...>` | Send one `ask` to a single agent, wait for the thread to finish, and print the final body. Use `--json` to print the final event object. A blocked final event is printed and exits non-zero. |
-| `agent-playbook run <name-or-path> [KEY=VALUE...]` | Run a JSON workflow from `.agents/playbooks/<name>.json` or an explicit path. Supports `send`, `wait`, `rpc`, and `print` steps with `{{variable}}` interpolation. |
-| `agent-synthesize [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>` | Wait for multiple threads to finish, bundle their final replies, and ask the synthesis agent (default `claude`) for consensus, disagreements, and a recommendation. |
-| `agent-thread [--json] <id>` | Show the full event history for any event id in a thread. |
-| `agent-watch [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, `--full` to avoid body truncation, and `--clear` to truncate `.agents/bus.jsonl` before watching. |
-| `agent-wait [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON and exits non-zero on timeout or unknown id. |
+| `agent-init [--scope repo\|workspace] [--bus-dir DIR] <name>` | Bootstrap or refresh this bus for `<name>`. Creates the resolved bus dir, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, and purges stale entries from previous sessions. |
+| `agent-send [--scope repo\|workspace] [--bus-dir DIR] <to> <type> [flags] <body>` | Append event(s) and signal recipient(s). Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. For `ask`, `<to>` may be `all` or comma-separated names (`claude,deepseek`); this fans out into one thread per peer. Refuses unknown refs and stale recipients. |
+| `agent-inbox [--scope repo\|workspace] [--bus-dir DIR] [--json] [--no-stale\|--only-stale] [--no-stuck\|--only-stuck] [--stuck-after MIN]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. Threads whose last event is `in_progress` and older than the stuck threshold (default 10 min, configurable via `AGENT_BUS_STUCK_AFTER_MIN` env) appear with `[stuck Xm]`. |
+| `agent-done [--scope repo\|workspace] [--bus-dir DIR] <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
+| `agent-cancel [--scope repo\|workspace] [--bus-dir DIR] <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |
+| `agent-resume [--scope repo\|workspace] [--bus-dir DIR] <id> [--force] [body]` | Re-open a stuck/crashed thread by appending a fresh `handoff` to its **original recipient**. Default body: `RESUME: <previous>`. Refuses if the thread is already done/blocked unless `--force`. |
+| `agent-doctor [--scope repo\|workspace] [--bus-dir DIR]` | Validate the resolved bus and registry without mutating anything. Reports malformed JSONL, schema errors, duplicate ids, orphan refs, and open/stale/stuck thread counts. |
+| `agent-repair [--scope repo\|workspace] [--bus-dir DIR] [--dry-run]` | Repair the resolved `bus.jsonl` when old malformed records contain raw newlines. Dry-run reports what would change; write mode creates a timestamped backup before replacing the bus. |
+| `agent-guard [--scope repo\|workspace] [--bus-dir DIR] check [--json] [--staged] [--agent NAME\|--all] [PATH...]` | Detect files that overlap `paths_claimed` by open threads. By default it ignores claims owned by the current registered surface; use `--agent NAME` outside cmux or `--all` to include every claim. `--staged` checks staged git paths for pre-commit usage. |
+| `agent-guard [--scope repo\|workspace] [--bus-dir DIR] install [--force]` | Install a git pre-commit hook that runs `agent-guard check --staged` and blocks commits touching files claimed by another open thread. |
+| `agent-rpc [--scope repo\|workspace] [--bus-dir DIR] [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] [--json] <agent> <body...>` | Send one `ask` to a single agent, wait for the thread to finish, and print the final body. Use `--json` to print the final event object. A blocked final event is printed and exits non-zero. |
+| `agent-playbook [--scope repo\|workspace] [--bus-dir DIR] run <name-or-path> [KEY=VALUE...]` | Run a JSON workflow from `<bus-dir>/playbooks/<name>.json` or an explicit path. Supports `send`, `wait`, `rpc`, and `print` steps with `{{variable}}` interpolation. |
+| `agent-synthesize [--scope repo\|workspace] [--bus-dir DIR] [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>` | Wait for multiple threads to finish, bundle their final replies, and ask the synthesis agent (default `claude`) for consensus, disagreements, and a recommendation. |
+| `agent-thread [--scope repo\|workspace] [--bus-dir DIR] [--json] <id>` | Show the full event history for any event id in a thread. |
+| `agent-watch [--scope repo\|workspace] [--bus-dir DIR] [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, `--full` to avoid body truncation, and `--clear` to truncate the resolved `bus.jsonl` before watching. |
+| `agent-wait [--scope repo\|workspace] [--bus-dir DIR] [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON and exits non-zero on timeout or unknown id. |
 
 `agent-guard` treats `paths_claimed` as meaningful on open `handoff` events.
 Claims use Bash pattern matching, so glob characters such as `*`, `?`, and
 `[...]` are active. `**` is not recursive. A leading `./` is ignored when
-comparing paths.
+comparing paths. New events include `cwd`, so claims are resolved relative to
+the worktree where they were created when a workspace-scoped bus is shared by
+multiple folders.
 
 `agent-playbook` files are JSON and live well as local runtime state under
-`.agents/playbooks/`. `send.paths` uses the same comma-separated string format
-as `agent-send --paths`. `send.save` stores the event id directly; `wait.save`
-and `rpc.save` expose `<name>_id`, `<name>_status`, and `<name>_body`.
+`<bus-dir>/playbooks/`. `send.paths` uses the same comma-separated string
+format as `agent-send --paths`. `send.save` stores the event id directly;
+`wait.save` and `rpc.save` expose `<name>_id`, `<name>_status`, and
+`<name>_body`.
 Example:
 
 ```json
@@ -184,7 +212,7 @@ ambiguous.
 
 ## Event schema
 
-Every line in `.agents/bus.jsonl` is one JSON object:
+Every line in the resolved `bus.jsonl` is one JSON object:
 
 ```json
 {
@@ -196,6 +224,7 @@ Every line in `.agents/bus.jsonl` is one JSON object:
   "ref":            "id of parent event, or null",
   "status":         "open|in_progress|done|blocked",
   "paths_claimed":  ["glob", ...],
+  "cwd":            "sender working directory",
   "body":           "free text"
 }
 ```
@@ -205,14 +234,34 @@ of a thread is whatever the last event in the chain declares. See
 [`PROTOCOL.md`](./PROTOCOL.md) for the full spec.
 
 Writers validate each event as a single-line JSON object and serialize
-appends with `.agents/bus.lock`, so concurrent agents cannot interleave
+appends with `<bus-dir>/bus.lock`, so concurrent agents cannot interleave
 partial JSON lines.
 
 ## Workspace isolation
 
-The bus lives in `.agents/` at your workspace root. Each project has its
-own bus, registry, and protocol — they never see each other. A single
-pane can participate in multiple workspaces; just `agent-init` in each.
+The default bus lives at cmux-workspace scope, so multiple folders or git
+worktrees opened in the same cmux workspace share one bus. This matches the
+way adjacent panes collaborate on one active effort.
+
+Use repo scope when you need folder isolation:
+
+```sh
+agent-init --scope repo codex
+agent-inbox --scope repo
+```
+
+For a persistent folder-local default in one shell:
+
+```sh
+export AGENT_BUS_SCOPE=repo
+```
+
+`AGENT_BUS_DIR=/path/to/bus` is an escape hatch for explicit custom storage.
+
+If `agent-send` says a recipient is unknown or stale, do not fall back to
+`cmux send`. Have the peer run `agent-init <name>` in its current pane, or
+rerun with `--scope repo` only when you intentionally want the folder-local
+bus.
 
 ## Surface lifecycle
 

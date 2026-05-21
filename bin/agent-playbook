@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
-# agent-playbook run <name-or-path> [KEY=VALUE...]
+# agent-playbook [--scope repo|workspace] [--bus-dir DIR] run <name-or-path> [KEY=VALUE...]
 # Run a small JSON workflow that composes agent-send, agent-wait, and agent-rpc.
 
 set -euo pipefail
 
+AGENT_CMD="agent-playbook"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
 usage() {
     cat >&2 <<EOF
-usage: agent-playbook run <name-or-path> [KEY=VALUE...]
+usage: agent-playbook [--scope repo|workspace] [--bus-dir DIR] run <name-or-path> [KEY=VALUE...]
 
-Looks for <name> at .agents/playbooks/<name>.json unless a readable path is
+Looks for <name> at <bus-dir>/playbooks/<name>.json unless a readable path is
 provided. Variables are referenced in string fields as {{key}}.
 EOF
+    agent_bus_common_usage >&2
     exit 2
 }
 
@@ -18,8 +31,8 @@ resolve_playbook() {
     local name="$1"
     if [ -f "$name" ]; then
         printf '%s\n' "$name"
-    elif [ -f ".agents/playbooks/$name.json" ]; then
-        printf '%s\n' ".agents/playbooks/$name.json"
+    elif [ -f "$AGENT_BUS_DIR_EFFECTIVE/playbooks/$name.json" ]; then
+        printf '%s\n' "$AGENT_BUS_DIR_EFFECTIVE/playbooks/$name.json"
     else
         echo "agent-playbook: playbook not found: $name" >&2
         exit 1
@@ -131,6 +144,15 @@ run_rpc() {
     event="$(agent-rpc --json --timeout "$timeout" --interval "$interval" --status "$status" "$to" "$body")" || exit 1
     save_event "$save" "$event"
 }
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+agent_bus_set_paths
+agent_bus_export_env
 
 [ $# -ge 2 ] || usage
 cmd="$1"; shift

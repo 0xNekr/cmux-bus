@@ -1,15 +1,36 @@
 #!/usr/bin/env bash
-# agent-doctor
+# agent-doctor [--scope repo|workspace] [--bus-dir DIR]
 # Read-only diagnostics for a cmux-bus workspace.
 
 set -euo pipefail
 
+AGENT_CMD="agent-doctor"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
 usage() {
-    echo "usage: agent-doctor" >&2
+    echo "usage: agent-doctor [--scope repo|workspace] [--bus-dir DIR]" >&2
+    agent_bus_common_usage >&2
     exit 2
 }
 
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
 [ $# -eq 0 ] || usage
+agent_bus_set_paths
 
 problem_count=0
 event_tmp=""
@@ -23,13 +44,13 @@ problem() {
     echo "problem: $*"
 }
 
-[ -d .agents ] || {
-    echo "agent-doctor: no .agents/ here — run 'agent-init <your_name>' first" >&2
+[ -d "$AGENT_BUS_DIR_EFFECTIVE" ] || {
+    echo "agent-doctor: no bus at $AGENT_BUS_DIR_EFFECTIVE — run 'agent-init <your_name>' first" >&2
     exit 2
 }
 
-agents_file=".agents/agents.json"
-bus_file=".agents/bus.jsonl"
+agents_file="$AGENT_BUS_AGENTS_FILE"
+bus_file="$AGENT_BUS_FILE"
 
 if [ ! -f "$agents_file" ]; then
     problem "missing $agents_file"
@@ -41,6 +62,14 @@ fi
 
 if [ ! -f "$bus_file" ]; then
     problem "missing $bus_file"
+fi
+
+if [ "$AGENT_BUS_REPO_RUNTIME" -eq 0 ] && [ -d .agents ]; then
+    [ -f .agents/bus.jsonl ] && problem "legacy .agents/bus.jsonl exists while active bus is $AGENT_BUS_DIR_EFFECTIVE"
+    [ -f .agents/agents.json ] && problem "legacy .agents/agents.json exists while active bus is $AGENT_BUS_DIR_EFFECTIVE"
+    if [ -f .agents/PROTOCOL.md ] && ! grep -q "workspace-scope stub" .agents/PROTOCOL.md; then
+        problem "legacy .agents/PROTOCOL.md exists while active bus is $AGENT_BUS_DIR_EFFECTIVE"
+    fi
 fi
 
 if [ "$problem_count" -gt 0 ]; then
@@ -66,6 +95,7 @@ while IFS= read -r line || [ -n "$line" ]; do
         and ((.ref == null) or (.ref | type == "string" and length > 0))
         and (.status | IN("open","in_progress","done","blocked"))
         and (.paths_claimed | type == "array" and all(.[]; type == "string"))
+        and ((.cwd == null) or (.cwd | type == "string"))
         and (.body | type == "string")
     ' >/dev/null 2>&1; then
         problem "line $line_no: invalid event JSON/schema"
