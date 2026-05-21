@@ -119,7 +119,10 @@ touch "$dir/bus.jsonl"
 agents_file="$dir/agents.json"
 [ -s "$agents_file" ] || echo '{"agents":{}}' > "$agents_file"
 
-live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ && /in_window=true/ {print $2}')
+# Presence in surface-health means alive; closed panes disappear. Do NOT
+# require in_window=true (that only marks the selected workspace), or the purge
+# would wrongly target alive agents whenever their workspace is backgrounded.
+live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
 purged=""
 if [ -n "$live" ]; then
     live_json=$(printf '%s\n' "$live" | jq -R . | jq -s .)

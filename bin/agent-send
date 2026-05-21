@@ -137,7 +137,12 @@ fi
 
 live=""
 if ! { [ "$recipients" = "user" ]; }; then
-    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ && /in_window=true/ {print $2}')
+    # A surface is alive if it still appears in surface-health (closed panes
+    # disappear). Do NOT require in_window=true: that flag only marks the
+    # currently selected workspace, so an alive peer in a backgrounded
+    # workspace would look stale and weaken this check whenever the user is
+    # looking elsewhere. surface-health defaults to $CMUX_WORKSPACE_ID.
+    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
 fi
 
 while IFS= read -r recipient; do

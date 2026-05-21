@@ -473,6 +473,35 @@ test_agent_init_enforces_one_name_per_surface() {
     pass "agent-init keeps one name per surface (rename replaces the old)"
 }
 
+test_agent_init_purges_only_absent_surfaces() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-init-purge"
+    workspace="$(new_workspace init-purge)"
+    mkdir -p "$fakebin"
+    # s1 is alive but backgrounded (in_window=false); s-dead is absent.
+    cat > "$fakebin/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    printf 'surface:1 s1 type=terminal in_window=false\n'
+    exit 0
+fi
+exit 0
+CMUX
+    chmod +x "$fakebin/cmux"
+
+    (
+        cd "$workspace"
+        mkdir -p .agents
+        printf '%s\n' '{"agents":{"codex":"s1","ghost":"s-dead"}}' > .agents/agents.json
+        touch .agents/bus.jsonl
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" codex >/dev/null
+        jq -e '.agents | has("ghost") | not' .agents/agents.json >/dev/null || fail "absent surface was not purged"
+        jq -e '.agents.codex == "s1"' .agents/agents.json >/dev/null || fail "alive backgrounded surface was wrongly purged"
+    )
+
+    pass "agent-init purges only absent surfaces (keeps alive backgrounded ones)"
+}
+
 test_agent_roster_lists_peers_and_marks_self() {
     local fakebin workspace out
     fakebin="$tmp_root/fakebin-roster"
@@ -778,6 +807,48 @@ test_agent_send_rejects_stale_recipient() {
     )
 
     pass "agent-send rejects stale recipients without appending"
+}
+
+test_agent_send_signals_backgrounded_peer_but_rejects_dead() {
+    local fakebin workspace cmux_log id
+    fakebin="$tmp_root/fakebin-send-bg"
+    workspace="$(new_workspace send-bg)"
+    cmux_log="$tmp_root/cmux-send-bg.log"
+    mkdir -p "$fakebin"
+    # s1 and s2 are alive but in a non-selected workspace (in_window=false);
+    # s3 is absent from surface-health (closed pane).
+    cat > "$fakebin/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    cat <<'OUT'
+surface:1 s1 type=terminal in_window=false
+surface:2 s2 type=terminal in_window=false
+OUT
+    exit 0
+fi
+if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
+    [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+    exit 0
+fi
+exit 0
+CMUX
+    chmod +x "$fakebin/cmux"
+
+    (
+        cd "$workspace"
+        write_agents   # codex:s1, claude:s2, deepseek:s3
+        # Alive but backgrounded peer (s2) must still be signalled.
+        id=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff "ping")
+        [ -n "$id" ] || fail "agent-send refused an alive backgrounded peer"
+        grep -q "send --surface s2 new handoff id=$id" "$cmux_log" || fail "alive backgrounded peer was not signalled"
+        # Dead peer (s3 absent) is still refused, even though live surfaces are in_window=false.
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" deepseek ask "x" >/dev/null 2>&1; then
+            fail "agent-send accepted a dead recipient"
+        fi
+        [ "$(wc -l < .agents/bus.jsonl | tr -d ' ')" = "1" ] || fail "dead recipient appended to bus"
+    )
+
+    pass "agent-send signals alive backgrounded peers and still rejects dead ones"
 }
 
 test_agent_send_multiline_body() {
@@ -1672,6 +1743,7 @@ test_agent_init_workspace_refuses_open_legacy_bus_files
 test_agent_init_rejects_invalid_input
 test_agent_init_is_idempotent
 test_agent_init_enforces_one_name_per_surface
+test_agent_init_purges_only_absent_surfaces
 test_agent_roster_lists_peers_and_marks_self
 test_install_links_all_commands
 test_agent_send_ref_validation
@@ -1685,6 +1757,7 @@ test_agent_send_rejects_invalid_recipient_type_and_status
 test_agent_send_unknown_recipient_warns_against_cmux_fallback
 test_agent_send_user_does_not_signal
 test_agent_send_rejects_stale_recipient
+test_agent_send_signals_backgrounded_peer_but_rejects_dead
 test_agent_send_multiline_body
 test_agent_done_smoke
 test_agent_done_rejects_unknown_id
