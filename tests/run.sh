@@ -473,6 +473,58 @@ test_agent_init_enforces_one_name_per_surface() {
     pass "agent-init keeps one name per surface (rename replaces the old)"
 }
 
+test_agent_roster_lists_peers_and_marks_self() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-roster"
+    workspace="$(new_workspace roster)"
+    mkdir -p "$fakebin"
+    # surface-health reports s1/s2 with in_window=false (alive but in a
+    # non-selected workspace) and omits s3 entirely (closed pane). Liveness must
+    # follow presence, not in_window.
+    cat > "$fakebin/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    cat <<'OUT'
+surface:1 s1 type=terminal in_window=false
+surface:2 s2 type=terminal in_window=false
+OUT
+    exit 0
+fi
+exit 0
+CMUX
+    chmod +x "$fakebin/cmux"
+
+    (
+        cd "$workspace"
+        write_agents   # codex:s1, claude:s2, deepseek:s3
+
+        # Human output tells the caller who they are and marks their own row.
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-roster")
+        printf '%s\n' "$out" | grep -q "you are 'codex'" || fail "roster did not tell caller who they are"
+        printf '%s\n' "$out" | grep -E "codex .*\(you\)" >/dev/null || fail "roster did not mark the caller row"
+        printf '%s\n' "$out" | grep -q "claude" || fail "roster missing peer claude"
+        printf '%s\n' "$out" | grep -q "deepseek" || fail "roster missing peer deepseek"
+
+        # JSON exposes me + is_self + live. Liveness follows presence, not
+        # in_window: claude/codex (in_window=false but present) are live;
+        # deepseek (absent from surface-health) is stale.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-roster" --json | jq -e '
+            .me == "claude"
+            and (.agents | length == 3)
+            and (.agents[] | select(.name=="claude")   | .is_self == true and .live == true)
+            and (.agents[] | select(.name=="codex")    | .is_self == false and .live == true)
+            and (.agents[] | select(.name=="deepseek") | .live == false)
+        ' >/dev/null || fail "roster --json reported wrong self/live data"
+
+        # An unregistered surface still lists peers but is told to run agent-init.
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s9 "$repo_root/bin/agent-roster")
+        printf '%s\n' "$out" | grep -q "NOT registered" || fail "roster did not flag the unregistered caller"
+        printf '%s\n' "$out" | grep -q "codex" || fail "roster hid peers from an unregistered caller"
+    )
+
+    pass "agent-roster lists peers and tells the caller who they are"
+}
+
 test_install_links_all_commands() {
     local fakebin home tool
     fakebin="$tmp_root/fakebin-install"
@@ -481,7 +533,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
+    for tool in agent-init agent-send agent-inbox agent-roster agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -1620,6 +1672,7 @@ test_agent_init_workspace_refuses_open_legacy_bus_files
 test_agent_init_rejects_invalid_input
 test_agent_init_is_idempotent
 test_agent_init_enforces_one_name_per_surface
+test_agent_roster_lists_peers_and_marks_self
 test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal

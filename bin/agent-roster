@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# agent-roster [--scope repo|workspace] [--bus-dir DIR] [--json]
+# List the agents registered in the resolved bus and tell the caller, up front,
+# which one *they* are (resolved from CMUX_SURFACE_ID). Read-only.
+
+set -euo pipefail
+
+AGENT_CMD="agent-roster"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
+json=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --json) json=1;;
+        *) echo "usage: agent-roster [--scope repo|workspace] [--bus-dir DIR] [--json]" >&2
+           agent_bus_common_usage >&2; exit 2;;
+    esac
+    shift
+done
+
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+
+my_surface="${CMUX_SURFACE_ID:-}"
+me=""
+[ -n "$my_surface" ] && me="$(agent_bus_current_agent)"
+
+# A surface is alive if it still appears in surface-health for the bus's
+# workspace (closed panes disappear). Do NOT require in_window=true: that flag
+# only marks the currently *selected* workspace, so filtering on it would report
+# every peer as stale whenever you are looking at another workspace.
+# surface-health defaults to $CMUX_WORKSPACE_ID, which is this bus's workspace.
+live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
+live_json=$(printf '%s\n' "$live" | jq -R . | jq -s 'map(select(length > 0))')
+
+roster=$(jq -c --arg me "$me" --arg mysurf "$my_surface" --argjson live "$live_json" '
+    .agents
+    | to_entries
+    | map({
+        name:    .key,
+        surface: .value,
+        live:    (.value as $s | $live | index($s) != null),
+        is_self: (.key == $me)
+      })
+    | sort_by((.is_self | not), .name)
+' "$AGENT_BUS_AGENTS_FILE")
+
+if [ "$json" -eq 1 ]; then
+    jq -nc --arg bus "$AGENT_BUS_DIR_EFFECTIVE" --arg me "$me" \
+        --arg mysurf "$my_surface" --argjson roster "$roster" \
+        '{bus_dir:$bus, me:(if $me=="" then null else $me end),
+          my_surface:(if $mysurf=="" then null else $mysurf end), agents:$roster}'
+    exit 0
+fi
+
+echo "agent-roster: bus $AGENT_BUS_DIR_EFFECTIVE"
+if [ -n "$me" ]; then
+    echo "agent-roster: you are '$me' (surface $my_surface)"
+elif [ -n "$my_surface" ]; then
+    echo "agent-roster: you are NOT registered in this bus — run 'agent-init <your_name>'"
+else
+    echo "agent-roster: CMUX_SURFACE_ID not set — cannot tell which agent you are"
+fi
+echo
+
+count=$(printf '%s' "$roster" | jq 'length')
+if [ "$count" -eq 0 ]; then
+    echo "agent-roster: no agents registered yet — run 'agent-init <your_name>'"
+    exit 0
+fi
+
+printf '%-3s %-16s %-7s %s\n' '' PEER STATUS SURFACE
+# is_self goes last so no leading field is ever empty (bash `read` collapses a
+# leading tab, which would shift every non-self column left by one).
+printf '%s' "$roster" | jq -r '.[] |
+    [ .name,
+      (if .live then "live" else "stale" end),
+      .surface,
+      .is_self ] | @tsv' |
+while IFS=$'\t' read -r name st surface self; do
+    if [ "$self" = "true" ]; then marker="->"; you=" (you)"; else marker=""; you=""; fi
+    printf '%-3s %-16s %-7s %s%s\n' "$marker" "$name" "$st" "$surface" "$you"
+done
