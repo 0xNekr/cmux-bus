@@ -113,6 +113,22 @@ agent_bus_workspace_id() {
     printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_'
 }
 
+agent_bus_repo_root() {
+    # Anchor --scope repo to the git toplevel, not pwd. The earlier relative
+    # ".agents" path silently created the bus wherever the caller happened to
+    # cd'd to, so peer panes ended up on disjoint registries and stopped seeing
+    # each other.
+    # Returns non-zero on failure; callers must propagate via `|| exit 1` so the
+    # outer command substitution actually tears down the script instead of
+    # silently continuing with an empty path.
+    local root
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+        echo "${AGENT_CMD}: --scope repo requires running inside a git repository (set AGENT_BUS_DIR or --bus-dir to override)" >&2
+        return 1
+    }
+    printf '%s' "$root"
+}
+
 agent_bus_resolve_dir() {
     if [ -n "$AGENT_BUS_CLI_DIR" ]; then
         printf '%s\n' "$AGENT_BUS_CLI_DIR"
@@ -124,7 +140,11 @@ agent_bus_resolve_dir() {
     fi
 
     case "$(agent_bus_scope)" in
-        repo) printf '%s\n' ".agents";;
+        repo)
+            local root
+            root="$(agent_bus_repo_root)" || exit 1
+            printf '%s/.agents\n' "$root"
+            ;;
         workspace)
             printf '%s/cmux-bus/workspaces/%s\n' "$(agent_bus_state_home)" "$(agent_bus_workspace_id)"
             ;;
