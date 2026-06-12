@@ -50,22 +50,26 @@ me=""
 live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
 live_json=$(printf '%s\n' "$live" | jq -R . | jq -s 'map(select(length > 0))')
 
-roster=$(jq -c --arg me "$me" --arg mysurf "$my_surface" --argjson live "$live_json" '
+lead="$(agent_bus_lead)"
+
+roster=$(jq -c --arg me "$me" --arg mysurf "$my_surface" --arg lead "$lead" --argjson live "$live_json" '
     .agents
     | to_entries
     | map({
         name:    .key,
         surface: .value,
         live:    (.value as $s | $live | index($s) != null),
-        is_self: (.key == $me)
+        is_self: (.key == $me),
+        is_lead: ($lead != "" and .key == $lead)
       })
     | sort_by((.is_self | not), .name)
 ' "$AGENT_BUS_AGENTS_FILE")
 
 if [ "$json" -eq 1 ]; then
-    jq -nc --arg bus "$AGENT_BUS_DIR_EFFECTIVE" --arg me "$me" \
+    jq -nc --arg bus "$AGENT_BUS_DIR_EFFECTIVE" --arg me "$me" --arg lead "$lead" \
         --arg mysurf "$my_surface" --argjson roster "$roster" \
         '{bus_dir:$bus, me:(if $me=="" then null else $me end),
+          lead:(if $lead=="" then null else $lead end),
           my_surface:(if $mysurf=="" then null else $mysurf end), agents:$roster}'
     exit 0
 fi
@@ -78,6 +82,13 @@ elif [ -n "$my_surface" ]; then
 else
     echo "agent-roster: CMUX_SURFACE_ID not set — cannot tell which agent you are"
 fi
+if [ -n "$lead" ]; then
+    if [ "$lead" = "$me" ]; then
+        echo "agent-roster: lead is '$lead' (you) — plan, delegate, review; workers execute"
+    else
+        echo "agent-roster: lead is '$lead' — take handoffs from the lead, report done with evidence"
+    fi
+fi
 echo
 
 count=$(printf '%s' "$roster" | jq 'length')
@@ -86,15 +97,16 @@ if [ "$count" -eq 0 ]; then
     exit 0
 fi
 
-printf '%-3s %-16s %-7s %s\n' '' PEER STATUS SURFACE
+printf '%-3s %-16s %-7s %-7s %s\n' '' PEER STATUS ROLE SURFACE
 # is_self goes last so no leading field is ever empty (bash `read` collapses a
 # leading tab, which would shift every non-self column left by one).
 printf '%s' "$roster" | jq -r '.[] |
     [ .name,
       (if .live then "live" else "stale" end),
+      (if .is_lead then "lead" else "-" end),
       .surface,
       .is_self ] | @tsv' |
-while IFS=$'\t' read -r name st surface self; do
+while IFS=$'\t' read -r name st role surface self; do
     if [ "$self" = "true" ]; then marker="->"; you=" (you)"; else marker=""; you=""; fi
-    printf '%-3s %-16s %-7s %s%s\n' "$marker" "$name" "$st" "$surface" "$you"
+    printf '%-3s %-16s %-7s %-7s %s%s\n' "$marker" "$name" "$st" "$role" "$surface" "$you"
 done

@@ -233,6 +233,11 @@ agent_bus_current_agent() {
     jq -r --arg s "$surface" '.agents | to_entries[] | select(.value == $s) | .key' "$AGENT_BUS_AGENTS_FILE" | head -n1
 }
 
+agent_bus_lead() {
+    [ -f "$AGENT_BUS_AGENTS_FILE" ] || return 0
+    jq -r '.lead // empty' "$AGENT_BUS_AGENTS_FILE"
+}
+
 agent_bus_open_thread_count() {
     local bus_file="$1"
     [ -f "$bus_file" ] || { printf '0\n'; return 0; }

@@ -10,9 +10,17 @@ current cmux workspace, not the current folder. Use `AGENT_BUS_SCOPE=repo` or
 **At session start:**
 1. Treat `agent-inbox` as the source of truth for the current bus. The protocol
    copied by `agent-init` defines the schema, types, inbox routine,
-   path-ownership rule, and disagreement escalation.
-2. Run `agent-inbox` to see open threads addressed to you. Process them before
+   path-ownership rule, lead mode, and disagreement escalation.
+2. Run `agent-roster` to learn who you are and whether a **lead** is set.
+3. Run `agent-inbox` to see open threads addressed to you. Process them before
    taking new work.
+
+**If a lead is set** (see `agent-lead`): the lead plans, delegates via
+`handoff` with acceptance criteria and `paths_claimed`, reviews every `done`,
+and avoids executing delegated work itself. Workers `ack`, execute, and reply
+`done` with verifiable evidence; they `ask` the lead before self-assigning new
+non-trivial work. On worker/lead disagreement, one round-trip, then the lead
+decides. The user always outranks the lead.
 
 **To send or hand off:** `agent-send <to> <type> [--ref ID] [--paths "p1,p2"]
 <body>`. Types: `ask`, `handoff`, `done`, `block`, `ack`.

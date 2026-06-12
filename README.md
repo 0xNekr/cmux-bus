@@ -115,10 +115,11 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 
 | Command | What it does |
 |---|---|
-| `agent-init [--scope repo\|workspace] [--bus-dir DIR] <name>` | Bootstrap or refresh this bus for `<name>`. Creates the resolved bus dir, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, and purges stale entries from previous sessions. |
+| `agent-init [--scope repo\|workspace] [--bus-dir DIR] [--lead] <name>` | Bootstrap or refresh this bus for `<name>`. Creates the resolved bus dir, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, and purges stale entries from previous sessions. `--lead` declares `<name>` as the bus lead (see Lead mode). |
 | `agent-send [--scope repo\|workspace] [--bus-dir DIR] <to> <type> [flags] <body>` | Append event(s) and signal recipient(s). Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. For `ask`, `<to>` may be `all` or comma-separated names (`claude,deepseek`); this fans out into one thread per peer. Refuses unknown refs and stale recipients. |
 | `agent-inbox [--scope repo\|workspace] [--bus-dir DIR] [--json] [--no-stale\|--only-stale] [--no-stuck\|--only-stuck] [--stuck-after MIN]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. Threads whose last event is `in_progress` and older than the stuck threshold (default 10 min, configurable via `AGENT_BUS_STUCK_AFTER_MIN` env) appear with `[stuck Xm]`. |
-| `agent-roster [--scope repo\|workspace] [--bus-dir DIR] [--json]` | List the agents registered in the resolved bus and tell you, up front, which one you are (resolved from `CMUX_SURFACE_ID`). Marks your own row `(you)` and flags each peer `live`/`stale` by presence in `surface-health`. Read-only. |
+| `agent-roster [--scope repo\|workspace] [--bus-dir DIR] [--json]` | List the agents registered in the resolved bus and tell you, up front, which one you are (resolved from `CMUX_SURFACE_ID`). Marks your own row `(you)`, shows who is `lead`, and flags each peer `live`/`stale` by presence in `surface-health`. Read-only. |
+| `agent-lead [--scope repo\|workspace] [--bus-dir DIR] [show\|set <name>\|clear] [--json]` | Show, set, or clear the bus **lead** — the orchestrator agent that plans, delegates via `handoff`, and reviews results while the other agents execute. `set` requires a registered agent name. |
 | `agent-done [--scope repo\|workspace] [--bus-dir DIR] <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
 | `agent-cancel [--scope repo\|workspace] [--bus-dir DIR] <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |
 | `agent-resume [--scope repo\|workspace] [--bus-dir DIR] <id> [--force] [body]` | Re-open a stuck/crashed thread by appending a fresh `handoff` to its **original recipient**. Default body: `RESUME: <previous>`. Refuses if the thread is already done/blocked unless `--force`. |
@@ -210,6 +211,44 @@ ack, block, or done without affecting the others.
 Broadcast is only supported for `ask`. `handoff` is deliberately excluded
 because broadcasting the same `paths_claimed` would make file ownership
 ambiguous.
+
+## Lead mode
+
+By default the bus is peer-to-peer. You can instead declare one agent as the
+**lead** — the orchestrator that thinks, plans, and reviews, while cheaper
+models execute. The typical setup puts the strongest (most expensive) model
+in the lead pane:
+
+```sh
+# lead pane (e.g. Claude on a frontier model)
+agent-init claude --lead
+
+# worker panes
+agent-init codex
+agent-init deepseek
+```
+
+The lead decomposes work and delegates each task as a `handoff` with explicit
+acceptance criteria and `paths_claimed`, then reviews every `done` against
+those criteria. Rework is requested with a new `handoff --ref` on the same
+thread, which reopens it (effective state is the last event in the chain).
+Workers `ack`, execute, and reply `done` with verifiable evidence; they `ask`
+the lead before self-assigning new non-trivial work.
+
+The role is stored as a top-level `"lead"` key in the resolved `agents.json`
+and is announced by `agent-roster` and `agent-lead`, so every agent learns
+its role at session start. Like path ownership, lead mode is a declared
+convention, not an enforced lock. Manage it anytime:
+
+```sh
+agent-lead              # show the current lead (and whether it's you)
+agent-lead set codex    # promote a registered agent
+agent-lead clear        # back to peer-to-peer mode
+```
+
+`agent-init` keeps the pointer coherent: it follows a same-surface rename and
+clears the lead when its surface disappears. The user always outranks the
+lead — a direct user instruction to a worker wins over the lead's plan.
 
 ## Event schema
 

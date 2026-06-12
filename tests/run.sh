@@ -158,6 +158,7 @@ new_workspace() {
     local name="$1"
     local dir="$tmp_root/$name"
     mkdir -p "$dir"
+    git -C "$dir" init -q
     printf '%s\n' "$dir"
 }
 
@@ -554,6 +555,116 @@ CMUX
     pass "agent-roster lists peers and tells the caller who they are"
 }
 
+test_agent_lead_set_show_clear() {
+    local workspace out
+    workspace="$(new_workspace lead-cmd)"
+
+    (
+        cd "$workspace"
+        write_agents   # codex:s1, claude:s2, deepseek:s3
+
+        out=$(CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead")
+        printf '%s\n' "$out" | grep -q "no lead set" || fail "fresh bus reported a lead: $out"
+
+        CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" set claude >/dev/null
+        jq -e '.lead == "claude"' .agents/agents.json >/dev/null || fail "set did not write lead"
+
+        out=$(CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead")
+        printf '%s\n' "$out" | grep -q "lead is 'claude'" || fail "show did not report lead: $out"
+        out=$(CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-lead")
+        printf '%s\n' "$out" | grep -q "lead is 'claude' (you)" || fail "show did not mark the lead caller: $out"
+
+        CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-lead" --json | jq -e '
+            .lead == "claude" and .me == "claude" and .is_me == true
+        ' >/dev/null || fail "lead --json reported wrong data"
+
+        if CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" set ghost >/dev/null 2>&1; then
+            fail "agent-lead accepted an unregistered name"
+        fi
+        jq -e '.lead == "claude"' .agents/agents.json >/dev/null || fail "failed set mutated the lead"
+
+        CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" clear >/dev/null
+        jq -e 'has("lead") | not' .agents/agents.json >/dev/null || fail "clear did not remove lead"
+    )
+
+    pass "agent-lead sets, shows, and clears the bus lead"
+}
+
+test_agent_init_lead_flag_and_maintenance() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-init-lead"
+    workspace="$(new_workspace init-lead)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-init" claude --lead)
+        jq -e '.lead == "claude"' .agents/agents.json >/dev/null || fail "--lead did not set lead"
+        printf '%s\n' "$out" | grep -q "lead is 'claude'" || fail "--lead was not reported"
+
+        # A plain re-init of a peer keeps the existing lead.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" codex >/dev/null
+        jq -e '.lead == "claude"' .agents/agents.json >/dev/null || fail "peer init dropped the lead"
+
+        # --lead from another pane takes over and reports the change.
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" codex --lead)
+        jq -e '.lead == "codex"' .agents/agents.json >/dev/null || fail "second --lead did not take over"
+        printf '%s\n' "$out" | grep -q "lead changed from 'claude' to 'codex'" || fail "lead change was not reported"
+
+        # A same-surface rename drags the lead pointer along.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" boss >/dev/null
+        jq -e '.lead == "boss"' .agents/agents.json >/dev/null || fail "lead did not follow rename"
+    )
+
+    pass "agent-init --lead sets, hands over, and renames the lead"
+}
+
+test_agent_init_clears_purged_lead() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-init-lead-purge"
+    workspace="$(new_workspace init-lead-purge)"
+    make_fake_cmux_live_s1_only "$fakebin"
+
+    (
+        cd "$workspace"
+        mkdir -p .agents
+        printf '%s\n' '{"agents":{"codex":"s1","claude":"s-dead"},"lead":"claude"}' > .agents/agents.json
+        touch .agents/bus.jsonl
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" codex)
+        jq -e '.agents | has("claude") | not' .agents/agents.json >/dev/null || fail "dead lead surface was not purged"
+        jq -e 'has("lead") | not' .agents/agents.json >/dev/null || fail "lead pointer survived its purged surface"
+        printf '%s\n' "$out" | grep -q "cleared stale lead 'claude'" || fail "lead cleanup was not reported"
+    )
+
+    pass "agent-init clears the lead when its surface is purged"
+}
+
+test_agent_roster_shows_lead() {
+    local fakebin workspace out tmp
+    fakebin="$tmp_root/fakebin-roster-lead"
+    workspace="$(new_workspace roster-lead)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        tmp=$(mktemp)
+        jq '.lead = "claude"' .agents/agents.json > "$tmp" && mv "$tmp" .agents/agents.json
+
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-roster")
+        printf '%s\n' "$out" | grep -q "lead is 'claude'" || fail "roster did not announce the lead"
+        printf '%s\n' "$out" | grep -E "claude .* lead " >/dev/null || fail "roster did not mark the lead row"
+
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-roster" --json | jq -e '
+            .lead == "claude"
+            and (.agents[] | select(.name=="claude") | .is_lead == true)
+            and (.agents[] | select(.name=="codex")  | .is_lead == false)
+        ' >/dev/null || fail "roster --json reported wrong lead data"
+    )
+
+    pass "agent-roster announces and marks the lead"
+}
+
 test_install_links_all_commands() {
     local fakebin home tool
     fakebin="$tmp_root/fakebin-install"
@@ -562,7 +673,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-roster agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
+    for tool in agent-init agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -1745,6 +1856,10 @@ test_agent_init_is_idempotent
 test_agent_init_enforces_one_name_per_surface
 test_agent_init_purges_only_absent_surfaces
 test_agent_roster_lists_peers_and_marks_self
+test_agent_lead_set_show_clear
+test_agent_init_lead_flag_and_maintenance
+test_agent_init_clears_purged_lead
+test_agent_roster_shows_lead
 test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal

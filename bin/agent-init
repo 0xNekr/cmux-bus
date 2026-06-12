@@ -20,8 +20,9 @@ done
 repo_root="$AGENT_REPO_ROOT"
 
 usage() {
-    echo "usage: agent-init [--scope repo|workspace] [--bus-dir DIR] <agent_name>" >&2
+    echo "usage: agent-init [--scope repo|workspace] [--bus-dir DIR] [--lead] <agent_name>" >&2
     echo "  registers this pane as <agent_name> in the resolved bus agents.json" >&2
+    echo "  --lead declares <agent_name> as the bus lead (see PROTOCOL.md, Lead mode)" >&2
     agent_bus_common_usage >&2
     exit 2
 }
@@ -33,8 +34,17 @@ else
     set --
 fi
 
-[ $# -eq 1 ] || usage
-name="$1"
+lead_flag=0
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --lead) lead_flag=1;;
+        *)      args+=("$1");;
+    esac
+    shift
+done
+[ "${#args[@]}" -eq 1 ] || usage
+name="${args[0]}"
 
 [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || {
     echo "agent-init: name must be lowercase, start with a letter, [a-z0-9_-], 1..32 chars" >&2
@@ -49,7 +59,13 @@ surface="${CMUX_SURFACE_ID:-}"
 
 gitignore_action="skipped"
 ensure_agents_gitignore() {
-    local gitignore=".gitignore"
+    # Write to the repo root .gitignore, not pwd's. Same reason as
+    # agent_bus_repo_root: agent-init may be run from a subdirectory, and
+    # appending ".agents/" to a nested .gitignore would leak the bus into git
+    # tracking from the root.
+    local root gitignore
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || root="."
+    gitignore="$root/.gitignore"
     if [ ! -f "$gitignore" ] || ! grep -qxF ".agents/" "$gitignore"; then
         [ -f "$gitignore" ] && [ -n "$(tail -c1 "$gitignore" 2>/dev/null)" ] && echo >> "$gitignore"
         echo ".agents/" >> "$gitignore"
@@ -142,6 +158,34 @@ renamed=$(jq -r --arg n "$name" --arg s "$surface" \
 jq --arg n "$name" --arg s "$surface" \
     '.agents |= (with_entries(select(.value != $s)) + {($n): $s})' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
 
+# Keep the lead pointer coherent with the registry: follow a same-surface
+# rename, drop it when the lead's surface was purged, and let --lead claim it.
+lead_note=""
+prev_lead="$(agent_bus_lead)"
+current_lead="$prev_lead"
+if [ "$lead_flag" -eq 1 ]; then
+    if [ -n "$prev_lead" ] && [ "$prev_lead" != "$name" ]; then
+        lead_note="lead changed from '$prev_lead' to '$name'"
+    else
+        lead_note="lead is '$name'"
+    fi
+    tmp=$(mktemp)
+    jq --arg n "$name" '.lead = $n' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
+    current_lead="$name"
+elif [ -n "$prev_lead" ]; then
+    if [ -n "$renamed" ] && printf ',%s,' "$renamed" | grep -qF ",$prev_lead,"; then
+        tmp=$(mktemp)
+        jq --arg n "$name" '.lead = $n' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
+        lead_note="lead followed rename: '$prev_lead' -> '$name'"
+        current_lead="$name"
+    elif ! jq -e --arg l "$prev_lead" '.agents | has($l)' "$agents_file" >/dev/null; then
+        tmp=$(mktemp)
+        jq 'del(.lead)' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
+        lead_note="cleared stale lead '$prev_lead'"
+        current_lead=""
+    fi
+fi
+
 if [ "$AGENT_BUS_REPO_RUNTIME" -eq 1 ]; then
     ensure_agents_gitignore
 fi
@@ -197,6 +241,17 @@ prior events. The effective state of a thread is the **last** event whose
 
 - **Claude** — design, critique, broad exploration, multi-file refactor, UX/API framing
 - **Codex** — CLI diagnostics, one-shot scripts, tests, bisect, migrations, hypothesis verification
+
+## Lead mode
+
+A bus may declare one **lead** agent (`"lead"` key in agents.json, managed
+with `agent-lead` / `agent-init --lead`). The lead plans, delegates via
+`handoff` with acceptance criteria and `paths_claimed`, reviews every `done`,
+and does not execute delegated work itself. Workers `ack`, execute, reply
+`done` with verifiable evidence, and `ask` the lead before self-assigning
+new non-trivial work. On worker/lead disagreement: one round-trip, then the
+lead decides. The user always outranks the lead. No lead set means
+peer-to-peer mode.
 
 ## Inbox routine
 
@@ -260,9 +315,16 @@ current cmux workspace, not the current folder. Use `AGENT_BUS_SCOPE=repo` or
 **At session start:**
 1. Treat `agent-inbox` as the source of truth for the current bus. The protocol
    copied by `agent-init` defines the schema, types, inbox routine,
-   path-ownership rule, and disagreement escalation.
-2. Run `agent-inbox` to see open threads addressed to you. Process them before
+   path-ownership rule, lead mode, and disagreement escalation.
+2. Run `agent-roster` to learn who you are and whether a **lead** is set.
+3. Run `agent-inbox` to see open threads addressed to you. Process them before
    taking new work.
+
+**If a lead is set** (see `agent-lead`): the lead plans, delegates via
+`handoff` with acceptance criteria and `paths_claimed`, reviews every `done`,
+and avoids executing delegated work itself. Workers `ack`, execute, and reply
+`done` with verifiable evidence; they `ask` the lead before self-assigning new
+non-trivial work. The user always outranks the lead.
 
 **To send or hand off:** `agent-send <to> <type> [--ref ID] [--paths "p1,p2"]
 <body>`. Types: `ask`, `handoff`, `done`, `block`, `ack`.
@@ -305,6 +367,11 @@ fi
 
 echo "agent-init: registered '$name' -> surface '$surface'"
 echo "agent-init: $(jq -c .agents "$agents_file")"
+if [ -n "$lead_note" ]; then
+    echo "agent-init: $lead_note"
+elif [ -n "$current_lead" ]; then
+    echo "agent-init: lead is '$current_lead'$([ "$current_lead" = "$name" ] && echo " (you)")"
+fi
 echo "agent-init: scope $AGENT_BUS_SCOPE_EFFECTIVE"
 echo "agent-init: protocol at $protocol, bus at $dir/bus.jsonl"
 echo "agent-init: $agents_md $agents_md_action"

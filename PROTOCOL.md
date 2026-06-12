@@ -116,6 +116,57 @@ These are conventions, not enforced rules:
 - **Claude** — design, critique, broad exploration, multi-file refactor, UX/API framing
 - **Codex** — CLI diagnostics, one-shot scripts, tests, bisect, migrations, hypothesis verification
 
+## Lead mode
+
+A bus may declare at most one **lead** agent, recorded as a top-level
+`"lead"` key in `agents.json`. Set it with `agent-init <name> --lead` or
+`agent-lead set <name>`; inspect it with `agent-lead` or `agent-roster`;
+remove it with `agent-lead clear`. Without a lead, the bus runs in the
+default peer-to-peer mode and this section does not apply.
+
+The intent is cost-tiering: the lead is typically the strongest (most
+expensive) model, and execution is delegated to cheaper peers. Like path
+ownership, this is a declared convention — every agent reads its role at
+session start and behaves accordingly.
+
+**If you are the lead**, your job is to think, not to type:
+
+- Analyze and decompose incoming work into tasks a worker can execute
+  without further context. Delegate each task with a `handoff` carrying
+  explicit acceptance criteria (what to change, how to verify, what
+  "done" means) and `paths_claimed`.
+- Do not execute delegated work yourself. You may read anything; reserve
+  your own edits for what cannot be delegated (final integration calls,
+  tiny corrections during review).
+- Review every `done` you receive: check the evidence against the
+  acceptance criteria. To request rework, append a new `handoff` with
+  `--ref` on the same thread describing precisely what failed; the
+  thread reopens because effective state is the last event in the chain.
+- Parallelize independent tasks across workers; never hand two workers
+  overlapping `paths_claimed`.
+
+**If you are a worker** (any registered agent that is not the lead):
+
+- Process `handoff` events from the lead first: `ack`, execute, then
+  `done` with verifiable evidence (commands run, test output, commit
+  ids) — not just "done".
+- When you discover new non-trivial work, send an `ask` to the lead
+  instead of self-assigning it. Trivial fixes inside your already
+  claimed paths are fine.
+- If a task is ambiguous or the acceptance criteria seem wrong, `ask`
+  the lead before writing code.
+
+**Arbitration**: on a worker ↔ lead disagreement, one full round-trip of
+arguments is allowed, then the lead decides and the worker complies.
+The standard disagreement rule still applies above the lead: if the
+lead itself is unsure or a worker raises a `block`, escalate to `user`.
+The user always outranks the lead; a direct user instruction to a
+worker takes precedence over the lead's plan (the worker should tell
+the lead via an `ask` so the plan can adapt).
+
+Lifecycle: `agent-init` keeps the pointer coherent — it follows a
+same-surface rename and is cleared when the lead's surface is purged.
+
 ## Inbox routine
 
 Before starting any new task, every agent **must**:

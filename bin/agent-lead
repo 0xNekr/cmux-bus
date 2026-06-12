@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# agent-lead [--scope repo|workspace] [--bus-dir DIR] [show|set <name>|clear] [--json]
+# Show, set, or clear the bus lead. The lead is the orchestrator agent: it
+# plans, delegates via handoff, and reviews results; other agents execute.
+
+set -euo pipefail
+
+AGENT_CMD="agent-lead"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-lead [--scope repo|workspace] [--bus-dir DIR] [show|set <name>|clear] [--json]
+  show          print the current lead (default)
+  set <name>    declare <name> (a registered agent) as the bus lead
+  clear         remove the lead — back to peer-to-peer mode
+EOF
+    agent_bus_common_usage >&2
+    exit 2
+}
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
+action="show"
+target=""
+json=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        show)  action="show";;
+        clear) action="clear";;
+        set)
+            action="set"
+            [ $# -ge 2 ] || { echo "agent-lead: set needs an agent name" >&2; exit 2; }
+            target="$2"; shift
+            ;;
+        --json) json=1;;
+        *) usage;;
+    esac
+    shift
+done
+
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+
+me=""
+[ -n "${CMUX_SURFACE_ID:-}" ] && me="$(agent_bus_current_agent)"
+
+case "$action" in
+    set)
+        jq -e --arg n "$target" '.agents | has($n)' "$AGENT_BUS_AGENTS_FILE" >/dev/null || {
+            echo "agent-lead: '$target' is not registered in bus $AGENT_BUS_DIR_EFFECTIVE — known agents:" >&2
+            jq -r '.agents | keys[]' "$AGENT_BUS_AGENTS_FILE" | sed 's/^/  /' >&2
+            echo "agent-lead: have them run 'agent-init $target' first" >&2
+            exit 1
+        }
+        tmp=$(mktemp)
+        jq --arg n "$target" '.lead = $n' "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+        echo "agent-lead: lead set to '$target'"
+        ;;
+    clear)
+        tmp=$(mktemp)
+        jq 'del(.lead)' "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+        echo "agent-lead: lead cleared — peer-to-peer mode"
+        ;;
+esac
+
+lead="$(agent_bus_lead)"
+
+if [ "$json" -eq 1 ]; then
+    jq -nc --arg lead "$lead" --arg me "$me" \
+        '{lead: (if $lead == "" then null else $lead end),
+          me:   (if $me   == "" then null else $me   end),
+          is_me: ($lead != "" and $lead == $me)}'
+    exit 0
+fi
+
+if [ "$action" = "show" ]; then
+    if [ -z "$lead" ]; then
+        echo "agent-lead: no lead set — peer-to-peer mode"
+    elif [ "$lead" = "$me" ]; then
+        echo "agent-lead: lead is '$lead' (you) — plan, delegate via handoff, review results; avoid executing multi-file work yourself"
+    else
+        echo "agent-lead: lead is '$lead' — take handoffs from the lead, report done with evidence, ask the lead before self-assigning new work"
+    fi
+fi

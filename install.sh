@@ -6,7 +6,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src_bin="$repo_root/bin"
-tools=(agent-init agent-send agent-inbox agent-roster agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update)
+tools=(agent-init agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update)
 
 missing=()
 command -v jq >/dev/null 2>&1 || missing+=("jq")
@@ -74,25 +74,49 @@ use the `agent-*` commands.
 1. **At session start in such a workspace**, treat `agent-inbox` as the
    source of truth for open work. The protocol copied by `agent-init` defines
    the message schema, types, status semantics, inbox routine, path-ownership
-   rule, and the disagreement escalation rule.
-2. **Before taking any new task**, run `agent-inbox` to see open threads
+   rule, lead mode, and the disagreement escalation rule.
+2. **Check your role** with `agent-roster` (or `agent-lead`): the bus may
+   declare a lead agent. See "Lead mode" below.
+3. **Before taking any new task**, run `agent-inbox` to see open threads
    addressed to you. Process them in chronological order.
-3. **To send a message or hand off work**, use `agent-send <to> <type>
+4. **To send a message or hand off work**, use `agent-send <to> <type>
    [--ref ID] [--paths "p1,p2"] <body>`. Always claim `paths_claimed` for
    handoffs that involve file edits.
-4. **To close a thread**, use `agent-done <id> [body]`.
-5. **Never edit a path** that another agent has claimed in an open thread.
-6. **On disagreement**, after two unresolved round-trips, escalate via a
+5. **To close a thread**, use `agent-done <id> [body]`.
+6. **Never edit a path** that another agent has claimed in an open thread.
+7. **On disagreement**, after two unresolved round-trips, escalate via a
    `block` event to `to=user` with a clear summary, each agent's
    recommendation, and concrete options.
-7. **If a peer is missing or stale**, ask them to run `agent-init <name>` in
+8. **If a peer is missing or stale**, ask them to run `agent-init <name>` in
    their current pane. Do not use `cmux send` as a fallback for bus messages.
+
+## Lead mode
+
+The bus may declare one lead agent (`agent-init <name> --lead`, or
+`agent-lead set <name>`). The intent is cost-tiering: the strongest model
+plans and reviews, cheaper peers execute.
+
+- **If you are the lead**: analyze and decompose work, delegate via
+  `handoff` with explicit acceptance criteria and `paths_claimed`, review
+  every `done` against those criteria, and request rework with a new
+  `handoff --ref` on the same thread. Do not execute delegated work
+  yourself; reading is fine, reserve your edits for what cannot be
+  delegated. Never give two workers overlapping path claims.
+- **If you are a worker**: process the lead's handoffs first (`ack` →
+  execute → `done` with verifiable evidence: commands run, test output,
+  commit ids). `ask` the lead before self-assigning new non-trivial work
+  or when acceptance criteria are ambiguous.
+- **Arbitration**: one worker↔lead round-trip, then the lead decides.
+  The user always outranks the lead; if the user instructs you directly,
+  follow the user and tell the lead via an `ask`.
 
 ## Setup in a fresh workspace
 
 If the user wants the multi-agent bus, run `agent-init <your_agent_name>`.
 Each agent runs `agent-init` once with its own name; the script registers your
 `CMUX_SURFACE_ID` in the resolved bus `agents.json` so peers can signal you.
+To bootstrap a managed fleet, the orchestrator pane runs
+`agent-init <name> --lead` and each worker pane runs `agent-init <name>`.
 RULE
     echo "installed Claude rule: $rule_dst"
 fi
