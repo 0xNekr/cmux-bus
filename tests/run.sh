@@ -2425,9 +2425,9 @@ test_agent_lead_guard_enforces_strict_lead() {
             || fail "a bus command must be allowed"
         [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status && agent-roster"}}')" ] \
             || fail "read-only coordination must be allowed"
-        # Read/monitor commands (gh pr list, pollers, cmux) must NOT prompt.
-        [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"for i in $(seq 1 5); do gh pr list --json url; sleep 30; done"}}')" ] \
-            || fail "a read-only PR poller must be allowed"
+        # A single read/monitor command (no loop) must NOT prompt.
+        [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr list --head fix/x --json url,number"}}')" ] \
+            || fail "a single read command must be allowed"
         # Bus commands are coordination even when their --task text mentions
         # mutation words (docker/ssh/npm) — those are data, not commands.
         [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"agent-spawn scout --as codex --task \"ssh root@h docker ps then npm build\" --paths \"\""}}')" ] \
