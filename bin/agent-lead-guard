@@ -175,32 +175,27 @@ emit_context() { # <event> <context>
     exit 0
 }
 
-# A Bash command is "coordination" if every segment's leading command is a bus
-# command or a read-only inspection tool. Anything else is treated as execution.
-bash_is_coordination() {
-    local cmd="$1" norm seg first sub
-    norm="$(printf '%s' "$cmd" | sed 's/&&/\n/g; s/||/\n/g; s/|/\n/g; s/;/\n/g')"
-    while IFS= read -r seg; do
-        seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-        [ -z "$seg" ] && continue
-        # First bare token, skipping leading VAR=val assignments.
-        first="$(printf '%s' "$seg" | awk '{for(i=1;i<=NF;i++){ if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue; print $i; exit }}')"
-        first="$(basename "$first" 2>/dev/null || printf '%s' "$first")"
-        case "$first" in
-            agent-*|cmux|ls|cat|bat|head|tail|grep|rg|egrep|fgrep|jq|yq|find|fd|echo|printf|pwd|whoami|which|command|type|wc|sort|uniq|cut|column|tr|comm|tree|basename|dirname|realpath|readlink|stat|file|date|env|true|false|test|diff|sed)
-                : ;;  # sed allowed (read-only use; -i would mutate but is rare for a lead inspecting)
-            git)
-                sub="$(printf '%s' "$seg" | awk '{for(i=1;i<=NF;i++){ if($i=="git"){print $(i+1); exit} }}')"
-                case "$sub" in
-                    status|log|diff|show|branch|blame|ls-files|rev-parse|remote|describe|shortlog|whatchanged|cat-file|config) : ;;
-                    *) return 1 ;;
-                esac ;;
-            *) return 1 ;;
-        esac
-    done <<EOF
-$norm
-EOF
-    return 0
+# Blocklist, not allowlist: the strict lead reads and coordinates freely
+# (reading is always fine), so a Bash command is allowed UNLESS it clearly
+# executes or mutates. This avoids prompting on the lead's normal review/monitor
+# work (gh pr list, loops, cmux read-screen, agent-*, git status, ...). Returns 0
+# when the command should prompt (ask), 1 when it should be allowed.
+bash_should_ask() {
+    local cmd="$1"
+    local b='(^|[;&|(`]|[[:space:]])'   # a word boundary that survives pipes/subshells
+
+    # Build tools, package managers, language runtimes — "doing work".
+    printf '%s' "$cmd" | grep -qiE "${b}(npm|yarn|pnpm|bun|make|cargo|go|mvn|gradle|pip|pip3|poetry|uv|python|python3|node|deno|ruby|rails|php|dotnet|rustc|tsc|vite|webpack|jest|vitest|pytest|terraform|ansible|kubectl|helm|docker|docker-compose|podman|vagrant|serverless)[[:space:]]" && return 0
+    # Filesystem mutations.
+    printf '%s' "$cmd" | grep -qiE "${b}(rm|mv|cp|chmod|chown|mkdir|rmdir|touch|ln|tee|dd|truncate)[[:space:]]" && return 0
+    # In-place stream edits.
+    printf '%s' "$cmd" | grep -qiE '(sed|perl)[[:space:]]+-i' && return 0
+    # git mutations (read subcommands like status/log/diff stay allowed).
+    printf '%s' "$cmd" | grep -qiE 'git[[:space:]]+(commit|push|merge|rebase|reset|checkout|switch|cherry-pick|revert|tag|am|apply|stash|clean|add|rm|mv)([[:space:]]|$)' && return 0
+    # gh / forge mutations (read subcommands like pr list/view stay allowed).
+    printf '%s' "$cmd" | grep -qiE 'gh[[:space:]]+(pr[[:space:]]+(create|merge|close|edit|review|comment|ready)|issue[[:space:]]+(create|close|edit|comment)|release|repo[[:space:]]+(create|delete|fork)|workflow[[:space:]]+run|api[[:space:]]+(-X[[:space:]]*)?(POST|PUT|PATCH|DELETE))' && return 0
+
+    return 1
 }
 
 case "$event" in
@@ -215,10 +210,10 @@ case "$event" in
                 ;;
             Bash)
                 cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null || true)"
-                if [ -z "$cmd" ] || bash_is_coordination "$cmd"; then
-                    exit 0
+                if [ -n "$cmd" ] && bash_should_ask "$cmd"; then
+                    emit_decision ask "You are '$me', the STRICT lead — this command builds/runs/mutates rather than reads. Delegate it via the bus ('agent-send <peer> handoff'), or approve only if the user explicitly asked you to run it yourself."
                 fi
-                emit_decision ask "You are '$me', the STRICT lead — this looks like execution, not coordination. Delegate it via the bus ('agent-send <peer> handoff'), or approve only if the user explicitly asked you to run it yourself."
+                exit 0
                 ;;
             *) exit 0 ;;
         esac

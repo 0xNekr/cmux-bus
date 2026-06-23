@@ -2425,8 +2425,15 @@ test_agent_lead_guard_enforces_strict_lead() {
             || fail "a bus command must be allowed"
         [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status && agent-roster"}}')" ] \
             || fail "read-only coordination must be allowed"
+        # Read/monitor commands (gh pr list, pollers, cmux) must NOT prompt.
+        [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"for i in $(seq 1 5); do gh pr list --json url; sleep 30; done"}}')" ] \
+            || fail "a read-only PR poller must be allowed"
         decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"npm run build"}}' \
-            | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null || fail "execution Bash should ask"
+            | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null || fail "build command should ask"
+        decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git commit -m x"}}' \
+            | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null || fail "git mutation should ask"
+        decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr create --fill"}}' \
+            | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null || fail "gh mutation should ask"
         [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{}}')" ] \
             || fail "Read must be allowed (reading is fine for the lead)"
         decide s1 '{"hook_event_name":"SessionStart","source":"startup"}' \
