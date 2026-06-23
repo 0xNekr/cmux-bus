@@ -2373,10 +2373,14 @@ test_agent_policy_show_init_and_check() {
     out=$(AGENT_BUS_POLICY_FILE="$tmp_root/none.json" "$repo_root/bin/agent-policy" show)
     printf '%s' "$out" | grep -q 'mode = open' || fail "show did not resolve to open: $out"
 
-    # init --user writes a starter and refuses to clobber without --force.
-    HOME="$home" AGENT_BUS_POLICY_FILE= "$repo_root/bin/agent-policy" init --user >/dev/null
-    [ -f "$home/.config/cmux-bus/policy.json" ] || fail "init --user did not write the file"
-    ! HOME="$home" AGENT_BUS_POLICY_FILE= "$repo_root/bin/agent-policy" init --user >/dev/null 2>&1 \
+    # init --user writes a starter and refuses to clobber without --force. Drive
+    # XDG_CONFIG_HOME explicitly so the path is deterministic regardless of the
+    # runner's environment (the user file resolves to $XDG_CONFIG_HOME first).
+    local cfgdir="$home/.config"
+    rm -f "$cfgdir/cmux-bus/policy.json"
+    XDG_CONFIG_HOME="$cfgdir" "$repo_root/bin/agent-policy" init --user >/dev/null
+    [ -f "$cfgdir/cmux-bus/policy.json" ] || fail "init --user did not write the file"
+    ! XDG_CONFIG_HOME="$cfgdir" "$repo_root/bin/agent-policy" init --user >/dev/null 2>&1 \
         || fail "init should refuse to overwrite without --force"
 
     pass "agent-policy shows, inits, and checks spawn rules"
