@@ -20,9 +20,10 @@ done
 repo_root="$AGENT_REPO_ROOT"
 
 usage() {
-    echo "usage: agent-init [--scope repo|workspace] [--bus-dir DIR] [--lead] <agent_name>" >&2
+    echo "usage: agent-init [--scope repo|workspace] [--bus-dir DIR] [--lead] [--as PROVIDER] <agent_name>" >&2
     echo "  registers this pane as <agent_name> in the resolved bus agents.json" >&2
     echo "  --lead declares <agent_name> as the bus lead (see PROTOCOL.md, Lead mode)" >&2
+    echo "  --as PROVIDER records your provider (claude|codex|...) for the spawn policy" >&2
     agent_bus_common_usage >&2
     exit 2
 }
@@ -35,11 +36,14 @@ else
 fi
 
 lead_flag=0
+as_provider=""
 args=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --lead) lead_flag=1;;
-        *)      args+=("$1");;
+        --lead)   lead_flag=1;;
+        --as)     [ $# -ge 2 ] || usage; as_provider="$2"; shift;;
+        --as=*)   as_provider="${1#--as=}";;
+        *)        args+=("$1");;
     esac
     shift
 done
@@ -184,6 +188,25 @@ elif [ -n "$prev_lead" ]; then
         lead_note="cleared stale lead '$prev_lead'"
         current_lead=""
     fi
+fi
+
+# Record a self-declared provider (--as) so the spawn policy can classify this
+# agent (a hand-started agent has no spawned provenance otherwise). Merge so a
+# later agent-init never erases spawn metadata already on this name.
+if [ -n "$as_provider" ]; then
+    tmp=$(mktemp)
+    jq --arg n "$name" --arg p "$as_provider" \
+        '.meta = ((.meta // {}) + {($n): ((.meta[$n] // {}) + {provider:$p, self:true})})' \
+        "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
+fi
+
+# Keep the optional `.meta` worker map (written by agent-spawn) coherent with the
+# registry: drop metadata for any name no longer present in .agents (purged dead
+# surfaces or renamed-away names), so the roster never shows ghost provenance.
+if jq -e 'has("meta")' "$agents_file" >/dev/null 2>&1; then
+    tmp=$(mktemp)
+    jq '.agents as $a | .meta |= with_entries(select(.key as $k | $a | has($k)))' \
+        "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
 fi
 
 if [ "$AGENT_BUS_REPO_RUNTIME" -eq 1 ]; then

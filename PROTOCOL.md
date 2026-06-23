@@ -129,21 +129,88 @@ expensive) model, and execution is delegated to cheaper peers. Like path
 ownership, this is a declared convention — every agent reads its role at
 session start and behaves accordingly.
 
-**If you are the lead**, your job is to think, not to type:
+**If you are the lead**, your job is to think, not to type. A lead has an
+**execution policy**, recorded as optional `lead_policy` in `agents.json`
+(absent ⇒ `strict`), managed with `agent-lead strict` / `agent-lead relaxed`
+or `agent-lead set <name> [--relaxed]`, and announced by `agent-roster`:
+
+- **`strict` (the default).** You must **not** edit, run, or execute
+  anything yourself — not a file edit, not a shell command, not a build.
+  Delegate every unit of work via `handoff`. The single exception is an
+  **explicit user instruction** to do something yourself; a user request
+  outranks the policy. Reading is always allowed.
+- **`relaxed`.** You may execute work directly when you judge it more
+  efficient than delegating. Use this only when the user opts out of strict.
+
+Strict mode is a declared convention by default, but it can be **enforced** with
+the `agent-lead-guard` Claude Code hook (`agent-lead-guard install`): for the
+strict lead it denies native sub-agents, asks before file edits / non-bus shell
+commands, and allows reads and `agent-*`/`cmux` coordination. If a tool call is
+denied or prompts for approval, that is the policy — delegate via the bus.
+
+Regardless of policy:
 
 - Analyze and decompose incoming work into tasks a worker can execute
   without further context. Delegate each task with a `handoff` carrying
   explicit acceptance criteria (what to change, how to verify, what
   "done" means) and `paths_claimed`.
-- Do not execute delegated work yourself. You may read anything; reserve
-  your own edits for what cannot be delegated (final integration calls,
-  tiny corrections during review).
 - Review every `done` you receive: check the evidence against the
   acceptance criteria. To request rework, append a new `handoff` with
   `--ref` on the same thread describing precisely what failed; the
   thread reopens because effective state is the last event in the chain.
 - Parallelize independent tasks across workers; never hand two workers
   overlapping `paths_claimed`.
+
+**Assembling your own team.** You do not need the user to open panes and
+run `agent-init` for each worker. Recruit them yourself:
+
+- `agent-spawn <name> --as <claude|codex|opencode> [--model M] [--split]`
+  opens the worker as a background tab in your pane (unfocused, one click
+  away; `--split` for a side-by-side pane instead), registers `<name>` on
+  this same bus, and launches that provider's CLI in it. The new surface
+  runs `agent-init` in its shell *before* the CLI starts, so the
+  registration is deterministic, and it inherits your `CMUX_WORKSPACE_ID`
+  so it lands on the same workspace bus automatically. Choose the provider
+  and model to fit the task (e.g. `codex` for CLI diagnostics and
+  one-shot scripts, `claude` for design and multi-file refactors). Models
+  default per provider and are overridable with `--model` (`--model
+  default` uses the CLI's own default).
+- Hand it a first task at spawn time with `--task "..."` (and optional
+  `--paths "..."`): once it registers, the lead posts that `handoff` on the
+  bus, which also signals the new pane. Without `--task`, `agent-spawn` only
+  onboards the agent and you delegate afterward with `agent-send`.
+- Stand up a whole squad at once with `agent-fleet name1=codex
+  name2=claude name3=opencode:<model> ...` — one worker per spec.
+- Provider launch commands and default models live in a registry
+  (`agent-providers list` / `agent-providers init` to customize); a config
+  file there survives `./install.sh`.
+- Worker provenance (provider, model, who spawned it, when) is recorded
+  under `.meta` in `agents.json` and shown by `agent-roster` in the VIA
+  column.
+- `agent-dismiss <name>` closes a worker's pane and removes it from the
+  registry (`--keep-pane` deregisters only). `agent-dismiss --done` sweeps
+  spawned workers whose threads are all closed; `agent-dismiss
+  --all-spawned` tears the whole spawned team down.
+- This makes the user's entry point trivial: they start you and say e.g.
+  "ask codex to bisect this" — you `agent-spawn` a codex worker, hand off
+  the task, review the `done`, and `agent-dismiss` it when finished.
+
+**Spawn call policy.** Who may *create* which agent is governed by a policy
+(managed with `agent-policy`), resolved from a built-in default deep-merged
+with a per-user file (`${XDG_CONFIG_HOME:-~/.config}/cmux-bus/policy.json`)
+and a per-repo file (`<git-root>/.cmux-bus/policy.json`, repo wins). Modes:
+
+- `open` (default) — anyone may spawn anyone.
+- `lead-only` — only the lead may `agent-spawn` / `agent-fleet`.
+- `matrix` — rules keyed by the caller's **provider** (or the special
+  `lead` role, or `default`) list the providers it may spawn, e.g.
+  `{"claude": ["codex","opencode"], "codex": []}`. Use `*` for "any".
+
+The caller's provider is its `.meta.provider` (set by `agent-spawn`, or
+self-declared with `agent-init --as <provider>`); the lead is identified by
+the `lead` role. `agent-spawn` and `agent-fleet` enforce this and refuse a
+forbidden creation. The policy gates **creation only** — delegation
+(`handoff`) between already-registered agents is not restricted.
 
 **If you are a worker** (any registered agent that is not the lead):
 

@@ -7,6 +7,10 @@ trap 'rm -rf "$tmp_root"' EXIT
 
 pass_count=0
 export AGENT_BUS_SCOPE=repo
+# Isolate the suite from any real user/repo spawn policy: point the override at a
+# path that never exists, so the resolved policy is the built-in "open". Policy
+# tests set AGENT_BUS_POLICY_FILE per-invocation to override this.
+export AGENT_BUS_POLICY_FILE="$tmp_root/.no-such-policy.json"
 
 fail() {
     echo "not ok - $1" >&2
@@ -149,6 +153,110 @@ if [ "$1" = "current-workspace" ]; then
     printf 'workspace:test\n'
     exit 0
 fi
+exit 0
+CMUX
+    chmod +x "$dir/cmux"
+}
+
+# Fake cmux for agent-spawn/agent-dismiss. new-split prints a parsable surface
+# ref; `send` simulates the child shell running agent-init by registering the
+# named agent into agents.json (so the readiness poll succeeds without a real
+# pane); close-surface, send and send-key are logged to CMUX_LOG.
+make_fake_cmux_spawn() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    cat <<'OUT'
+surface:1 s-lead type=terminal in_window=true
+surface:99 s-spawned type=terminal in_window=true
+OUT
+    exit 0
+fi
+case "$1" in
+    new-split)
+        [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+        echo "OK surface:99 workspace:test"
+        exit 0
+        ;;
+    new-surface)
+        [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+        echo "OK surface:99 pane:9 workspace:test"
+        exit 0
+        ;;
+    close-surface|rename-tab)
+        [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+        exit 0
+        ;;
+    send)
+        [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+        # The message is the last argument. If it is an agent-init bootstrap,
+        # mimic the child registering itself on the bus.
+        msg=""
+        for arg in "$@"; do msg="$arg"; done
+        case "$msg" in
+            agent-init*)
+                set -- $msg
+                shift
+                name=""
+                while [ $# -gt 0 ]; do
+                    case "$1" in
+                        --scope|--bus-dir) shift 2; continue;;
+                        --scope=*|--bus-dir=*) shift; continue;;
+                        "&&") break;;
+                        *) name="$1"; break;;
+                    esac
+                done
+                if [ -n "$name" ] && [ -f .agents/agents.json ]; then
+                    tmp=$(mktemp)
+                    jq --arg n "$name" '.agents[$n] = "s-spawned"' .agents/agents.json > "$tmp" && mv "$tmp" .agents/agents.json
+                fi
+                ;;
+        esac
+        exit 0
+        ;;
+    send-key)
+        [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+        exit 0
+        ;;
+    identify)
+        printf '{"caller":{"workspace_id":"%s","pane_ref":"pane:9"}}\n' "${FAKE_CALLER_WS:-}"
+        exit 0
+        ;;
+    current-workspace)
+        printf 'workspace:test\n'
+        exit 0
+        ;;
+esac
+exit 0
+CMUX
+    chmod +x "$dir/cmux"
+}
+
+# Like make_fake_cmux_spawn but surface-health lists only the lead (s-spawned is
+# gone), to exercise agent-init purging a dead worker and its .meta.
+make_fake_cmux_lead_only() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    cat <<'OUT'
+surface:1 s-lead type=terminal in_window=true
+OUT
+    exit 0
+fi
+case "$1" in
+    send|send-key|close-surface)
+        [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+        exit 0
+        ;;
+    identify)
+        printf '{"caller":{"workspace_id":"%s"}}\n' "${FAKE_CALLER_WS:-}"
+        exit 0
+        ;;
+esac
 exit 0
 CMUX
     chmod +x "$dir/cmux"
@@ -673,7 +781,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
+    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -1843,6 +1951,528 @@ test_agent_synthesize_json_and_unknown_id() {
     pass "agent-synthesize supports JSON output and rejects unknown ids"
 }
 
+test_agent_spawn_opens_split_and_registers() {
+    local fakebin workspace log
+    fakebin="$tmp_root/fakebin-spawn"
+    workspace="$(new_workspace spawn)"
+    log="$tmp_root/spawn.log"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex worker-codex >/dev/null
+        jq -e '.agents["worker-codex"] != null' .agents/agents.json >/dev/null
+        # The bootstrap line registered the worker before launching the CLI with
+        # the registry default model.
+        grep -q 'agent-init' "$log"
+        grep -q 'codex --model gpt-5.4' "$log"
+        # The tab was renamed "<model> - <provider>".
+        grep -q 'rename-tab.*gpt-5.4 - codex' "$log"
+        # An onboarding message was sent (default --say), mentioning the lead.
+        grep -q "lead is 'claude'" "$log"
+    )
+
+    pass "agent-spawn opens a tab, registers the worker, and launches the CLI"
+}
+
+test_agent_spawn_model_override_and_default() {
+    local fakebin workspace log
+    fakebin="$tmp_root/fakebin-spawn-model"
+    workspace="$(new_workspace spawn-model)"
+    log="$tmp_root/spawn-model.log"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" claude >/dev/null
+        # Explicit override.
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --model gpt-foo --no-say worker-a >/dev/null
+        grep -q 'codex --model gpt-foo' "$log"
+        # "default" sentinel launches the CLI bare (no --model flag).
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as opencode --model default --no-say worker-b >/dev/null
+        grep -qE 'opencode($| )' "$log"
+        ! grep -q 'opencode --model' "$log"
+        # No onboarding message was sent under --no-say.
+        ! grep -q 'agent-roster' "$log"
+        # opencode applies the model via OPENCODE_CONFIG_CONTENT (its TUI has no
+        # --model flag), not a CLI flag.
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as opencode --model opencode-go/qwen3.7-max --no-say worker-c >/dev/null
+        grep -q 'OPENCODE_CONFIG_CONTENT' "$log" || fail "opencode model not passed via config env"
+        grep -q 'qwen3.7-max' "$log" || fail "opencode model value missing"
+        ! grep -q 'opencode --model' "$log"
+    )
+
+    pass "agent-spawn honors --model override, the default sentinel, and --no-say"
+}
+
+test_agent_spawn_rejects_bad_input() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-spawn-bad"
+    workspace="$(new_workspace spawn-bad)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" claude >/dev/null
+        # Unknown provider.
+        ! PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as gemini worker-x >/dev/null 2>&1
+        # Missing --as.
+        ! PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" worker-x >/dev/null 2>&1
+        # Caller not registered on the bus.
+        ! PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-stranger \
+            "$repo_root/bin/agent-spawn" --as codex worker-x >/dev/null 2>&1
+    )
+
+    pass "agent-spawn rejects unknown providers, missing --as, and unregistered callers"
+}
+
+test_agent_spawn_refuses_live_name_collision() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-spawn-collision"
+    workspace="$(new_workspace spawn-collision)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" claude >/dev/null
+        # Pre-register a worker on the live surface s-spawned.
+        tmp=$(mktemp)
+        jq '.agents["worker-codex"] = "s-spawned"' .agents/agents.json > "$tmp" && mv "$tmp" .agents/agents.json
+        # Spawning the same name must refuse to clobber the live agent.
+        ! AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say worker-codex >/dev/null 2>&1
+    )
+
+    pass "agent-spawn refuses to clobber a live agent of the same name"
+}
+
+test_agent_dismiss_closes_and_deregisters() {
+    local fakebin workspace log
+    fakebin="$tmp_root/fakebin-dismiss"
+    workspace="$(new_workspace dismiss)"
+    log="$tmp_root/dismiss.log"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say worker-codex >/dev/null
+        jq -e '.agents["worker-codex"] != null' .agents/agents.json >/dev/null
+        CMUX_LOG="$log" PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-dismiss" worker-codex >/dev/null
+        jq -e '.agents["worker-codex"] == null' .agents/agents.json >/dev/null
+        grep -q 'close-surface' "$log"
+        # Unknown name is rejected.
+        ! PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-dismiss" ghost >/dev/null 2>&1
+    )
+
+    pass "agent-dismiss closes the pane, deregisters, and rejects unknown names"
+}
+
+test_agent_dismiss_protects_lead_and_self() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-dismiss-lead"
+    workspace="$(new_workspace dismiss-lead)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        # Dismissing the lead without --force is refused.
+        ! PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-dismiss" claude >/dev/null 2>&1
+        # With --force it succeeds and clears the lead pointer.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-dismiss" --force claude >/dev/null
+        jq -e '.lead == null' .agents/agents.json >/dev/null
+        jq -e '.agents["claude"] == null' .agents/agents.json >/dev/null
+    )
+
+    pass "agent-dismiss protects the lead and self unless --force"
+}
+
+test_agent_providers_list_init_get_and_override() {
+    local cfg out
+    cfg="$tmp_root/providers-cfg.json"
+    rm -f "$cfg"
+
+    # No config file -> built-in defaults.
+    out=$(AGENT_BUS_PROVIDERS_FILE="$cfg" "$repo_root/bin/agent-providers" get codex default_model)
+    [ "$out" = "gpt-5.4" ] || fail "providers default codex model wrong: $out"
+
+    # init writes the file; --force re-writes; without --force it refuses.
+    AGENT_BUS_PROVIDERS_FILE="$cfg" "$repo_root/bin/agent-providers" init >/dev/null
+    [ -f "$cfg" ] || fail "agent-providers init did not write $cfg"
+    ! AGENT_BUS_PROVIDERS_FILE="$cfg" "$repo_root/bin/agent-providers" init >/dev/null 2>&1 \
+        || fail "agent-providers init should refuse to overwrite without --force"
+
+    # Override codex's model and add a brand-new provider; merge must win per field.
+    jq '.providers.codex.default_model = "gpt-x"
+        | .providers.cursor = {launch:"cursor-agent", model_flag:"-m", default_model:"auto"}' \
+        "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+    out=$(AGENT_BUS_PROVIDERS_FILE="$cfg" "$repo_root/bin/agent-providers" get codex default_model)
+    [ "$out" = "gpt-x" ] || fail "providers override not applied: $out"
+    out=$(AGENT_BUS_PROVIDERS_FILE="$cfg" "$repo_root/bin/agent-providers" get cursor launch)
+    [ "$out" = "cursor-agent" ] || fail "providers new entry not visible: $out"
+    # Built-in providers survive the merge.
+    out=$(AGENT_BUS_PROVIDERS_FILE="$cfg" "$repo_root/bin/agent-providers" get claude default_model)
+    [ "$out" = "opus" ] || fail "providers merge dropped a built-in: $out"
+    # Unknown provider get fails.
+    ! AGENT_BUS_PROVIDERS_FILE="$cfg" "$repo_root/bin/agent-providers" get nope launch >/dev/null 2>&1 \
+        || fail "agent-providers get should fail on unknown provider"
+
+    pass "agent-providers lists, inits, gets, and merges config over built-ins"
+}
+
+test_agent_spawn_records_meta_and_roster_shows_via() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-meta"
+    workspace="$(new_workspace spawn-meta)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say worker-codex >/dev/null 2>&1
+        jq -e '.meta["worker-codex"].provider == "codex"' .agents/agents.json >/dev/null
+        jq -e '.meta["worker-codex"].model == "gpt-5.4"' .agents/agents.json >/dev/null
+        jq -e '.meta["worker-codex"].spawned_by == "claude"' .agents/agents.json >/dev/null
+        jq -e '(.meta["worker-codex"].spawned_at | type) == "string"' .agents/agents.json >/dev/null
+        # Roster surfaces the provenance in the VIA column.
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-roster")
+        printf '%s' "$out" | grep -q 'VIA' || fail "roster has no VIA column"
+        printf '%s' "$out" | grep -E 'worker-codex' | grep -q 'codex' || fail "roster VIA missing provider"
+    )
+
+    pass "agent-spawn records worker metadata and agent-roster shows provenance"
+}
+
+test_agent_spawn_task_seeds_handoff() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-task"
+    workspace="$(new_workspace spawn-task)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --task "Bisect the flaky test" \
+            --paths "tests/**" fixer >/dev/null 2>&1
+        # A handoff from the lead to the new worker was seeded on the bus.
+        jq -e 'select(.type=="handoff" and .to=="fixer" and .from=="claude" and (.body|test("Bisect")))' \
+            .agents/bus.jsonl >/dev/null || fail "no seeded handoff for --task"
+        jq -e 'select(.to=="fixer") | .paths_claimed | index("tests/**")' \
+            .agents/bus.jsonl >/dev/null || fail "seeded handoff missing paths_claimed"
+    )
+
+    pass "agent-spawn --task seeds a first handoff on the bus"
+}
+
+test_agent_dismiss_all_spawned_and_done() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-batch"
+    workspace="$(new_workspace dismiss-batch)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say w1 >/dev/null 2>&1
+        AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say w2 >/dev/null 2>&1
+        # Give w1 an open thread; w2 has none.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-send" w1 handoff "do the thing" >/dev/null
+
+        # --done dismisses only the idle worker (w2), keeps w1 (open thread) and the lead.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-dismiss" --done >/dev/null
+        jq -e '.agents | has("w1")' .agents/agents.json >/dev/null || fail "--done wrongly dropped w1"
+        jq -e '.agents | has("w2") | not' .agents/agents.json >/dev/null || fail "--done kept idle w2"
+        jq -e '.agents | has("claude")' .agents/agents.json >/dev/null || fail "--done dropped the lead"
+
+        # --all-spawned --force sweeps the rest of the team (w1) but not the lead.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-dismiss" --all-spawned --force >/dev/null
+        jq -e '.agents | has("w1") | not' .agents/agents.json >/dev/null || fail "--all-spawned kept w1"
+        jq -e '.agents | has("claude")' .agents/agents.json >/dev/null || fail "--all-spawned dropped the lead"
+        jq -e '(.meta // {}) | length == 0' .agents/agents.json >/dev/null || fail "meta not cleaned after sweep"
+    )
+
+    pass "agent-dismiss --done and --all-spawned manage the spawned team"
+}
+
+test_agent_init_prunes_orphan_meta() {
+    local fakebin deadbin workspace
+    fakebin="$tmp_root/fakebin-prune"
+    deadbin="$tmp_root/fakebin-prune-dead"
+    workspace="$(new_workspace prune-meta)"
+    make_fake_cmux_spawn "$fakebin"
+    make_fake_cmux_lead_only "$deadbin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say worker-codex >/dev/null 2>&1
+        jq -e '.meta["worker-codex"] != null' .agents/agents.json >/dev/null
+        # Re-init with the worker's surface gone: agent-init purges it from
+        # .agents and must drop its orphan .meta too.
+        PATH="$deadbin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" claude >/dev/null
+        jq -e '.agents | has("worker-codex") | not' .agents/agents.json >/dev/null || fail "dead worker not purged"
+        jq -e '.meta | has("worker-codex") | not' .agents/agents.json >/dev/null || fail "orphan meta not pruned"
+    )
+
+    pass "agent-init prunes .meta for purged workers"
+}
+
+test_agent_fleet_spawns_a_team() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-fleet"
+    workspace="$(new_workspace fleet)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-fleet" --no-say a=codex b=claude c=opencode:anthropic/claude-sonnet-4-6 \
+            >/dev/null 2>&1
+        jq -e '.agents | has("a") and has("b") and has("c")' .agents/agents.json >/dev/null \
+            || fail "fleet did not register all workers"
+        jq -e '.meta["a"].provider == "codex"' .agents/agents.json >/dev/null || fail "fleet meta a wrong"
+        jq -e '.meta["b"].provider == "claude"' .agents/agents.json >/dev/null || fail "fleet meta b wrong"
+        jq -e '.meta["c"].model == "anthropic/claude-sonnet-4-6"' .agents/agents.json >/dev/null \
+            || fail "fleet did not pass the per-entry model"
+        # Bad spec is rejected before spawning anything.
+        ! PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-fleet" --no-say "broken-spec" >/dev/null 2>&1 \
+            || fail "fleet accepted a malformed spec"
+    )
+
+    pass "agent-fleet spawns a multi-provider team from specs"
+}
+
+test_agent_lead_strict_default_and_toggle() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-strict"
+    workspace="$(new_workspace lead-strict)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" --lead claude >/dev/null
+        # A freshly set lead is STRICT by default (no lead_policy stored).
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" show)
+        printf '%s' "$out" | grep -q "lead is 'claude' (you)" || fail "show lost the lead marker: $out"
+        printf '%s' "$out" | grep -q "STRICT" || fail "lead not strict by default: $out"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" --json \
+            | jq -e '.policy == "strict"' >/dev/null || fail "json policy not strict"
+
+        # Toggle relaxed, then back to strict.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" relaxed >/dev/null
+        jq -e '.lead_policy == "relaxed"' .agents/agents.json >/dev/null || fail "relaxed not stored"
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" show)
+        printf '%s' "$out" | grep -q "relaxed" || fail "show did not report relaxed: $out"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" strict >/dev/null
+        jq -e '(.lead_policy // "strict") == "strict"' .agents/agents.json >/dev/null || fail "strict not restored"
+
+        # set --relaxed in one go.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" set claude --relaxed >/dev/null
+        jq -e '.lead_policy == "relaxed"' .agents/agents.json >/dev/null || fail "set --relaxed did not store relaxed"
+        # clear drops both lead and policy.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" clear >/dev/null
+        jq -e '(.lead // null) == null and (.lead_policy // null) == null' .agents/agents.json >/dev/null \
+            || fail "clear left lead or policy behind"
+    )
+
+    pass "agent-lead defaults the lead to strict and toggles strict/relaxed"
+}
+
+test_agent_init_as_records_provider() {
+    local fakebin workspace
+    fakebin="$tmp_root/fakebin-as"
+    workspace="$(new_workspace init-as)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" --as codex codex >/dev/null
+        jq -e '.meta["codex"].provider == "codex"' .agents/agents.json >/dev/null || fail "--as did not record provider"
+        jq -e '.meta["codex"].self == true' .agents/agents.json >/dev/null || fail "--as did not mark self"
+    )
+
+    pass "agent-init --as records the agent's provider for the policy"
+}
+
+test_agent_policy_show_init_and_check() {
+    local cfg home out
+    cfg="$tmp_root/policy-check.json"
+    home="$tmp_root/home-policy"
+    mkdir -p "$home"
+
+    # matrix: lead -> *, claude -> codex only.
+    printf '%s' '{"spawn":{"mode":"matrix","rules":{"lead":["*"],"claude":["codex"],"default":[]}}}' > "$cfg"
+    AGENT_BUS_POLICY_FILE="$cfg" "$repo_root/bin/agent-policy" check claude codex >/dev/null \
+        || fail "matrix should allow claude->codex"
+    ! AGENT_BUS_POLICY_FILE="$cfg" "$repo_root/bin/agent-policy" check claude opencode >/dev/null 2>&1 \
+        || fail "matrix should deny claude->opencode"
+    AGENT_BUS_POLICY_FILE="$cfg" "$repo_root/bin/agent-policy" check lead opencode >/dev/null \
+        || fail "matrix should allow lead->*"
+    ! AGENT_BUS_POLICY_FILE="$cfg" "$repo_root/bin/agent-policy" check default codex >/dev/null 2>&1 \
+        || fail "matrix default should deny"
+
+    # lead-only: only the lead key passes.
+    printf '%s' '{"spawn":{"mode":"lead-only"}}' > "$cfg"
+    AGENT_BUS_POLICY_FILE="$cfg" "$repo_root/bin/agent-policy" check lead codex >/dev/null \
+        || fail "lead-only should allow the lead"
+    ! AGENT_BUS_POLICY_FILE="$cfg" "$repo_root/bin/agent-policy" check codex claude >/dev/null 2>&1 \
+        || fail "lead-only should deny a non-lead"
+
+    # open (no file) allows anything; show reports the resolved mode.
+    out=$(AGENT_BUS_POLICY_FILE="$tmp_root/none.json" "$repo_root/bin/agent-policy" show)
+    printf '%s' "$out" | grep -q 'mode = open' || fail "show did not resolve to open: $out"
+
+    # init --user writes a starter and refuses to clobber without --force.
+    HOME="$home" AGENT_BUS_POLICY_FILE= "$repo_root/bin/agent-policy" init --user >/dev/null
+    [ -f "$home/.config/cmux-bus/policy.json" ] || fail "init --user did not write the file"
+    ! HOME="$home" AGENT_BUS_POLICY_FILE= "$repo_root/bin/agent-policy" init --user >/dev/null 2>&1 \
+        || fail "init should refuse to overwrite without --force"
+
+    pass "agent-policy shows, inits, and checks spawn rules"
+}
+
+test_agent_spawn_enforces_policy() {
+    local fakebin workspace cfg
+    fakebin="$tmp_root/fakebin-spawn-policy"
+    workspace="$(new_workspace spawn-policy)"
+    cfg="$tmp_root/spawn-policy.json"
+    make_fake_cmux_spawn "$fakebin"
+    # The lead may spawn codex but nothing else.
+    printf '%s' '{"spawn":{"mode":"matrix","rules":{"lead":["codex"]}}}' > "$cfg"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        # Allowed provider spawns fine.
+        AGENT_BUS_POLICY_FILE="$cfg" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say ok-worker >/dev/null 2>&1 \
+            || fail "policy wrongly blocked an allowed provider"
+        jq -e '.agents | has("ok-worker")' .agents/agents.json >/dev/null || fail "allowed worker not registered"
+        # Forbidden provider is refused before any pane opens.
+        ! AGENT_BUS_POLICY_FILE="$cfg" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as opencode --no-say bad-worker >/dev/null 2>&1 \
+            || fail "policy did not block a forbidden provider"
+        jq -e '.agents | has("bad-worker") | not' .agents/agents.json >/dev/null \
+            || fail "forbidden worker leaked into the registry"
+    )
+
+    pass "agent-spawn enforces the spawn call policy"
+}
+
+test_agent_fleet_pre_checks_policy() {
+    local fakebin workspace cfg
+    fakebin="$tmp_root/fakebin-fleet-policy"
+    workspace="$(new_workspace fleet-policy)"
+    cfg="$tmp_root/fleet-policy.json"
+    make_fake_cmux_spawn "$fakebin"
+    printf '%s' '{"spawn":{"mode":"matrix","rules":{"lead":["codex"]}}}' > "$cfg"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+        # One member (opencode) is forbidden -> the whole fleet aborts, spawning nobody.
+        ! AGENT_BUS_POLICY_FILE="$cfg" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-fleet" --no-say a=codex b=opencode >/dev/null 2>&1 \
+            || fail "fleet did not abort on a forbidden member"
+        jq -e '.agents | (has("a") or has("b")) | not' .agents/agents.json >/dev/null \
+            || fail "fleet spawned despite a policy violation"
+    )
+
+    pass "agent-fleet pre-checks the policy before spawning anyone"
+}
+
+test_agent_lead_guard_enforces_strict_lead() {
+    local fakebin workspace G
+    fakebin="$tmp_root/fakebin-guard"
+    workspace="$(new_workspace lead-guard)"
+    make_fake_cmux "$fakebin"
+    G="$repo_root/bin/agent-lead-guard"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-init" --lead claude >/dev/null
+
+        decide() { printf '%s' "$2" | env PATH="$fakebin:$PATH" AGENT_BUS_SCOPE=repo CMUX_SURFACE_ID="$1" bash "$G" 2>/dev/null; }
+
+        decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{}}' \
+            | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null || fail "Edit should ask"
+        decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Task","tool_input":{}}' \
+            | jq -e '.hookSpecificOutput.permissionDecision == "deny"' >/dev/null || fail "native sub-agent should deny"
+        [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"agent-send codex handoff x"}}')" ] \
+            || fail "a bus command must be allowed"
+        [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"git status && agent-roster"}}')" ] \
+            || fail "read-only coordination must be allowed"
+        decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"npm run build"}}' \
+            | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null || fail "execution Bash should ask"
+        [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{}}')" ] \
+            || fail "Read must be allowed (reading is fine for the lead)"
+        decide s1 '{"hook_event_name":"SessionStart","source":"startup"}' \
+            | jq -e '.hookSpecificOutput.additionalContext | test("STRICT")' >/dev/null || fail "SessionStart should inject the reminder"
+
+        # A non-lead surface and a relaxed lead must be left completely untouched.
+        [ -z "$(decide s2 '{"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{}}')" ] \
+            || fail "a non-lead surface must not be gated"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-lead" relaxed >/dev/null
+        [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Edit","tool_input":{}}')" ] \
+            || fail "a relaxed lead must not be gated"
+    )
+
+    pass "agent-lead-guard gates the strict lead (deny sub-agents, ask edits/exec) and stays invisible otherwise"
+}
+
+test_agent_lead_guard_install_merges_settings() {
+    local workspace G
+    workspace="$(new_workspace guard-install)"
+    G="$repo_root/bin/agent-lead-guard"
+
+    (
+        cd "$workspace"
+        mkdir -p .claude
+        echo '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"/x/security.js"}]}]}}' > .claude/settings.json
+
+        "$G" install --project >/dev/null
+        jq -e '[.hooks | to_entries[] | select(.value|tostring|contains("agent-lead-guard")) | .key] | sort == ["PreToolUse","SessionStart","UserPromptSubmit"]' \
+            .claude/settings.json >/dev/null || fail "guard not wired into all three events"
+        jq -e '[.hooks.PreToolUse[].hooks[].command] | any(contains("security.js"))' \
+            .claude/settings.json >/dev/null || fail "existing hook was clobbered"
+
+        "$G" install --project >/dev/null   # idempotent
+        jq -e '[.hooks.PreToolUse[].hooks[].command | select(contains("agent-lead-guard"))] | length == 1' \
+            .claude/settings.json >/dev/null || fail "re-install duplicated the guard"
+
+        "$G" uninstall --project >/dev/null
+        jq -e '[.hooks | to_entries[] | .value[]?.hooks[]?.command | select(contains("agent-lead-guard"))] | length == 0' \
+            .claude/settings.json >/dev/null || fail "uninstall left guard entries behind"
+        jq -e '[.hooks.PreToolUse[].hooks[].command] | any(contains("security.js"))' \
+            .claude/settings.json >/dev/null || fail "uninstall removed the unrelated hook"
+    )
+
+    pass "agent-lead-guard install merges into settings.json idempotently and uninstall is clean"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_defaults_to_workspace_scope
@@ -1860,6 +2490,25 @@ test_agent_lead_set_show_clear
 test_agent_init_lead_flag_and_maintenance
 test_agent_init_clears_purged_lead
 test_agent_roster_shows_lead
+test_agent_spawn_opens_split_and_registers
+test_agent_spawn_model_override_and_default
+test_agent_spawn_rejects_bad_input
+test_agent_spawn_refuses_live_name_collision
+test_agent_dismiss_closes_and_deregisters
+test_agent_dismiss_protects_lead_and_self
+test_agent_providers_list_init_get_and_override
+test_agent_spawn_records_meta_and_roster_shows_via
+test_agent_spawn_task_seeds_handoff
+test_agent_dismiss_all_spawned_and_done
+test_agent_init_prunes_orphan_meta
+test_agent_fleet_spawns_a_team
+test_agent_lead_strict_default_and_toggle
+test_agent_init_as_records_provider
+test_agent_policy_show_init_and_check
+test_agent_spawn_enforces_policy
+test_agent_fleet_pre_checks_policy
+test_agent_lead_guard_enforces_strict_lead
+test_agent_lead_guard_install_merges_settings
 test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal

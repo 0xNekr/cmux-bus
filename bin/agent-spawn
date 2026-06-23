@@ -1,0 +1,343 @@
+#!/usr/bin/env bash
+# agent-spawn [--scope repo|workspace] [--bus-dir DIR] \
+#   --as <PROVIDER> [--model M] [--dir left|right|up|down] [--focus] \
+#   [--task TEXT [--paths "p1,p2"]] [--say TEXT | --no-say] \
+#   [--ready-timeout N] <name>
+#
+# Let a lead (or any registered agent) assemble its own team: open a fresh cmux
+# split next to the caller, register a new agent on the SAME bus, launch the
+# requested provider CLI in it, and (optionally) hand it its first task.
+#
+# The new pane self-registers deterministically: we send `agent-init <name>`
+# into its shell *before* launching the CLI, so the bus entry exists regardless
+# of how the model behaves. The pane inherits the caller's CMUX_WORKSPACE_ID, so
+# in workspace scope it resolves to the very same bus with no path plumbing.
+#
+# Providers/models come from the registry (see agent-providers). Worker metadata
+# (provider, model, who spawned it, when) is recorded under `.meta` in
+# agents.json for agent-roster and agent-dismiss.
+
+set -euo pipefail
+
+AGENT_CMD="agent-spawn"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-spawn [--scope repo|workspace] [--bus-dir DIR] \\
+         --as <PROVIDER> [--model M] [--dir left|right|up|down] [--focus] \\
+         [--task TEXT [--paths "p1,p2"]] [--say TEXT | --no-say] \\
+         [--ready-timeout N] <name>
+
+  Open a new cmux split next to you, register <name> on this bus, and launch the
+  requested agent CLI in it. The lead uses this to build and grow its own team.
+
+  --as PROVIDER     which agent CLI to launch (see 'agent-providers list') [required]
+  --model M         model override; "default" uses the CLI's own default
+  --split [--dir D] open as a side-by-side pane split instead of a background tab
+  --dir DIR         split direction (left|right|up|down) [default: right; implies --split]
+  --title TEXT      tab title (default: "<model> - <provider>")
+  --no-rename       leave the tab title untouched
+  --focus           focus the new pane (default: keep focus on the caller)
+  --task TEXT       hand <name> a first task as a handoff once it registers
+  --paths "a,b"     paths_claimed for --task (passed through to agent-send)
+  --say TEXT        custom onboarding message (default: a generic orientation)
+  --no-say          do not send any onboarding message (spawn bare)
+  --ready-timeout N seconds to wait for registration / pane readiness [default: 25]
+
+  Models default per provider via the registry; override the registry with a
+  config file (see 'agent-providers init').
+EOF
+    agent_bus_common_usage >&2
+    exit 2
+}
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
+provider=""
+model=""
+dir="right"
+split_mode=0
+focus="false"
+task=""
+task_set=0
+paths=""
+say=""
+say_set=0
+no_say=0
+tab_title=""
+title_set=0
+no_rename=0
+ready_timeout=25
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --as)            [ $# -ge 2 ] || usage; provider="$2"; shift;;
+        --as=*)          provider="${1#--as=}";;
+        --model)         [ $# -ge 2 ] || usage; model="$2"; shift;;
+        --model=*)       model="${1#--model=}";;
+        --split)         split_mode=1;;
+        --dir)           [ $# -ge 2 ] || usage; dir="$2"; split_mode=1; shift;;
+        --dir=*)         dir="${1#--dir=}"; split_mode=1;;
+        --title)         [ $# -ge 2 ] || usage; tab_title="$2"; title_set=1; shift;;
+        --title=*)       tab_title="${1#--title=}"; title_set=1;;
+        --no-rename)     no_rename=1;;
+        --focus)         focus="true";;
+        --task)          [ $# -ge 2 ] || usage; task="$2"; task_set=1; shift;;
+        --task=*)        task="${1#--task=}"; task_set=1;;
+        --paths)         [ $# -ge 2 ] || usage; paths="$2"; shift;;
+        --paths=*)       paths="${1#--paths=}";;
+        --say)           [ $# -ge 2 ] || usage; say="$2"; say_set=1; shift;;
+        --say=*)         say="${1#--say=}"; say_set=1;;
+        --no-say)        no_say=1;;
+        --ready-timeout) [ $# -ge 2 ] || usage; ready_timeout="$2"; shift;;
+        --ready-timeout=*) ready_timeout="${1#--ready-timeout=}";;
+        -*)              echo "agent-spawn: unknown option '$1'" >&2; usage;;
+        *)               args+=("$1");;
+    esac
+    shift
+done
+
+[ "${#args[@]}" -eq 1 ] || usage
+name="${args[0]}"
+
+[[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || {
+    echo "agent-spawn: name must be lowercase, start with a letter, [a-z0-9_-], 1..32 chars" >&2
+    exit 1
+}
+[ -n "$provider" ] || { echo "agent-spawn: --as <provider> is required" >&2; usage; }
+agent_provider_known "$provider" || {
+    echo "agent-spawn: unknown provider '$provider' — known providers:" >&2
+    agent_provider_names | sed 's/^/  /' >&2
+    echo "agent-spawn: add one with 'agent-providers init' then edit the config" >&2
+    exit 1
+}
+case "$dir" in
+    left|right|up|down) ;;
+    *) echo "agent-spawn: --dir must be left|right|up|down" >&2; exit 1;;
+esac
+case "$ready_timeout" in
+    ''|*[!0-9]*) echo "agent-spawn: --ready-timeout must be a whole number of seconds" >&2; exit 1;;
+esac
+[ -n "$paths" ] && [ "$task_set" -eq 0 ] && {
+    echo "agent-spawn: --paths only applies together with --task" >&2; exit 1
+}
+
+# Resolve the model: explicit override, the "default" sentinel (CLI's own
+# default), or the registry default for this provider.
+case "$model" in
+    default|-) model="";;
+    "")        model="$(agent_provider_field "$provider" default_model)";;
+esac
+
+my_surface="${CMUX_SURFACE_ID:-}"
+[ -n "$my_surface" ] || {
+    echo "agent-spawn: CMUX_SURFACE_ID is not set — run inside a cmux pane" >&2
+    exit 1
+}
+
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+
+me="$(agent_bus_current_agent)"
+[ -n "$me" ] || {
+    echo "agent-spawn: you are not registered on this bus — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+lead="$(agent_bus_lead)"
+
+# Enforce the spawn call policy: who is allowed to create which provider. This
+# is the single enforcement point — agent-fleet routes through here too.
+decision="$(agent_spawn_decision "$me" "$provider")"
+if [ "$decision" != "allow" ]; then
+    echo "agent-spawn: refused — ${decision#deny: }" >&2
+    echo "agent-spawn: adjust the policy with 'agent-policy' (user or repo)" >&2
+    exit 1
+fi
+
+# Refuse to clobber a *live* agent that already owns this name. agent-init in the
+# child would otherwise reassign the name to the new surface, orphaning the
+# existing one. A stale entry (dead surface) is fine — it will be cleaned up.
+if jq -e --arg n "$name" '.agents | has($n)' "$AGENT_BUS_AGENTS_FILE" >/dev/null; then
+    existing_surface="$(jq -r --arg n "$name" '.agents[$n]' "$AGENT_BUS_AGENTS_FILE")"
+    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
+    if printf '%s\n' "$live" | grep -qxF "$existing_surface"; then
+        echo "agent-spawn: '$name' is already a live agent on this bus (surface $existing_surface)" >&2
+        echo "agent-spawn: pick another name, or 'agent-dismiss $name' first" >&2
+        exit 1
+    fi
+fi
+
+# Build the launch command from the registry, honoring the provider's model
+# style: a CLI flag (claude/codex) or opencode's inline config env var.
+launch="$(agent_provider_field "$provider" launch)"
+model_flag="$(agent_provider_field "$provider" model_flag)"
+model_style="$(agent_provider_field "$provider" model_style)"
+[ -n "$model_style" ] || model_style="flag"
+[ -n "$launch" ] || { echo "agent-spawn: provider '$provider' has no launch command" >&2; exit 1; }
+base_cmd="${launch%% *}"
+command -v "$base_cmd" >/dev/null 2>&1 || {
+    echo "agent-spawn: warning: '$base_cmd' not found on PATH here; the new pane may share this PATH and fail to launch" >&2
+}
+if [ -z "$model" ]; then
+    launch_cmd="$launch"
+elif [ "$model_style" = "opencode" ]; then
+    # The opencode TUI ignores --model; inject the model via inline config which
+    # merges at local precedence. (OPENCODE_CONFIG_CONTENT, per opencode docs.)
+    model_json="$(jq -nc --arg m "$model" '{model:$m}')"
+    launch_cmd="OPENCODE_CONFIG_CONTENT=$(printf '%q' "$model_json") $launch"
+else
+    launch_cmd="$launch ${model_flag:+$model_flag }$(printf '%q' "$model")"
+fi
+
+# Bus scope flags to forward — to the child's agent-init (so it lands on THIS
+# bus) and to our own agent-send for --task. Workspace scope needs nothing (same
+# CMUX_WORKSPACE_ID resolves the same bus); repo/explicit dirs must pass through.
+bus_args=()
+child_scope_args=""
+if [ -n "$AGENT_BUS_CLI_DIR" ] || [ -n "${AGENT_BUS_DIR:-}" ]; then
+    bus_args=(--bus-dir "$AGENT_BUS_DIR_EFFECTIVE")
+    child_scope_args="--bus-dir $(printf '%q' "$AGENT_BUS_DIR_EFFECTIVE")"
+elif [ "$AGENT_BUS_SCOPE_EFFECTIVE" = "repo" ]; then
+    bus_args=(--scope repo)
+    child_scope_args="--scope repo"
+fi
+
+# Create the worker's surface. Default: a new TAB in the caller's pane — it sits
+# in the background (unfocused) and is one click away, instead of carving up the
+# layout. With --split, fall back to a side-by-side pane split. Both print a line
+# like "OK surface:20 ... " from which we grab the surface ref.
+if [ "$split_mode" -eq 1 ]; then
+    surf_out="$(cmux new-split "$dir" --surface "$my_surface" --focus "$focus" 2>&1)" || {
+        echo "agent-spawn: cmux new-split failed: $surf_out" >&2
+        exit 1
+    }
+    placement="$dir split"
+else
+    caller_pane="$(cmux identify --id-format both 2>/dev/null | jq -r '.caller.pane_ref // .caller.pane_id // empty' 2>/dev/null || true)"
+    pane_args=()
+    [ -n "$caller_pane" ] && pane_args=(--pane "$caller_pane")
+    surf_out="$(cmux new-surface --type terminal ${pane_args[@]+"${pane_args[@]}"} --focus "$focus" 2>&1)" || {
+        echo "agent-spawn: cmux new-surface failed: $surf_out" >&2
+        exit 1
+    }
+    placement="tab"
+fi
+new_surface="$(printf '%s\n' "$surf_out" | grep -oE 'surface:[0-9]+' | head -n1)"
+[ -n "$new_surface" ] || {
+    echo "agent-spawn: could not parse new surface from: $surf_out" >&2
+    exit 1
+}
+
+# Label the new agent's tab "<model> - <provider>" (override with --title, skip
+# with --no-rename). Best-effort: a rename failure must not abort the spawn.
+if [ "$no_rename" -eq 0 ]; then
+    [ "$title_set" -eq 1 ] || tab_title="${model:-default} - $provider"
+    cmux rename-tab --surface "$new_surface" "$tab_title" >/dev/null 2>&1 \
+        || echo "agent-spawn: warning: could not rename the tab" >&2
+fi
+
+# Bootstrap line: register first (deterministic), then launch the CLI only if
+# registration succeeded. Sent as one shell line, executed by the trailing Enter.
+boot_line="agent-init ${child_scope_args:+$child_scope_args }$(printf '%q' "$name") && $launch_cmd"
+cmux send --surface "$new_surface" "$boot_line" >/dev/null
+cmux send-key --surface "$new_surface" Enter >/dev/null
+
+echo "agent-spawn: opened $new_surface ($placement), launching '$name' as $provider${model:+ (model $model)}"
+
+# Wait until the child's agent-init has written its registration.
+registered=0
+waited=0
+while [ "$waited" -lt "$ready_timeout" ]; do
+    if jq -e --arg n "$name" '.agents[$n] != null' "$AGENT_BUS_AGENTS_FILE" >/dev/null 2>&1; then
+        registered=1
+        break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+done
+
+if [ "$registered" -eq 0 ]; then
+    echo "agent-spawn: warning: '$name' did not register within ${ready_timeout}s — check the pane" >&2
+    exit 1
+fi
+echo "agent-spawn: '$name' registered on bus $AGENT_BUS_DIR_EFFECTIVE"
+
+# Record worker metadata (additive; never touches .agents). Lets agent-roster
+# show provenance and agent-dismiss act on the team the lead built.
+spawned_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+meta_model="${model:-default}"
+tmp=$(mktemp)
+jq --arg n "$name" --arg p "$provider" --arg m "$meta_model" --arg by "$me" --arg at "$spawned_at" \
+    '.meta = ((.meta // {}) + {($n): {provider:$p, model:$m, spawned_by:$by, spawned_at:$at}})' \
+    "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+
+# Wait for the CLI's TUI to finish drawing before we type into it: poll the
+# rendered screen until it is non-empty and stable across two reads. Set
+# AGENT_SPAWN_SETTLE=0 to skip (fast path for tests / scripted spawns).
+settle="${AGENT_SPAWN_SETTLE:-1}"
+pane_ready=0
+if [ "$settle" = "0" ]; then
+    pane_ready=1
+else
+    prev=""
+    stable=0
+    i=0
+    while [ "$i" -lt "$ready_timeout" ]; do
+        cur="$(cmux read-screen --surface "$new_surface" --lines 25 2>/dev/null || true)"
+        if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then
+            stable=$((stable + 1))
+            [ "$stable" -ge 2 ] && { pane_ready=1; break; }
+        else
+            stable=0
+        fi
+        prev="$cur"
+        sleep "$settle"
+        i=$((i + 1))
+    done
+    [ "$pane_ready" -eq 1 ] || echo "agent-spawn: warning: '$name' pane did not settle within ${ready_timeout}s — sending anyway" >&2
+fi
+
+# Hand off the first task on the bus (agent-send signals the now-ready pane), or
+# send a generic orientation nudge. Either way the agent ends up reading its
+# inbox; with --task it finds real work waiting there.
+if [ "$task_set" -eq 1 ]; then
+    send_paths_args=()
+    [ -n "$paths" ] && send_paths_args=(--paths "$paths")
+    # agent-send takes <to> <type> first, then flags, then the body. Guard the
+    # array expansions for bash 3.2 (empty "${a[@]}" is an error under set -u).
+    if "$AGENT_BIN_DIR/agent-send" ${bus_args[@]+"${bus_args[@]}"} "$name" handoff \
+        ${send_paths_args[@]+"${send_paths_args[@]}"} "$task" >/dev/null; then
+        echo "agent-spawn: handed '$name' its first task"
+    else
+        echo "agent-spawn: warning: failed to hand off the task to '$name' — send it manually with agent-send" >&2
+    fi
+elif [ "$no_say" -eq 0 ]; then
+    if [ "$say_set" -eq 0 ]; then
+        say="You are '$name' on the cmux multi-agent bus."
+        [ -n "$lead" ] && say="$say The lead is '$lead'."
+        say="$say Run 'agent-roster' then 'agent-inbox' to see who is here and any work addressed to you, then wait for handoffs."
+    fi
+    cmux send --surface "$new_surface" "$say" >/dev/null
+    cmux send-key --surface "$new_surface" Enter >/dev/null
+    echo "agent-spawn: onboarded '$name'"
+fi
+
+if [ -n "$lead" ] && [ "$lead" != "$me" ]; then
+    echo "agent-spawn: note — bus lead is '$lead', not you ('$me')" >&2
+fi

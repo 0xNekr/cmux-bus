@@ -4,9 +4,21 @@
 
 set -euo pipefail
 
+want_guard=0
+for arg in "$@"; do
+    case "$arg" in
+        --guard) want_guard=1;;
+        -h|--help)
+            echo "usage: ./install.sh [--guard]"
+            echo "  --guard   also enable the strict-lead enforcement hook (agent-lead-guard install)"
+            exit 0
+            ;;
+    esac
+done
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src_bin="$repo_root/bin"
-tools=(agent-init agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update)
+tools=(agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update)
 
 missing=()
 command -v jq >/dev/null 2>&1 || missing+=("jq")
@@ -96,12 +108,40 @@ The bus may declare one lead agent (`agent-init <name> --lead`, or
 `agent-lead set <name>`). The intent is cost-tiering: the strongest model
 plans and reviews, cheaper peers execute.
 
-- **If you are the lead**: analyze and decompose work, delegate via
-  `handoff` with explicit acceptance criteria and `paths_claimed`, review
-  every `done` against those criteria, and request rework with a new
-  `handoff --ref` on the same thread. Do not execute delegated work
-  yourself; reading is fine, reserve your edits for what cannot be
-  delegated. Never give two workers overlapping path claims.
+- **If you are the lead**: by default you are in **STRICT** mode — you plan,
+  decompose, and delegate, and you do **NOT** edit, run, or execute anything
+  yourself. The only exception is an explicit user instruction to do it
+  yourself. Delegate every task via `handoff` with explicit acceptance
+  criteria and `paths_claimed`; review every `done` against those criteria;
+  request rework with a new `handoff --ref` on the same thread. Reading is
+  always fine. Never give two workers overlapping path claims. Check your
+  policy with `agent-roster` / `agent-lead` — a `relaxed` lead (set via
+  `agent-lead relaxed`) may execute work directly when it judges fit.
+- **Who may spawn whom** is governed by the spawn call policy
+  (`agent-policy`). If `agent-spawn`/`agent-fleet` refuses, the policy
+  forbids that caller from creating that provider — surface it to the user
+  rather than working around it.
+- **Strict enforcement** may be active via a Claude Code hook
+  (`agent-lead-guard`): if a tool call to edit/run/spawn is denied or
+  prompts for approval, that is the strict-lead policy — delegate via the
+  bus instead of retrying, unless the user explicitly approves.
+- **Building your own team**: you can recruit workers yourself, without the
+  user opening panes. `agent-spawn <name> --as <claude|codex|opencode>
+  [--model M] [--task "..." --paths "..."]` opens the worker as a background
+  tab in your pane (unfocused; `--split` for a pane instead), registers
+  `<name>` on this same bus, launches that provider's CLI, and
+  (with `--task`) hands it a first `handoff`. Pick the provider/model that
+  fits the task (codex for CLI diagnostics, claude for design). Without
+  `--task`, delegate afterward with `agent-send`. Spin up a whole squad at
+  once with `agent-fleet name1=codex name2=claude ...`. Provider launch
+  commands and default models come from the registry — inspect or customize
+  them with `agent-providers list` / `agent-providers init`.
+- **Tearing it down**: `agent-dismiss <name>` closes a worker's pane and
+  deregisters it; `agent-dismiss --done` sweeps workers whose threads are all
+  closed; `agent-dismiss --all-spawned` removes the whole spawned team.
+  `agent-roster` shows each worker's provider/model under VIA. So the user
+  need only start you and say e.g. "ask codex to ..." — you spawn the codex
+  worker, delegate, review, and dismiss it when finished.
 - **If you are a worker**: process the lead's handoffs first (`ack` →
   execute → `done` with verifiable evidence: commands run, test output,
   commit ids). `ask` the lead before self-assigning new non-trivial work
@@ -121,8 +161,19 @@ RULE
     echo "installed Claude rule: $rule_dst"
 fi
 
+if [ "$want_guard" -eq 1 ]; then
+    echo ""
+    "$src_bin/agent-lead-guard" install || echo "warning: agent-lead-guard install failed" >&2
+fi
+
 echo ""
 echo "next steps:"
 echo "  1. open two cmux panes in a workspace"
 echo "  2. in each pane: agent-init <name>   (e.g. claude / codex)"
 echo "  3. agent-send <peer> handoff \"...\""
+if [ "$want_guard" -eq 0 ]; then
+    echo ""
+    echo "optional: enforce the STRICT lead with Claude Code hooks (opt-in):"
+    echo "  ./install.sh --guard            # or: agent-lead-guard install"
+    echo "  agent-lead-guard uninstall      # remove it"
+fi

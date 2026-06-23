@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# agent-dismiss [--scope repo|workspace] [--bus-dir DIR] [--keep-pane] [--force] \
+#   (<name> | --all-spawned | --done)
+#
+# Tear down agents the lead spawned: close their cmux panes and remove them from
+# the bus registry (and their `.meta`). The inverse of agent-spawn.
+#
+#   agent-dismiss <name>      dismiss one agent
+#   agent-dismiss --all-spawned  dismiss every lead-spawned worker (has .meta)
+#   agent-dismiss --done         dismiss spawned workers with no open inbound thread
+
+set -euo pipefail
+
+AGENT_CMD="agent-dismiss"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-dismiss [--scope repo|workspace] [--bus-dir DIR] [--keep-pane] [--force] \\
+         (<name> | --all-spawned | --done)
+  <name>          close <name>'s pane and remove it from the registry
+  --all-spawned   dismiss every lead-spawned worker (those carrying .meta)
+  --done          dismiss spawned workers that have no open thread addressed to them
+  --keep-pane     deregister only; leave the pane open
+  --force         allow dismissing yourself or the lead (single mode)
+EOF
+    agent_bus_common_usage >&2
+    exit 2
+}
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
+keep_pane=0
+force=0
+mode="single"
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --keep-pane)   keep_pane=1;;
+        --force)       force=1;;
+        --all-spawned) mode="all-spawned";;
+        --done)        mode="done";;
+        -*)            echo "agent-dismiss: unknown option '$1'" >&2; usage;;
+        *)             args+=("$1");;
+    esac
+    shift
+done
+
+if [ "$mode" = "single" ]; then
+    [ "${#args[@]}" -eq 1 ] || usage
+else
+    [ "${#args[@]}" -eq 0 ] || usage
+fi
+
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+
+me="$(agent_bus_current_agent)"
+lead="$(agent_bus_lead)"
+
+# Close a pane (best-effort) and remove the name from both .agents and .meta,
+# clearing the lead pointer if we just dismissed the lead.
+dismiss_one() {
+    local name="$1"
+    local surface closed_note tmp
+    surface="$(jq -r --arg n "$name" '.agents[$n]' "$AGENT_BUS_AGENTS_FILE")"
+
+    if [ "$keep_pane" -eq 0 ]; then
+        if cmux close-surface --surface "$surface" >/dev/null 2>&1; then
+            closed_note="closed pane $surface"
+        else
+            closed_note="pane $surface already gone — deregistering anyway"
+        fi
+    else
+        closed_note="left pane $surface open"
+    fi
+
+    tmp=$(mktemp)
+    jq --arg n "$name" '
+        .agents |= (with_entries(select(.key != $n)))
+        | (if (.meta) then .meta |= (with_entries(select(.key != $n))) else . end)
+        | (if (.lead == $n) then del(.lead) else . end)
+    ' "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+
+    echo "agent-dismiss: dismissed '$name' — $closed_note"
+    if [ "$name" = "$lead" ]; then
+        echo "agent-dismiss: cleared lead pointer (was '$name') — peer-to-peer mode"
+    fi
+}
+
+# ---- batch modes ----
+if [ "$mode" != "single" ]; then
+    spawned="$(jq -r '(.meta // {}) | keys[]' "$AGENT_BUS_AGENTS_FILE")"
+    [ -n "$spawned" ] || { echo "agent-dismiss: no spawned workers (.meta is empty)"; exit 0; }
+
+    open_recipients=""
+    if [ "$mode" = "done" ] && [ -s "$AGENT_BUS_FILE" ]; then
+        open_recipients="$(jq -Rsr '
+            def root($m;$e): if ($e.ref == null or $m[$e.ref] == null) then $e.id else root($m;$m[$e.ref]) end;
+            split("\n") | map(fromjson?)
+            | map(select(type == "object" and (.id | type == "string"))) as $events
+            | ($events | map({key:.id, value:.}) | from_entries) as $m
+            | ($events | map(. + {root: root($m;.)}) | group_by(.root) | map(.[-1]))
+            | map(select(.status | IN("done","blocked") | not))
+            | map(.to) | unique | .[]
+        ' "$AGENT_BUS_FILE" 2>/dev/null || true)"
+    fi
+
+    dismissed=0
+    skipped=0
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        # Never sweep the caller; skip the lead unless --force.
+        if [ "$name" = "$me" ]; then skipped=$((skipped+1)); continue; fi
+        if [ "$name" = "$lead" ] && [ "$force" -eq 0 ]; then
+            echo "agent-dismiss: skipping lead '$name' (pass --force to include it)" >&2
+            skipped=$((skipped+1)); continue
+        fi
+        if [ "$mode" = "done" ]; then
+            if printf '%s\n' "$open_recipients" | grep -qxF "$name"; then
+                skipped=$((skipped+1)); continue   # still has open work
+            fi
+        fi
+        dismiss_one "$name"
+        dismissed=$((dismissed+1))
+    done <<< "$spawned"
+
+    echo "agent-dismiss: $(jq -c .agents "$AGENT_BUS_AGENTS_FILE")"
+    echo "agent-dismiss: dismissed $dismissed, skipped $skipped"
+    exit 0
+fi
+
+# ---- single mode ----
+name="${args[0]}"
+jq -e --arg n "$name" '.agents | has($n)' "$AGENT_BUS_AGENTS_FILE" >/dev/null || {
+    echo "agent-dismiss: '$name' is not registered on bus $AGENT_BUS_DIR_EFFECTIVE — known agents:" >&2
+    jq -r '.agents | keys[]' "$AGENT_BUS_AGENTS_FILE" | sed 's/^/  /' >&2
+    exit 1
+}
+
+if [ "$name" = "$me" ] && [ "$force" -eq 0 ]; then
+    echo "agent-dismiss: refusing to dismiss yourself ('$name') — pass --force to override" >&2
+    exit 1
+fi
+if [ "$name" = "$lead" ] && [ "$force" -eq 0 ]; then
+    echo "agent-dismiss: '$name' is the bus lead — pass --force to dismiss the lead" >&2
+    exit 1
+fi
+
+dismiss_one "$name"
+echo "agent-dismiss: $(jq -c .agents "$AGENT_BUS_AGENTS_FILE")"

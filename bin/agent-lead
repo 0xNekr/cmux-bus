@@ -19,10 +19,12 @@ done
 
 usage() {
     cat >&2 <<EOF
-usage: agent-lead [--scope repo|workspace] [--bus-dir DIR] [show|set <name>|clear] [--json]
-  show          print the current lead (default)
-  set <name>    declare <name> (a registered agent) as the bus lead
+usage: agent-lead [--scope repo|workspace] [--bus-dir DIR] [show|set <name> [--relaxed]|clear|strict|relaxed] [--json]
+  show          print the current lead and its execution policy (default)
+  set <name>    declare <name> as the bus lead (STRICT by default; --relaxed to opt out)
   clear         remove the lead — back to peer-to-peer mode
+  strict        the lead must delegate everything, execute nothing itself (default)
+  relaxed       allow the lead to execute work directly when it judges fit
 EOF
     agent_bus_common_usage >&2
     exit 2
@@ -38,16 +40,20 @@ fi
 action="show"
 target=""
 json=0
+relaxed_flag=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        show)  action="show";;
-        clear) action="clear";;
+        show)    action="show";;
+        clear)   action="clear";;
+        strict)  action="policy"; target="strict";;
+        relaxed) action="policy"; target="relaxed";;
         set)
             action="set"
             [ $# -ge 2 ] || { echo "agent-lead: set needs an agent name" >&2; exit 2; }
             target="$2"; shift
             ;;
-        --json) json=1;;
+        --relaxed) relaxed_flag=1;;
+        --json)    json=1;;
         *) usage;;
     esac
     shift
@@ -69,32 +75,60 @@ case "$action" in
             exit 1
         }
         tmp=$(mktemp)
-        jq --arg n "$target" '.lead = $n' "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
-        echo "agent-lead: lead set to '$target'"
+        # Strict is the default: store "relaxed" only when asked, else drop the
+        # key so the bus reads as strict.
+        if [ "$relaxed_flag" -eq 1 ]; then
+            jq --arg n "$target" '.lead = $n | .lead_policy = "relaxed"' "$AGENT_BUS_AGENTS_FILE" > "$tmp"
+        else
+            jq --arg n "$target" '.lead = $n | del(.lead_policy)' "$AGENT_BUS_AGENTS_FILE" > "$tmp"
+        fi
+        mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+        echo "agent-lead: lead set to '$target' ($([ "$relaxed_flag" -eq 1 ] && echo relaxed || echo strict))"
         ;;
     clear)
         tmp=$(mktemp)
-        jq 'del(.lead)' "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+        jq 'del(.lead) | del(.lead_policy)' "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
         echo "agent-lead: lead cleared — peer-to-peer mode"
+        ;;
+    policy)
+        [ -n "$(agent_bus_lead)" ] || {
+            echo "agent-lead: no lead set — set one first with 'agent-lead set <name>'" >&2
+            exit 1
+        }
+        tmp=$(mktemp)
+        if [ "$target" = "relaxed" ]; then
+            jq '.lead_policy = "relaxed"' "$AGENT_BUS_AGENTS_FILE" > "$tmp"
+        else
+            jq 'del(.lead_policy)' "$AGENT_BUS_AGENTS_FILE" > "$tmp"
+        fi
+        mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+        echo "agent-lead: lead policy set to '$target'"
         ;;
 esac
 
 lead="$(agent_bus_lead)"
+policy="strict"
+[ -n "$lead" ] && policy="$(agent_bus_lead_policy)"
 
 if [ "$json" -eq 1 ]; then
-    jq -nc --arg lead "$lead" --arg me "$me" \
-        '{lead: (if $lead == "" then null else $lead end),
-          me:   (if $me   == "" then null else $me   end),
-          is_me: ($lead != "" and $lead == $me)}'
+    jq -nc --arg lead "$lead" --arg me "$me" --arg policy "$policy" \
+        '{lead:   (if $lead == "" then null else $lead end),
+          me:     (if $me   == "" then null else $me   end),
+          is_me:  ($lead != "" and $lead == $me),
+          policy: (if $lead == "" then null else $policy end)}'
     exit 0
 fi
 
-if [ "$action" = "show" ]; then
+if [ "$action" = "show" ] || [ "$action" = "policy" ]; then
     if [ -z "$lead" ]; then
         echo "agent-lead: no lead set — peer-to-peer mode"
     elif [ "$lead" = "$me" ]; then
-        echo "agent-lead: lead is '$lead' (you) — plan, delegate via handoff, review results; avoid executing multi-file work yourself"
+        if [ "$policy" = "strict" ]; then
+            echo "agent-lead: lead is '$lead' (you), policy STRICT — delegate every task via handoff; do NOT edit, run, or execute anything yourself unless the user explicitly tells you to"
+        else
+            echo "agent-lead: lead is '$lead' (you), policy relaxed — plan and delegate; you may execute work directly when you judge fit"
+        fi
     else
-        echo "agent-lead: lead is '$lead' — take handoffs from the lead, report done with evidence, ask the lead before self-assigning new work"
+        echo "agent-lead: lead is '$lead' (policy $policy) — take handoffs from the lead, report done with evidence, ask the lead before self-assigning new work"
     fi
 fi

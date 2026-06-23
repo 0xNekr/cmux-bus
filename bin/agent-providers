@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# agent-providers [list|init|path|get <provider> <field>] [--json] [--force]
+#
+# Inspect and scaffold the provider registry used by agent-spawn / agent-fleet.
+# Resolution: built-in defaults deep-merged with a user config at
+# $AGENT_BUS_PROVIDERS_FILE or ${XDG_CONFIG_HOME:-~/.config}/cmux-bus/providers.json.
+# Editing the config survives `./install.sh` (which would overwrite the scripts).
+
+set -euo pipefail
+
+AGENT_CMD="agent-providers"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-providers [list|init|path|get <provider> <field>] [--json] [--force]
+  list                 show the resolved providers (built-in merged with config)
+  init                 write the built-in defaults to the config file (--force to overwrite)
+  path                 print the resolved config file path
+  get <provider> <f>   print one field (launch|model_flag|default_model) — for scripts
+EOF
+    exit 2
+}
+
+action="list"
+json=0
+force=0
+get_provider=""
+get_field=""
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        list|init|path) action="$1";;
+        get)
+            action="get"
+            [ $# -ge 3 ] || { echo "agent-providers: get needs <provider> <field>" >&2; usage; }
+            get_provider="$2"; get_field="$3"; shift 2
+            ;;
+        --json)  json=1;;
+        --force) force=1;;
+        *) usage;;
+    esac
+    shift
+done
+
+case "$action" in
+    path)
+        agent_providers_file
+        ;;
+    get)
+        agent_provider_known "$get_provider" || {
+            echo "agent-providers: unknown provider '$get_provider'" >&2
+            exit 1
+        }
+        agent_provider_field "$get_provider" "$get_field"
+        ;;
+    init)
+        file="$(agent_providers_file)"
+        if [ -f "$file" ] && [ "$force" -eq 0 ]; then
+            echo "agent-providers: $file already exists — pass --force to overwrite" >&2
+            exit 1
+        fi
+        mkdir -p "$(dirname "$file")"
+        agent_providers_builtin > "$file"
+        echo "agent-providers: wrote defaults to $file"
+        ;;
+    list)
+        if [ "$json" -eq 1 ]; then
+            agent_providers_json
+            exit 0
+        fi
+        file="$(agent_providers_file)"
+        if [ -f "$file" ]; then
+            echo "agent-providers: config $file (merged over built-in defaults)"
+        else
+            echo "agent-providers: no config file ($file) — using built-in defaults"
+            echo "agent-providers: run 'agent-providers init' to customize"
+        fi
+        echo
+        printf '%-12s %-12s %-12s %s\n' PROVIDER LAUNCH FLAG 'DEFAULT MODEL'
+        agent_providers_json | jq -r '
+            .providers | to_entries[]
+            | [ .key, (.value.launch // "-"), (.value.model_flag // "-"), (.value.default_model // "-") ]
+            | @tsv' |
+        while IFS=$'\t' read -r name launch flag model; do
+            printf '%-12s %-12s %-12s %s\n' "$name" "$launch" "$flag" "$model"
+        done
+        ;;
+esac

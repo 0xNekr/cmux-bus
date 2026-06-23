@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+# agent-lead-guard — Claude Code hook that turns the STRICT lead convention into
+# real enforcement. As a hook it reads the event JSON on stdin; as a CLI it wires
+# itself into settings.json.
+#
+#   agent-lead-guard                 (hook mode: reads stdin, emits a decision)
+#   agent-lead-guard install [--user|--project]
+#   agent-lead-guard uninstall [--user|--project]
+#   agent-lead-guard status [--user|--project]
+#
+# When the current pane is the strict lead of its bus:
+#   - PreToolUse Task/Agent  -> deny  (use agent-spawn to put workers on the bus)
+#   - PreToolUse Edit/Write/NotebookEdit -> ask (delegate, or approve if the user
+#     explicitly told the lead to edit)
+#   - PreToolUse Bash        -> allow coordination/read-only commands; ask the rest
+#   - UserPromptSubmit / SessionStart -> inject a "you are the strict lead" reminder
+# In every other case (no cmux pane, no bus, not the lead, or relaxed) it exits 0
+# and stays out of the way. Fail-open by design — it must never break a session.
+
+# NOTE: no `set -e`. A guard bug must not block tools; we handle errors and
+# default to allow (exit 0).
+set -uo pipefail
+
+AGENT_CMD="agent-lead-guard"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+# ---------------------------------------------------------------------------
+# CLI mode: install / uninstall / status
+# ---------------------------------------------------------------------------
+
+settings_target() {
+    local scope="user"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --project) scope="project";;
+            --user)    scope="user";;
+        esac
+        shift
+    done
+    if [ "$scope" = "project" ]; then
+        printf '%s/.claude/settings.json\n' "$PWD"
+    else
+        printf '%s/.claude/settings.json\n' "$HOME"
+    fi
+}
+
+do_install() {
+    local file cmd tmp scope="user" a
+    for a in "$@"; do
+        case "$a" in --project) scope="project";; --user) scope="user";; esac
+    done
+    file="$(settings_target "$@")"
+    if [ "$scope" = "project" ]; then
+        # Portable + fail-safe command for a committable project settings file:
+        # resolve via PATH and no-op when cmux-bus is not installed. This lets a
+        # repo COMMIT .claude/settings.json so every cloner who has cmux-bus gets
+        # the enforcement automatically, while cloners without it are unaffected.
+        cmd='command -v agent-lead-guard >/dev/null 2>&1 && agent-lead-guard || true'
+    else
+        # User-level: absolute path to this clone (fastest, this machine only).
+        cmd="$AGENT_BIN_DIR/agent-lead-guard"
+    fi
+    mkdir -p "$(dirname "$file")"
+    [ -f "$file" ] || echo '{}' > "$file"
+    jq -e . "$file" >/dev/null 2>&1 || {
+        echo "agent-lead-guard: $file is not valid JSON — aborting (nothing changed)" >&2
+        return 1
+    }
+    cp "$file" "$file.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    tmp="$(mktemp)"
+    jq --arg cmd "$cmd" '
+        def strip: map(select(((.hooks // []) | map(.command) | any(contains("agent-lead-guard"))) | not));
+        .hooks //= {}
+        | .hooks.PreToolUse //= []
+        | .hooks.UserPromptSubmit //= []
+        | .hooks.SessionStart //= []
+        | .hooks.PreToolUse |= strip
+        | .hooks.UserPromptSubmit |= strip
+        | .hooks.SessionStart |= strip
+        | .hooks.PreToolUse += [{matcher:"Edit|Write|NotebookEdit|Bash|Task|Agent", hooks:[{type:"command", command:$cmd}]}]
+        | .hooks.UserPromptSubmit += [{matcher:"", hooks:[{type:"command", command:$cmd}]}]
+        | .hooks.SessionStart += [{matcher:"", hooks:[{type:"command", command:$cmd}]}]
+    ' "$file" > "$tmp" && mv "$tmp" "$file" || {
+        echo "agent-lead-guard: failed to update $file" >&2
+        return 1
+    }
+    echo "agent-lead-guard: installed into $file (timestamped backup kept)"
+    echo "agent-lead-guard: gates Edit/Write/NotebookEdit/Bash/Task/Agent + injects a reminder for the strict lead"
+    echo "agent-lead-guard: only acts when this pane is the strict lead — every other session is untouched"
+}
+
+do_uninstall() {
+    local file tmp
+    file="$(settings_target "$@")"
+    [ -f "$file" ] || { echo "agent-lead-guard: $file does not exist — nothing to do"; return 0; }
+    jq -e . "$file" >/dev/null 2>&1 || { echo "agent-lead-guard: $file is not valid JSON — aborting" >&2; return 1; }
+    cp "$file" "$file.bak-$(date -u +%Y%m%dT%H%M%SZ)"
+    tmp="$(mktemp)"
+    jq '
+        def strip: map(select(((.hooks // []) | map(.command) | any(contains("agent-lead-guard"))) | not));
+        if .hooks then
+            (if .hooks.PreToolUse then .hooks.PreToolUse |= strip else . end)
+            | (if .hooks.UserPromptSubmit then .hooks.UserPromptSubmit |= strip else . end)
+            | (if .hooks.SessionStart then .hooks.SessionStart |= strip else . end)
+        else . end
+    ' "$file" > "$tmp" && mv "$tmp" "$file"
+    echo "agent-lead-guard: removed guard hooks from $file"
+}
+
+do_status() {
+    local file
+    file="$(settings_target "$@")"
+    if [ ! -f "$file" ] || ! jq -e . "$file" >/dev/null 2>&1; then
+        echo "agent-lead-guard: no usable settings at $file — not installed"
+        return 0
+    fi
+    local n
+    n="$(jq '[.hooks // {} | to_entries[] | .value[]? | .hooks[]? | select(.command | type=="string" and contains("agent-lead-guard"))] | length' "$file" 2>/dev/null)"
+    if [ "${n:-0}" -gt 0 ]; then
+        echo "agent-lead-guard: installed in $file ($n hook entr$( [ "$n" = 1 ] && echo y || echo ies ))"
+        jq -r '.hooks // {} | to_entries[] | "  \(.key): " + ([.value[]? | .hooks[]? | select(.command|type=="string" and contains("agent-lead-guard")) | "on"] | length | tostring) + " entry(ies)"' "$file" 2>/dev/null
+    else
+        echo "agent-lead-guard: not installed in $file"
+    fi
+}
+
+case "${1:-}" in
+    install)   shift; do_install "$@"; exit $? ;;
+    uninstall) shift; do_uninstall "$@"; exit $? ;;
+    status)    shift; do_status "$@"; exit $? ;;
+    -h|--help)
+        sed -n '2,20p' "$script_path"; exit 0 ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Hook mode: read the event JSON from stdin and emit a decision
+# ---------------------------------------------------------------------------
+
+# If there is no piped input (run by hand in a terminal), show usage rather than
+# hanging on a stdin read.
+if [ -t 0 ]; then
+    echo "usage: agent-lead-guard [install|uninstall|status] [--user|--project]" >&2
+    echo "  (hook mode reads a Claude Code event JSON on stdin)" >&2
+    exit 0
+fi
+
+input="$(cat 2>/dev/null || true)"
+[ -n "$input" ] || exit 0
+event="$(printf '%s' "$input" | jq -r '.hook_event_name // empty' 2>/dev/null || true)"
+[ -n "$event" ] || exit 0
+
+# Only ever act when this pane is the strict lead; otherwise stay invisible.
+agent_bus_i_am_strict_lead 2>/dev/null || exit 0
+me="$(agent_bus_current_agent 2>/dev/null || true)"
+[ -n "$me" ] || me="the lead"
+
+emit_decision() { # <permissionDecision> <reason>
+    jq -nc --arg d "$1" --arg r "$2" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:$d,permissionDecisionReason:$r}}'
+    exit 0
+}
+
+emit_context() { # <event> <context>
+    jq -nc --arg e "$1" --arg c "$2" \
+        '{hookSpecificOutput:{hookEventName:$e,additionalContext:$c}}'
+    exit 0
+}
+
+# A Bash command is "coordination" if every segment's leading command is a bus
+# command or a read-only inspection tool. Anything else is treated as execution.
+bash_is_coordination() {
+    local cmd="$1" norm seg first sub
+    norm="$(printf '%s' "$cmd" | sed 's/&&/\n/g; s/||/\n/g; s/|/\n/g; s/;/\n/g')"
+    while IFS= read -r seg; do
+        seg="$(printf '%s' "$seg" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -z "$seg" ] && continue
+        # First bare token, skipping leading VAR=val assignments.
+        first="$(printf '%s' "$seg" | awk '{for(i=1;i<=NF;i++){ if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue; print $i; exit }}')"
+        first="$(basename "$first" 2>/dev/null || printf '%s' "$first")"
+        case "$first" in
+            agent-*|cmux|ls|cat|bat|head|tail|grep|rg|egrep|fgrep|jq|yq|find|fd|echo|printf|pwd|whoami|which|command|type|wc|sort|uniq|cut|column|tr|comm|tree|basename|dirname|realpath|readlink|stat|file|date|env|true|false|test|diff|sed)
+                : ;;  # sed allowed (read-only use; -i would mutate but is rare for a lead inspecting)
+            git)
+                sub="$(printf '%s' "$seg" | awk '{for(i=1;i<=NF;i++){ if($i=="git"){print $(i+1); exit} }}')"
+                case "$sub" in
+                    status|log|diff|show|branch|blame|ls-files|rev-parse|remote|describe|shortlog|whatchanged|cat-file|config) : ;;
+                    *) return 1 ;;
+                esac ;;
+            *) return 1 ;;
+        esac
+    done <<EOF
+$norm
+EOF
+    return 0
+}
+
+case "$event" in
+    PreToolUse)
+        tool="$(printf '%s' "$input" | jq -r '.tool_name // empty' 2>/dev/null || true)"
+        case "$tool" in
+            Task|Agent)
+                emit_decision deny "You are '$me', the STRICT lead on the cmux bus. Native sub-agents are off the bus and invisible to peers. Use 'agent-spawn <name> --as <provider>' to put a worker on the bus, then delegate with 'agent-send <name> handoff --paths ...'."
+                ;;
+            Edit|Write|NotebookEdit)
+                emit_decision ask "You are '$me', the STRICT lead — delegate file changes via 'agent-send <peer> handoff --paths ...' instead of editing yourself. Approve only if the user explicitly told you to edit directly."
+                ;;
+            Bash)
+                cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null || true)"
+                if [ -z "$cmd" ] || bash_is_coordination "$cmd"; then
+                    exit 0
+                fi
+                emit_decision ask "You are '$me', the STRICT lead — this looks like execution, not coordination. Delegate it via the bus ('agent-send <peer> handoff'), or approve only if the user explicitly asked you to run it yourself."
+                ;;
+            *) exit 0 ;;
+        esac
+        ;;
+    UserPromptSubmit|SessionStart)
+        emit_context "$event" "cmux-bus: you are '$me', the STRICT LEAD on this bus. Plan and delegate — do NOT edit files, run shell commands, or spawn native Task/Agent sub-agents yourself (those are gated/blocked). Delegate every task with 'agent-send <peer> handoff --paths ...' or recruit workers with 'agent-spawn <name> --as <provider>'. Check the board first: 'agent-roster' then 'agent-inbox'. The only exception is an explicit user instruction to act yourself."
+        ;;
+    *) exit 0 ;;
+esac
+exit 0

@@ -238,6 +238,212 @@ agent_bus_lead() {
     jq -r '.lead // empty' "$AGENT_BUS_AGENTS_FILE"
 }
 
+# ---- Provider registry (agent-spawn / agent-fleet) ----
+# Resolution: built-in defaults below, deep-merged with a user config at
+# $AGENT_BUS_PROVIDERS_FILE or ${XDG_CONFIG_HOME:-~/.config}/cmux-bus/providers.json
+# if it exists (file wins per field, and may add new providers). Each provider
+# has a `launch` command, a `model_flag`, and a `default_model`. The launch line
+# is "<launch> <model_flag> <model>" unless the resolved model is empty.
+
+agent_providers_file() {
+    if [ -n "${AGENT_BUS_PROVIDERS_FILE:-}" ]; then
+        printf '%s\n' "$AGENT_BUS_PROVIDERS_FILE"
+        return 0
+    fi
+    printf '%s/cmux-bus/providers.json\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+agent_providers_builtin() {
+    # model_style: "flag" -> "<launch> <model_flag> <model>" (claude, codex);
+    #              "opencode" -> "OPENCODE_CONFIG_CONTENT='{\"model\":\"<model>\"}' <launch>"
+    #              because the opencode TUI has no --model flag (only `opencode run`
+    #              does); the model must come from config, which OPENCODE_CONFIG_CONTENT
+    #              injects inline at local precedence.
+    # opencode default_model is empty: with no --model, opencode keeps its own
+    # configured default; --model then overrides it via the inline config.
+    cat <<'JSON'
+{
+  "providers": {
+    "claude":   { "launch": "claude",   "model_style": "flag", "model_flag": "--model", "default_model": "opus" },
+    "codex":    { "launch": "codex",    "model_style": "flag", "model_flag": "--model", "default_model": "gpt-5.4" },
+    "opencode": { "launch": "opencode", "model_style": "opencode", "default_model": "" }
+  }
+}
+JSON
+}
+
+agent_providers_json() {
+    local f
+    f="$(agent_providers_file)"
+    if [ -f "$f" ]; then
+        # Deep-merge builtin (base) with the user file (override/extend). Fall
+        # back to builtin if the file is malformed rather than breaking spawn.
+        jq -s '.[0] * .[1]' <(agent_providers_builtin) "$f" 2>/dev/null \
+            || agent_providers_builtin
+    else
+        agent_providers_builtin
+    fi
+}
+
+agent_provider_known() {
+    local p="$1"
+    agent_providers_json | jq -e --arg p "$p" '.providers[$p] != null' >/dev/null 2>&1
+}
+
+agent_provider_field() {
+    local p="$1" field="$2"
+    agent_providers_json | jq -r --arg p "$p" --arg f "$field" '.providers[$p][$f] // empty'
+}
+
+agent_provider_names() {
+    agent_providers_json | jq -r '.providers | keys[]'
+}
+
+# ---- Worker metadata (agent-spawn / agent-dismiss / agent-roster) ----
+# agents.json carries an optional `.meta` map parallel to `.agents`:
+#   .meta[name] = {provider, model, spawned_by, spawned_at}
+# It is purely additive — every command that reads `.agents[name]` (a surface
+# string) keeps working whether or not `.meta` is present.
+
+agent_meta_get() {
+    # agent_meta_get <name> <field> -> prints value or empty
+    local name="$1" field="$2"
+    [ -f "$AGENT_BUS_AGENTS_FILE" ] || return 0
+    jq -r --arg n "$name" --arg f "$field" '.meta[$n][$f] // empty' "$AGENT_BUS_AGENTS_FILE"
+}
+
+# ---- Lead execution policy ----
+# When a lead is set, it defaults to STRICT: the lead plans and delegates and
+# does NOT edit/run/execute anything itself, except on an explicit user
+# instruction. Stored as optional "lead_policy" in agents.json; absent => strict.
+# Only meaningful when a lead is set — callers should check agent_bus_lead first.
+agent_bus_lead_policy() {
+    [ -f "$AGENT_BUS_AGENTS_FILE" ] || { printf 'strict\n'; return 0; }
+    case "$(jq -r '.lead_policy // empty' "$AGENT_BUS_AGENTS_FILE")" in
+        relaxed) printf 'relaxed\n';;
+        *)       printf 'strict\n';;
+    esac
+}
+
+# Fast, fail-open check used by the lead guard hook: returns 0 only when the
+# current pane is the bus lead AND the policy is strict. Returns non-zero in
+# every other case (no cmux pane, no bus, not registered, not the lead, or
+# relaxed) so a guard can early-exit and never interfere with normal sessions.
+# Resolves the bus from env only (CMUX_SURFACE_ID / CMUX_WORKSPACE_ID) to stay
+# cheap enough to run on every tool call — no cmux socket round-trip.
+agent_bus_i_am_strict_lead() {
+    [ -n "${CMUX_SURFACE_ID:-}" ] || return 1
+    agent_bus_set_paths 2>/dev/null || return 1
+    [ -f "$AGENT_BUS_AGENTS_FILE" ] || return 1
+    local me lead
+    me="$(jq -r --arg s "$CMUX_SURFACE_ID" '.agents | to_entries[] | select(.value == $s) | .key' "$AGENT_BUS_AGENTS_FILE" 2>/dev/null | head -n1)"
+    [ -n "$me" ] || return 1
+    lead="$(jq -r '.lead // empty' "$AGENT_BUS_AGENTS_FILE" 2>/dev/null)"
+    [ "$me" = "$lead" ] || return 1
+    [ "$(agent_bus_lead_policy)" = "strict" ] || return 1
+    return 0
+}
+
+# ---- Spawn call policy ----
+# Controls which agents may CREATE new agents via agent-spawn / agent-fleet.
+# Resolution: built-in default (open) deep-merged with a user policy then a repo
+# policy (repo wins, file fields win). Override the whole stack with
+# $AGENT_BUS_POLICY_FILE. Rules are keyed by the caller's provider, the special
+# "lead" role, or "default"; values are lists of allowed target providers (or
+# ["*"]). Modes: "open" (anyone), "lead-only", "matrix" (consult rules).
+
+agent_policy_user_file() {
+    printf '%s/cmux-bus/policy.json\n' "${XDG_CONFIG_HOME:-$HOME/.config}"
+}
+
+agent_policy_repo_file() {
+    local root
+    root="$(git rev-parse --show-toplevel 2>/dev/null)" || return 0
+    printf '%s/.cmux-bus/policy.json\n' "$root"
+}
+
+agent_policy_builtin() {
+    printf '%s\n' '{"spawn":{"mode":"open","rules":{}}}'
+}
+
+# Merge a JSON file onto a base JSON string (deep merge, file wins). Echoes the
+# base unchanged if the file is missing or malformed.
+agent_policy_merge_file() {
+    local base="$1" file="$2"
+    if [ -n "$file" ] && [ -f "$file" ]; then
+        jq -s '.[0] * .[1]' <(printf '%s' "$base") "$file" 2>/dev/null || printf '%s' "$base"
+    else
+        printf '%s' "$base"
+    fi
+}
+
+agent_policy_json() {
+    local out
+    out="$(agent_policy_builtin)"
+    if [ -n "${AGENT_BUS_POLICY_FILE:-}" ]; then
+        out="$(agent_policy_merge_file "$out" "$AGENT_BUS_POLICY_FILE")"
+        printf '%s\n' "$out"
+        return 0
+    fi
+    out="$(agent_policy_merge_file "$out" "$(agent_policy_user_file)")"
+    out="$(agent_policy_merge_file "$out" "$(agent_policy_repo_file || true)")"
+    printf '%s\n' "$out"
+}
+
+# Policy identity of a caller name: "lead" if it is the bus lead, else its
+# declared provider (from .meta), else "default".
+agent_policy_caller_key() {
+    local name="$1" lead prov
+    lead="$(agent_bus_lead)"
+    if [ -n "$lead" ] && [ "$name" = "$lead" ]; then printf 'lead\n'; return 0; fi
+    prov="$(agent_meta_get "$name" provider)"
+    if [ -n "$prov" ]; then printf '%s\n' "$prov"; else printf 'default\n'; fi
+}
+
+# Decide whether a <caller key> (a provider, "lead", or "default") may spawn a
+# <target provider>. Pure policy logic — no bus access. Echoes "allow" or
+# "deny: <reason>".
+agent_spawn_decision_key() {
+    local key="$1" target="$2"
+    local policy mode allowed
+    policy="$(agent_policy_json)"
+    mode="$(printf '%s' "$policy" | jq -r '.spawn.mode // "open"')"
+    case "$mode" in
+        open)
+            printf 'allow\n'
+            ;;
+        lead-only)
+            if [ "$key" = "lead" ]; then
+                printf 'allow\n'
+            else
+                printf 'deny: spawn policy is lead-only; only the lead may spawn\n'
+            fi
+            ;;
+        matrix)
+            # The lead may spawn anything unless an explicit "lead" rule narrows it.
+            if [ "$key" = "lead" ] && ! printf '%s' "$policy" | jq -e '.spawn.rules.lead' >/dev/null 2>&1; then
+                printf 'allow\n'
+            else
+                allowed="$(printf '%s' "$policy" | jq -r --arg k "$key" '(.spawn.rules[$k] // .spawn.rules.default // []) | .[]' 2>/dev/null)"
+                if printf '%s\n' "$allowed" | grep -qxF '*' || printf '%s\n' "$allowed" | grep -qxF "$target"; then
+                    printf 'allow\n'
+                else
+                    printf 'deny: spawn policy (matrix) does not allow "%s" to spawn "%s"\n' "$key" "$target"
+                fi
+            fi
+            ;;
+        *)
+            printf 'deny: unknown spawn policy mode "%s"\n' "$mode"
+            ;;
+    esac
+}
+
+# Decide whether <caller name> may spawn a <target provider>, resolving the
+# caller's policy key from the bus (lead role / declared provider / default).
+agent_spawn_decision() {
+    agent_spawn_decision_key "$(agent_policy_caller_key "$1")" "$2"
+}
+
 agent_bus_open_thread_count() {
     local bus_file="$1"
     [ -f "$bus_file" ] || { printf '0\n'; return 0; }

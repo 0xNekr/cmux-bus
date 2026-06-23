@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# agent-fleet [--scope repo|workspace] [--bus-dir DIR] [--dir left|right|up|down] \
+#   [--no-say] [--ready-timeout N] <name=provider[:model]> ...
+#
+# Spawn a whole team in one shot: each spec opens a worker via agent-spawn on
+# this bus. Lets a lead stand up a standard squad (e.g. two codex + one claude)
+# with a single command. Work is delegated afterward with agent-send, exactly as
+# for a hand-spawned worker.
+#
+# Example:
+#   agent-fleet fixer=codex tester=codex designer=claude
+#   agent-fleet a=codex:gpt-5.4 b=opencode:anthropic/claude-sonnet-4-6
+
+set -euo pipefail
+
+AGENT_CMD="agent-fleet"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-fleet [--scope repo|workspace] [--bus-dir DIR] [--dir left|right|up|down] \\
+         [--no-say] [--ready-timeout N] <name=provider[:model]> ...
+
+  Spawn one worker per spec via agent-spawn. Each spec is name=provider[:model]:
+    fixer=codex            spawn 'fixer' as codex on the registry default model
+    designer=claude        spawn 'designer' as claude
+    b=opencode:anthropic/claude-sonnet-4-6   explicit model (may contain a '/')
+
+  Workers open as background tabs by default; pass --split (optionally with
+  --dir) to lay them out as pane splits instead. --no-say, --ready-timeout and
+  the bus scope flags are forwarded to each agent-spawn.
+EOF
+    agent_bus_common_usage >&2
+    exit 2
+}
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
+dir="right"
+split_mode=0
+no_say=0
+ready_timeout=25
+specs=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --split)           split_mode=1;;
+        --dir)             [ $# -ge 2 ] || usage; dir="$2"; split_mode=1; shift;;
+        --dir=*)           dir="${1#--dir=}"; split_mode=1;;
+        --no-say)          no_say=1;;
+        --ready-timeout)   [ $# -ge 2 ] || usage; ready_timeout="$2"; shift;;
+        --ready-timeout=*) ready_timeout="${1#--ready-timeout=}";;
+        -*)                echo "agent-fleet: unknown option '$1'" >&2; usage;;
+        *)                 specs+=("$1");;
+    esac
+    shift
+done
+
+[ "${#specs[@]}" -ge 1 ] || usage
+
+# Resolve the bus so we can identify the caller and pre-check the spawn policy
+# for the whole team before launching anything (fail fast, like spec validation).
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+me="$(agent_bus_current_agent)"
+[ -n "$me" ] || {
+    echo "agent-fleet: you are not registered on this bus — run 'agent-init <your_name>' first" >&2
+    exit 1
+}
+
+# Forward the bus scope to each agent-spawn so the whole fleet lands on this bus.
+bus_args=()
+if [ -n "$AGENT_BUS_CLI_DIR" ] || [ -n "${AGENT_BUS_DIR:-}" ]; then
+    bus_args=(--bus-dir "$AGENT_BUS_DIR_EFFECTIVE")
+elif [ "$AGENT_BUS_SCOPE_EFFECTIVE" = "repo" ]; then
+    bus_args=(--scope repo)
+fi
+
+spawn="$AGENT_BIN_DIR/agent-spawn"
+[ -x "$spawn" ] || spawn="agent-spawn"
+
+# Validate every spec up front so a typo doesn't leave a half-built team.
+parsed_names=()
+parsed_providers=()
+parsed_models=()
+for spec in "${specs[@]}"; do
+    case "$spec" in
+        *=*) ;;
+        *) echo "agent-fleet: bad spec '$spec' — expected name=provider[:model]" >&2; exit 1;;
+    esac
+    name="${spec%%=*}"
+    rest="${spec#*=}"
+    provider="${rest%%:*}"
+    if [ "$rest" = "$provider" ]; then
+        model=""
+    else
+        model="${rest#*:}"   # everything after the first ':' (model may contain '/')
+    fi
+    [ -n "$name" ] && [ -n "$provider" ] || {
+        echo "agent-fleet: bad spec '$spec' — name and provider are required" >&2; exit 1
+    }
+    parsed_names+=("$name")
+    parsed_providers+=("$provider")
+    parsed_models+=("$model")
+done
+
+# Pre-check the spawn policy for every target provider, so a forbidden member
+# does not leave a half-built team.
+for provider in "${parsed_providers[@]}"; do
+    decision="$(agent_spawn_decision "$me" "$provider")"
+    if [ "$decision" != "allow" ]; then
+        echo "agent-fleet: refused — ${decision#deny: }" >&2
+        echo "agent-fleet: adjust the policy with 'agent-policy' (user or repo)" >&2
+        exit 1
+    fi
+done
+
+ok=0
+fail=0
+for i in "${!parsed_names[@]}"; do
+    name="${parsed_names[$i]}"
+    provider="${parsed_providers[$i]}"
+    model="${parsed_models[$i]}"
+    # Guard the array expansion for bash 3.2 (empty "${a[@]}" errors under set -u).
+    spawn_args=(${bus_args[@]+"${bus_args[@]}"} --as "$provider" --ready-timeout "$ready_timeout")
+    [ "$split_mode" -eq 1 ] && spawn_args+=(--split --dir "$dir")
+    [ -n "$model" ] && spawn_args+=(--model "$model")
+    [ "$no_say" -eq 1 ] && spawn_args+=(--no-say)
+    spawn_args+=("$name")
+
+    echo "agent-fleet: spawning '$name' as $provider${model:+ ($model)}..."
+    if "$spawn" "${spawn_args[@]}"; then
+        ok=$((ok + 1))
+    else
+        echo "agent-fleet: failed to spawn '$name'" >&2
+        fail=$((fail + 1))
+    fi
+done
+
+echo "agent-fleet: spawned $ok worker(s), $fail failure(s)"
+[ "$fail" -eq 0 ]

@@ -53,14 +53,19 @@ live_json=$(printf '%s\n' "$live" | jq -R . | jq -s 'map(select(length > 0))')
 lead="$(agent_bus_lead)"
 
 roster=$(jq -c --arg me "$me" --arg mysurf "$my_surface" --arg lead "$lead" --argjson live "$live_json" '
-    .agents
+    (.meta // {}) as $meta
+    | .agents
     | to_entries
-    | map({
+    | map(($meta[.key] // null) as $m | {
         name:    .key,
         surface: .value,
         live:    (.value as $s | $live | index($s) != null),
         is_self: (.key == $me),
-        is_lead: ($lead != "" and .key == $lead)
+        is_lead: ($lead != "" and .key == $lead),
+        provider:   ($m.provider // null),
+        model:      ($m.model // null),
+        spawned_by: ($m.spawned_by // null),
+        via: (if $m then ($m.provider + (if ($m.model // "default") != "default" then ":" + $m.model else "" end)) else null end)
       })
     | sort_by((.is_self | not), .name)
 ' "$AGENT_BUS_AGENTS_FILE")
@@ -83,11 +88,20 @@ else
     echo "agent-roster: CMUX_SURFACE_ID not set — cannot tell which agent you are"
 fi
 if [ -n "$lead" ]; then
+    policy="$(agent_bus_lead_policy)"
     if [ "$lead" = "$me" ]; then
-        echo "agent-roster: lead is '$lead' (you) — plan, delegate, review; workers execute"
+        if [ "$policy" = "strict" ]; then
+            echo "agent-roster: lead is '$lead' (you), policy STRICT — delegate everything via handoff; do NOT edit/run/execute anything yourself unless the user explicitly asks"
+        else
+            echo "agent-roster: lead is '$lead' (you), policy relaxed — plan and delegate; you may execute directly when you judge fit"
+        fi
     else
-        echo "agent-roster: lead is '$lead' — take handoffs from the lead, report done with evidence"
+        echo "agent-roster: lead is '$lead' (policy $policy) — take handoffs from the lead, report done with evidence"
     fi
+fi
+spawn_mode="$(agent_policy_json | jq -r '.spawn.mode // "open"')"
+if [ "$spawn_mode" != "open" ]; then
+    echo "agent-roster: spawn policy '$spawn_mode' — who may create agents is restricted (see 'agent-policy show')"
 fi
 echo
 
@@ -97,16 +111,17 @@ if [ "$count" -eq 0 ]; then
     exit 0
 fi
 
-printf '%-3s %-16s %-7s %-7s %s\n' '' PEER STATUS ROLE SURFACE
+printf '%-3s %-16s %-7s %-7s %-22s %s\n' '' PEER STATUS ROLE VIA SURFACE
 # is_self goes last so no leading field is ever empty (bash `read` collapses a
 # leading tab, which would shift every non-self column left by one).
 printf '%s' "$roster" | jq -r '.[] |
     [ .name,
       (if .live then "live" else "stale" end),
       (if .is_lead then "lead" else "-" end),
+      (.via // "-"),
       .surface,
       .is_self ] | @tsv' |
-while IFS=$'\t' read -r name st role surface self; do
+while IFS=$'\t' read -r name st role via surface self; do
     if [ "$self" = "true" ]; then marker="->"; you=" (you)"; else marker=""; you=""; fi
-    printf '%-3s %-16s %-7s %-7s %s%s\n' "$marker" "$name" "$st" "$role" "$surface" "$you"
+    printf '%-3s %-16s %-7s %-7s %-22s %s%s\n' "$marker" "$name" "$st" "$role" "$via" "$surface" "$you"
 done
