@@ -181,19 +181,33 @@ emit_context() { # <event> <context>
 # work (gh pr list, loops, cmux read-screen, agent-*, git status, ...). Returns 0
 # when the command should prompt (ask), 1 when it should be allowed.
 bash_should_ask() {
-    local cmd="$1"
+    local cmd="$1" first c
     local b='(^|[;&|(`]|[[:space:]])'   # a word boundary that survives pipes/subshells
 
+    # Bus/coordination commands are ALWAYS allowed: their arguments (a --task
+    # description, --paths, a handoff message) are data, not commands the lead
+    # runs. Checking the first real token avoids false positives like
+    # `agent-spawn x --task "... docker ps ... ssh ..."`.
+    first="$(printf '%s' "$cmd" | awk '{for(i=1;i<=NF;i++){ if($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue; print $i; exit }}')"
+    first="$(basename "$first" 2>/dev/null || printf '%s' "$first")"
+    case "$first" in
+        agent-*|cmux) return 1 ;;
+    esac
+
+    # Strip quoted spans so blocklist words inside messages/patterns/--task text
+    # do not trigger; what remains is the command structure.
+    c="$(printf '%s' "$cmd" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")"
+
     # Build tools, package managers, language runtimes — "doing work".
-    printf '%s' "$cmd" | grep -qiE "${b}(npm|yarn|pnpm|bun|make|cargo|go|mvn|gradle|pip|pip3|poetry|uv|python|python3|node|deno|ruby|rails|php|dotnet|rustc|tsc|vite|webpack|jest|vitest|pytest|terraform|ansible|kubectl|helm|docker|docker-compose|podman|vagrant|serverless)[[:space:]]" && return 0
+    printf '%s' "$c" | grep -qiE "${b}(npm|yarn|pnpm|bun|make|cargo|go|mvn|gradle|pip|pip3|poetry|uv|python|python3|node|deno|ruby|rails|php|dotnet|rustc|tsc|vite|webpack|jest|vitest|pytest|terraform|ansible|kubectl|helm|docker|docker-compose|podman|vagrant|serverless)[[:space:]]" && return 0
     # Filesystem mutations.
-    printf '%s' "$cmd" | grep -qiE "${b}(rm|mv|cp|chmod|chown|mkdir|rmdir|touch|ln|tee|dd|truncate)[[:space:]]" && return 0
+    printf '%s' "$c" | grep -qiE "${b}(rm|mv|cp|chmod|chown|mkdir|rmdir|touch|ln|tee|dd|truncate)[[:space:]]" && return 0
     # In-place stream edits.
-    printf '%s' "$cmd" | grep -qiE '(sed|perl)[[:space:]]+-i' && return 0
+    printf '%s' "$c" | grep -qiE '(sed|perl)[[:space:]]+-i' && return 0
     # git mutations (read subcommands like status/log/diff stay allowed).
-    printf '%s' "$cmd" | grep -qiE 'git[[:space:]]+(commit|push|merge|rebase|reset|checkout|switch|cherry-pick|revert|tag|am|apply|stash|clean|add|rm|mv)([[:space:]]|$)' && return 0
+    printf '%s' "$c" | grep -qiE 'git[[:space:]]+(commit|push|merge|rebase|reset|checkout|switch|cherry-pick|revert|tag|am|apply|stash|clean|add|rm|mv)([[:space:]]|$)' && return 0
     # gh / forge mutations (read subcommands like pr list/view stay allowed).
-    printf '%s' "$cmd" | grep -qiE 'gh[[:space:]]+(pr[[:space:]]+(create|merge|close|edit|review|comment|ready)|issue[[:space:]]+(create|close|edit|comment)|release|repo[[:space:]]+(create|delete|fork)|workflow[[:space:]]+run|api[[:space:]]+(-X[[:space:]]*)?(POST|PUT|PATCH|DELETE))' && return 0
+    printf '%s' "$c" | grep -qiE 'gh[[:space:]]+(pr[[:space:]]+(create|merge|close|edit|review|comment|ready)|issue[[:space:]]+(create|close|edit|comment)|release|repo[[:space:]]+(create|delete|fork)|workflow[[:space:]]+run|api[[:space:]]+(-X[[:space:]]*)?(POST|PUT|PATCH|DELETE))' && return 0
 
     return 1
 }
