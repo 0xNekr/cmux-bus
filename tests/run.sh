@@ -1113,6 +1113,34 @@ test_agent_done_smoke() {
     pass "agent-done appends done event and signals originator"
 }
 
+test_agent_done_routes_to_delegator_after_own_ack() {
+    local fakebin workspace cmux_log done_id
+    fakebin="$tmp_root/fakebin-done-ack"
+    workspace="$(new_workspace done-ack)"
+    cmux_log="$tmp_root/cmux-done-ack.log"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        # Thread: claude hands off to codex, codex acks (codex is now the last
+        # speaker). When codex closes, the done must go to claude — not back to
+        # codex just because codex spoke last.
+        : > .agents/bus.jsonl
+        jq -nc '{id:"rootaaaa",ts:"2026-05-05T00:00:00Z",from:"claude",to:"codex",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"do it"}' >> .agents/bus.jsonl
+        jq -nc '{id:"ackbbbb",ts:"2026-05-05T00:01:00Z",from:"codex",to:"claude",type:"ack",ref:"rootaaaa",status:"in_progress",paths_claimed:[],body:"on it"}' >> .agents/bus.jsonl
+        done_id=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-done" ackbbbb "all done")
+        tail -n 1 .agents/bus.jsonl | jq -e --arg id "$done_id" \
+            '.id==$id and .type=="done" and .from=="codex" and .to=="claude" and .ref=="rootaaaa"' >/dev/null \
+            || fail "done routed to self instead of the delegator"
+        # The wake-up signal went to claude's surface (s2), not codex's own (s1).
+        grep -q "send --surface s2 new done id=$done_id from=codex" "$cmux_log" \
+            || fail "done signalled the wrong surface"
+    )
+
+    pass "agent-done routes the done to the delegator even when closing after your own ack"
+}
+
 test_agent_done_rejects_unknown_id() {
     local workspace
     workspace="$(new_workspace done-missing)"
@@ -2541,6 +2569,7 @@ test_agent_send_rejects_stale_recipient
 test_agent_send_signals_backgrounded_peer_but_rejects_dead
 test_agent_send_multiline_body
 test_agent_done_smoke
+test_agent_done_routes_to_delegator_after_own_ack
 test_agent_done_rejects_unknown_id
 test_concurrent_writes_stay_valid
 test_agent_inbox_empty_bus

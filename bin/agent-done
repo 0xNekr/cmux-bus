@@ -28,14 +28,21 @@ agent_bus_need_agents
 my_surface="${CMUX_SURFACE_ID:-}"; [ -n "$my_surface" ] || { echo "agent-done: CMUX_SURFACE_ID not set" >&2; exit 1; }
 from=$(jq -r --arg s "$my_surface" '.agents|to_entries[]|select(.value==$s)|.key' "$AGENT_BUS_AGENTS_FILE" | head -n1)
 [ -n "$from" ] || { echo "agent-done: this surface is not registered — run 'agent-init <your_name>' first" >&2; exit 1; }
-thread=$(jq -Rsr --arg ref "$ref" '
+root_event=$(jq -Rsr --arg ref "$ref" '
   def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
   split("\n") | map(fromjson?) |
   map(select(type=="object" and .id)) as $events | ($events|map({key:.id,value:.})|from_entries) as $m |
-  if $m[$ref]==null then null else ($events|map(.+{root:root($m;.)})|map(select(.root==root($m;$m[$ref])))|last) end
+  if $m[$ref]==null then null else $m[root($m;$m[$ref])] end
 ' "$AGENT_BUS_FILE")
-[ "$thread" != null ] || { echo "agent-done: unknown event id '$ref'" >&2; exit 1; }
-to=$(printf '%s' "$thread" | jq -r .from); root=$(printf '%s' "$thread" | jq -r .root)
+[ "$root_event" != null ] && [ -n "$root_event" ] || { echo "agent-done: unknown event id '$ref'" >&2; exit 1; }
+root=$(printf '%s' "$root_event" | jq -r .id)
+# Address the done to the OTHER party of the thread — the counterparty on the
+# ROOT event — not whoever spoke last. Closing right after your own ack would
+# otherwise route the done back to yourself, so the original delegator (the
+# lead) never gets signalled.
+rfrom=$(printf '%s' "$root_event" | jq -r .from)
+rto=$(printf '%s' "$root_event" | jq -r .to)
+if [ "$rfrom" = "$from" ]; then to="$rto"; else to="$rfrom"; fi
 id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n'); ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 event=$(jq -nc --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" --arg ref "$root" --arg cwd "$PWD" --arg body "$body" \
   '{id:$id,ts:$ts,from:$from,to:$to,type:"done",ref:$ref,status:"done",paths_claimed:[],cwd:$cwd,body:$body}')
