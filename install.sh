@@ -142,6 +142,11 @@ plans and reviews, cheaper peers execute.
   `agent-roster` shows each worker's provider/model under VIA. So the user
   need only start you and say e.g. "ask codex to ..." — you spawn the codex
   worker, delegate, review, and dismiss it when finished.
+- **Yield, don't poll**: after delegating, END your turn. When a worker
+  appends `ack`/`done`, the bus injects `new <type> id=…` into your pane and
+  wakes you. A foreground `sleep`/polling loop is harmful — those wake-up
+  signals queue behind it, so you react late and waste tokens. To block on
+  one reply use `agent-wait <id>` / `agent-rpc`, never a hand-rolled loop.
 - **If you are a worker**: process the lead's handoffs first (`ack` →
   execute → `done` with verifiable evidence: commands run, test output,
   commit ids). `ask` the lead before self-assigning new non-trivial work

@@ -160,6 +160,13 @@ Regardless of policy:
   thread reopens because effective state is the last event in the chain.
 - Parallelize independent tasks across workers; never hand two workers
   overlapping `paths_claimed`.
+- **Yield, don't poll.** After delegating, *end your turn*. When a worker
+  appends `ack`/`done`, `agent-send` injects `new <type> id=…` into your
+  pane, which wakes you for a fresh turn. A foreground `sleep`/polling loop
+  is harmful: while it runs, those wake-up signals just queue behind it, so
+  you react minutes late and burn tokens. If you truly have nothing else to
+  do and want to block on one specific reply, use `agent-wait <id>` or
+  `agent-rpc` — never a hand-rolled poll loop.
 
 **Assembling your own team.** You do not need the user to open panes and
 run `agent-init` for each worker. Recruit them yourself:

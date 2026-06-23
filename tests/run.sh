@@ -2438,6 +2438,12 @@ test_agent_lead_guard_enforces_strict_lead() {
             | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null || fail "git mutation should ask"
         decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"gh pr create --fill"}}' \
             | jq -e '.hookSpecificOutput.permissionDecision == "ask"' >/dev/null || fail "gh mutation should ask"
+        # A bus polling loop (loop + sleep) is nudged to yield instead.
+        decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"for i in $(seq 1 40); do agent-inbox; sleep 15; done"}}' \
+            | jq -e '.hookSpecificOutput.permissionDecisionReason | test("END YOUR TURN")' >/dev/null || fail "poll loop should be nudged to yield"
+        # A single blocking wait (agent-wait) is fine, not a poll loop.
+        [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"agent-wait 6c74f7ea --timeout 300"}}')" ] \
+            || fail "agent-wait must be allowed"
         [ -z "$(decide s1 '{"hook_event_name":"PreToolUse","tool_name":"Read","tool_input":{}}')" ] \
             || fail "Read must be allowed (reading is fine for the lead)"
         decide s1 '{"hook_event_name":"SessionStart","source":"startup"}' \

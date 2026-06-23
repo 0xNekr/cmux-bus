@@ -175,6 +175,17 @@ emit_context() { # <event> <context>
     exit 0
 }
 
+# Detect a busy-wait / polling loop (a loop construct plus a sleep). The lead
+# must not block on these: while a foreground poll runs, worker ack/done signals
+# injected into the pane just queue behind it instead of waking the lead. Returns
+# 0 when the command looks like bus polling.
+bash_is_poll_loop() {
+    local c
+    c="$(printf '%s' "$1" | sed "s/'[^']*'//g; s/\"[^\"]*\"//g")"
+    printf '%s' "$c" | grep -qiE '(^|[;&|`(]|[[:space:]])(for|while|until)[[:space:]]' \
+        && printf '%s' "$c" | grep -qiE '(^|[;&|`(]|[[:space:]])sleep[[:space:]]'
+}
+
 # Blocklist, not allowlist: the strict lead reads and coordinates freely
 # (reading is always fine), so a Bash command is allowed UNLESS it clearly
 # executes or mutates. This avoids prompting on the lead's normal review/monitor
@@ -224,7 +235,9 @@ case "$event" in
                 ;;
             Bash)
                 cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // empty' 2>/dev/null || true)"
-                if [ -n "$cmd" ] && bash_should_ask "$cmd"; then
+                if [ -n "$cmd" ] && bash_is_poll_loop "$cmd"; then
+                    emit_decision ask "You are '$me', the STRICT lead — don't block on a polling loop. After delegating, END YOUR TURN: a worker's 'ack'/'done' is signalled into your pane and wakes you automatically; a foreground sleep-loop only makes those signals queue behind it. For a single blocking wait use 'agent-wait <id>' or 'agent-rpc'."
+                elif [ -n "$cmd" ] && bash_should_ask "$cmd"; then
                     emit_decision ask "You are '$me', the STRICT lead — this command builds/runs/mutates rather than reads. Delegate it via the bus ('agent-send <peer> handoff'), or approve only if the user explicitly asked you to run it yourself."
                 fi
                 exit 0
@@ -233,7 +246,7 @@ case "$event" in
         esac
         ;;
     UserPromptSubmit|SessionStart)
-        emit_context "$event" "cmux-bus: you are '$me', the STRICT LEAD on this bus. Plan and delegate — do NOT edit files, run shell commands, or spawn native Task/Agent sub-agents yourself (those are gated/blocked). Delegate every task with 'agent-send <peer> handoff --paths ...' or recruit workers with 'agent-spawn <name> --as <provider>'. Check the board first: 'agent-roster' then 'agent-inbox'. The only exception is an explicit user instruction to act yourself."
+        emit_context "$event" "cmux-bus: you are '$me', the STRICT LEAD on this bus. Plan and delegate — do NOT edit files, run shell commands, or spawn native Task/Agent sub-agents yourself (those are gated/blocked). Delegate every task with 'agent-send <peer> handoff --paths ...' or recruit workers with 'agent-spawn <name> --as <provider>'. Check the board first: 'agent-roster' then 'agent-inbox'. After delegating, END YOUR TURN — a worker's 'ack'/'done' is signalled into your pane and wakes you automatically; never block on a sleep/polling loop (it just makes those signals queue behind it). The only exception is an explicit user instruction to act yourself."
         ;;
     *) exit 0 ;;
 esac
