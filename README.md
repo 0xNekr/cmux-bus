@@ -41,11 +41,38 @@ cd cmux-bus
 ```
 
 The installer symlinks all `bin/agent-*` scripts into `~/.local/bin`
-(create it if missing). Updates are then a `git pull` away.
+(create it if missing). Updates are then a `git pull` away (or `agent-update`).
 
 If Claude Code is detected (`~/.claude/rules/` exists), it also installs
 `agents-protocol.md` there so Claude auto-loads the protocol context at
 session start.
+
+Add `--guard` to also enable strict-lead enforcement on this machine:
+
+```sh
+./install.sh --guard          # = install + agent-lead-guard install
+```
+
+### Using it across your repos / sharing with a team
+
+Each developer installs cmux-bus **once** (`clone + ./install.sh`); the symlinks
+point at their own clone, so every repo and cmux workspace on that machine picks
+up the latest commands automatically. The per-bus `PROTOCOL.md`/`AGENTS.md` are
+snapshots copied by `agent-init` — re-run it (or `agent-update`) to refresh an
+old bus.
+
+A repo can **ship its own governance** so cloners inherit it automatically:
+
+- **Spawn policy** — commit `.cmux-bus/policy.json` (see [Spawn call
+  policy](#spawn-call-policy-who-may-create-whom)). Any cloner with cmux-bus
+  resolves it at runtime; repo rules override the user's.
+- **Strict-lead enforcement** — run `agent-lead-guard install --project` and
+  commit the resulting `.claude/settings.json`. The hook command is written
+  PATH-relative and fail-safe, so cloners who have cmux-bus get the enforcement
+  and cloners who don't are unaffected (it no-ops).
+
+So a "bus-governed" repo just commits two small files; teammates only need
+cmux-bus installed.
 
 ## Quick start
 
@@ -115,11 +142,17 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 
 | Command | What it does |
 |---|---|
-| `agent-init [--scope repo\|workspace] [--bus-dir DIR] [--lead] <name>` | Bootstrap or refresh this bus for `<name>`. Creates the resolved bus dir, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, and purges stale entries from previous sessions. `--lead` declares `<name>` as the bus lead (see Lead mode). |
+| `agent-init [--scope repo\|workspace] [--bus-dir DIR] [--lead] [--as PROVIDER] <name>` | Bootstrap or refresh this bus for `<name>`. Creates the resolved bus dir, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, and purges stale entries from previous sessions. `--lead` declares `<name>` as the bus lead (strict by default — see Lead mode). `--as PROVIDER` records your provider in `.meta` so the spawn policy can classify you. |
+| `agent-spawn [--scope repo\|workspace] [--bus-dir DIR] --as <claude\|codex\|opencode> [--model M] [--task TEXT [--paths "a,b"]] [--split [--dir left\|right\|up\|down]] [--title TEXT\|--no-rename] [--focus] [--say TEXT\|--no-say] <name>` | Open the worker as a **background tab** in your pane (one click away, unfocused), register `<name>` on **this** bus, and launch the chosen agent CLI in it. `--split` lays it out as a pane split instead. The new surface runs `agent-init` in its shell *before* the CLI starts (deterministic registration) and inherits your `CMUX_WORKSPACE_ID` so it lands on the same bus. The tab is renamed `"<model> - <provider>"` (`--title` / `--no-rename`). `--task` seeds a first handoff; default models come from the registry (`agent-providers`); `--model default` uses the CLI's own default. opencode's model is applied via `OPENCODE_CONFIG_CONTENT` (its TUI has no `--model` flag). Enforced by the spawn policy. |
+| `agent-dismiss [--scope repo\|workspace] [--bus-dir DIR] [--keep-pane] [--force] (<name>\|--all-spawned\|--done)` | The inverse of `agent-spawn`: close a worker's cmux pane and remove it from the registry (and its `.meta`). `--all-spawned` dismisses every lead-spawned worker; `--done` dismisses spawned workers with no open inbound thread. `--keep-pane` deregisters only; `--force` is required to dismiss yourself or the lead (dismissing the lead clears the lead pointer). |
+| `agent-fleet [--scope repo\|workspace] [--bus-dir DIR] [--split [--dir DIR]] [--no-say] <name=provider[:model]> ...` | Spawn a whole team in one shot — one `agent-spawn` per spec (`fixer=codex`, `b=opencode:opencode-go/qwen3.7-max`). Workers open as background tabs by default (`--split` for panes). Validates all specs before spawning so a typo can't leave a half-built team. |
+| `agent-providers [list\|init\|path\|get <provider> <field>] [--json] [--force]` | Inspect and scaffold the provider registry used by `agent-spawn` / `agent-fleet`. Built-in defaults (claude/codex/opencode) are deep-merged with a config at `$AGENT_BUS_PROVIDERS_FILE` or `${XDG_CONFIG_HOME:-~/.config}/cmux-bus/providers.json`; the config survives `./install.sh`. `init` writes the defaults to edit; `get` reads one field for scripts. |
 | `agent-send [--scope repo\|workspace] [--bus-dir DIR] <to> <type> [flags] <body>` | Append event(s) and signal recipient(s). Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. For `ask`, `<to>` may be `all` or comma-separated names (`claude,deepseek`); this fans out into one thread per peer. Refuses unknown refs and stale recipients. |
 | `agent-inbox [--scope repo\|workspace] [--bus-dir DIR] [--json] [--no-stale\|--only-stale] [--no-stuck\|--only-stuck] [--stuck-after MIN]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. Threads whose last event is `in_progress` and older than the stuck threshold (default 10 min, configurable via `AGENT_BUS_STUCK_AFTER_MIN` env) appear with `[stuck Xm]`. |
 | `agent-roster [--scope repo\|workspace] [--bus-dir DIR] [--json]` | List the agents registered in the resolved bus and tell you, up front, which one you are (resolved from `CMUX_SURFACE_ID`). Marks your own row `(you)`, shows who is `lead`, and flags each peer `live`/`stale` by presence in `surface-health`. Read-only. |
-| `agent-lead [--scope repo\|workspace] [--bus-dir DIR] [show\|set <name>\|clear] [--json]` | Show, set, or clear the bus **lead** — the orchestrator agent that plans, delegates via `handoff`, and reviews results while the other agents execute. `set` requires a registered agent name. |
+| `agent-lead [--scope repo\|workspace] [--bus-dir DIR] [show\|set <name> [--relaxed]\|clear\|strict\|relaxed] [--json]` | Show, set, or clear the bus **lead** — the orchestrator agent that plans, delegates via `handoff`, and reviews results while the other agents execute. A lead is **strict** by default (delegates everything, executes nothing itself unless the user explicitly asks); `set --relaxed`, `relaxed`, and `strict` manage that policy. `set` requires a registered agent name. |
+| `agent-policy [show\|path\|init\|check <caller> <provider>] [--user\|--repo] [--json] [--force]` | Inspect and scaffold the **spawn call policy** — who may create which provider via `agent-spawn` / `agent-fleet`. Built-in `open` is deep-merged with a per-user file and a per-repo file (`<git-root>/.cmux-bus/policy.json`, repo wins). Modes: `open`, `lead-only`, `matrix` (rules by provider / `lead` / `default`). `check` tests a rule; `init` scaffolds a starter. |
+| `agent-lead-guard [install\|uninstall\|status] [--user\|--project]` | Claude Code hook that turns the **strict lead** convention into real enforcement. When the current pane is the strict lead, it `deny`s native `Task`/`Agent` sub-agents (use `agent-spawn` instead), `ask`s before `Edit`/`Write`/`NotebookEdit` and non-coordination `Bash` (approve only on an explicit user instruction), and injects a role reminder at `SessionStart`/`UserPromptSubmit`. Fail-open: any other session (no bus, not the lead, or `relaxed`) is untouched. `install` merges into `settings.json` (idempotent, backed up); opt-in. |
 | `agent-done [--scope repo\|workspace] [--bus-dir DIR] <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
 | `agent-cancel [--scope repo\|workspace] [--bus-dir DIR] <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |
 | `agent-resume [--scope repo\|workspace] [--bus-dir DIR] <id> [--force] [body]` | Re-open a stuck/crashed thread by appending a fresh `handoff` to its **original recipient**. Default body: `RESUME: <previous>`. Refuses if the thread is already done/blocked unless `--force`. |
@@ -228,6 +261,36 @@ agent-init codex
 agent-init deepseek
 ```
 
+### The lead builds its own team
+
+You don't have to open and initialize each worker pane by hand. Once a lead is
+running, it can recruit workers itself with `agent-spawn`: open a fresh split,
+register the worker on the same bus, and launch its CLI — then delegate as
+usual. So you only ever start the lead and tell it what you want:
+
+```sh
+# you, to the lead pane: "ask codex to bisect the flaky test, then clean up"
+
+# the lead does, on its own — spawn and delegate in one step:
+agent-spawn fixer --as codex \
+  --task "Bisect the flaky test in tests/, propose a fix, reply done with the commit" \
+  --paths "tests/**"
+# ... lead reviews the `done` it gets back ...
+agent-dismiss fixer                                # close the pane, shrink the team
+```
+
+`agent-spawn` registers the worker deterministically (it runs `agent-init` in
+the new pane's shell before the CLI launches). With `--task` it seeds the first
+`handoff` on the bus the moment the worker registers; without it, delegate later
+with `agent-send`. Pick the provider and model per task (`--as
+claude|codex|opencode`, `--model`); defaults come from the registry
+(`agent-providers`). Stand up a standard squad in one command:
+
+```sh
+agent-fleet reviewer=claude tester=codex bencher=codex   # three workers at once
+agent-dismiss --done                                     # later: drop the finished ones
+```
+
 The lead decomposes work and delegates each task as a `handoff` with explicit
 acceptance criteria and `paths_claimed`, then reviews every `done` against
 those criteria. Rework is requested with a new `handoff --ref` on the same
@@ -249,6 +312,77 @@ agent-lead clear        # back to peer-to-peer mode
 `agent-init` keeps the pointer coherent: it follows a same-surface rename and
 clears the lead when its surface disappears. The user always outranks the
 lead — a direct user instruction to a worker wins over the lead's plan.
+
+### Lead execution policy (strict by default)
+
+A lead is **strict** unless told otherwise: it plans and delegates and does
+**not** edit, run, or execute anything itself — the only exception is an
+explicit user instruction. This is a declared convention (like path ownership),
+surfaced to the lead by `agent-roster` and `agent-lead` so it reads its stance
+at session start.
+
+```sh
+agent-lead set claude --lead    # strict by default
+agent-lead relaxed              # let the lead execute directly when it judges fit
+agent-lead strict               # back to delegate-only
+agent-lead                      # show lead + policy
+```
+
+The state lives as an optional `lead_policy` key in `agents.json` (absent ⇒
+strict). `agent-lead clear` removes both the lead and its policy.
+
+By default this is a *declared* convention. To make it **enforced**, install the
+Claude Code hook:
+
+```sh
+agent-lead-guard install        # opt-in; merges into settings.json (backed up)
+```
+
+When the current pane is the strict lead, the hook:
+- **denies** native `Task`/`Agent` sub-agents → you must use `agent-spawn` so
+  workers land on the bus (visible, path-claimed, reviewable);
+- **asks** before `Edit`/`Write`/`NotebookEdit` and non-coordination `Bash`
+  (you approve only when the user explicitly told the lead to act itself);
+- **allows** reads and bus/coordination commands (`agent-*`, `cmux`, `git
+  status`, …) so delegation always works;
+- **injects** a "you are the strict lead" reminder at session start and on each
+  prompt, so the role survives context compaction.
+
+It is fail-open: any session that is not a strict lead (no bus, not the lead, or
+`relaxed`) is left completely untouched. `agent-lead-guard uninstall` removes it.
+
+### Spawn call policy (who may create whom)
+
+Independently, you can restrict **which agent may create which provider** via
+`agent-spawn` / `agent-fleet`. The policy resolves from a built-in default
+(`open`) deep-merged with a per-user file
+(`${XDG_CONFIG_HOME:-~/.config}/cmux-bus/policy.json`) and a per-repo file
+(`<git-root>/.cmux-bus/policy.json`, repo wins). Modes:
+
+- `open` (default) — anyone may spawn anyone.
+- `lead-only` — only the lead may spawn.
+- `matrix` — rules keyed by the caller's **provider** (or the special `lead`
+  role, or `default`), each listing the providers it may spawn (`*` = any).
+
+```jsonc
+// .cmux-bus/policy.json — committable, per-repo
+{ "spawn": { "mode": "matrix", "rules": {
+    "lead":   ["*"],
+    "claude": ["codex", "opencode"],
+    "codex":  []
+} } }
+```
+
+The caller's provider comes from `.meta.provider` (set by `agent-spawn`, or
+self-declared with `agent-init --as <provider>`). `agent-spawn`/`agent-fleet`
+**enforce** this and refuse a forbidden creation; it gates creation only, not
+`handoff` delegation between existing agents.
+
+```sh
+agent-policy init --repo                  # scaffold a starter repo policy
+agent-policy show                         # resolved mode + rules + sources
+agent-policy check claude codex           # test a rule (allow / deny)
+```
 
 ## Event schema
 
