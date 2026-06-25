@@ -1181,6 +1181,36 @@ test_concurrent_writes_stay_valid() {
     pass "concurrent agent-send writes remain valid JSONL"
 }
 
+test_bus_lock_breaks_stale_holder() {
+    local workspace deadpid
+    workspace="$(new_workspace lock-stale)"
+
+    (
+        cd "$workspace"
+        write_agents
+        export HOSTNAME=testhost
+
+        # (A) Dead holder on this host: a lock stamped with a PID that is gone must
+        # be broken so the write still lands. This is the SIGKILL-leaves-the-lock
+        # deadlock that previously froze the bus forever.
+        sleep 100 & deadpid=$!
+        kill "$deadpid" 2>/dev/null || true
+        wait "$deadpid" 2>/dev/null || true
+        mkdir .agents/bus.lock
+        printf '%s %s %s\n' testhost "$deadpid" "$(date +%s)" > .agents/bus.lock/owner
+        CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" user block "after-dead" >/dev/null
+        [ "$(jq -s length .agents/bus.jsonl)" = "1" ] || fail "stale (dead-pid) lock was not broken"
+        [ ! -e .agents/bus.lock ] || fail "lock dir left behind after write"
+
+        # (B) Aged lock with no owner stamp: stale once older than the threshold.
+        mkdir .agents/bus.lock
+        AGENT_BUS_LOCK_STALE_SECS=0 CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" user block "after-aged" >/dev/null
+        [ "$(jq -s length .agents/bus.jsonl)" = "2" ] || fail "aged lock was not broken"
+    )
+
+    pass "bus lock breaks a stale holder instead of deadlocking"
+}
+
 test_agent_inbox_empty_bus() {
     local workspace output
     workspace="$(new_workspace inbox-empty)"
@@ -2582,6 +2612,7 @@ test_agent_done_smoke
 test_agent_done_routes_to_delegator_after_own_ack
 test_agent_done_rejects_unknown_id
 test_concurrent_writes_stay_valid
+test_bus_lock_breaks_stale_holder
 test_agent_inbox_empty_bus
 test_agent_cancel_and_resume_smoke
 test_agent_cancel_and_resume_negative_cases

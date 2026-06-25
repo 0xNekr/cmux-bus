@@ -183,9 +183,54 @@ agent_bus_need_agents() {
     }
 }
 
+# ---- Bus lock (used by agent_bus_append_event) ----
+# The bus lock is a directory (atomic mkdir). We stamp it with the holder's
+# host+PID+epoch in an `owner` file so a *stale* lock — one left behind by a
+# holder that was SIGKILLed (no EXIT trap fires) or by a crashed pane — can be
+# detected and broken instead of deadlocking every future writer forever. This
+# is the root-cause fix for the observed "agent-done: timed out waiting for bus
+# lock" under contention.
+
+# Portable mtime (epoch seconds) of a path; empty if it can't be read.
+agent_bus_mtime() {
+    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true
+}
+
+# Stable-ish host id so we only trust `kill -0` for a holder on the same host.
+agent_bus_hostid() {
+    printf '%s' "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+}
+
+# Decide whether the currently-held lock is stale. True (0) when the owning PID
+# is on this host and no longer alive, or when the lock dir is older than
+# $stale_after seconds (covers a missing/unreadable owner file and cross-host
+# holders we cannot probe).
+agent_bus_lock_is_stale() {
+    local owner_file="$1" stale_after="$2"
+    local host pid ts now lock_mtime
+    now="$(date +%s)"
+    if [ -r "$owner_file" ]; then
+        read -r host pid ts < "$owner_file" 2>/dev/null || true
+        if [ -n "${pid:-}" ] && [ "${host:-}" = "$(agent_bus_hostid)" ]; then
+            kill -0 "$pid" 2>/dev/null && return 1   # holder alive -> not stale
+            return 0                                  # holder gone  -> stale
+        fi
+    fi
+    lock_mtime="$(agent_bus_mtime "$AGENT_BUS_LOCK")"
+    [ -n "$lock_mtime" ] || return 1
+    [ $(( now - lock_mtime )) -ge "$stale_after" ]
+}
+
+agent_bus_lock_holder_note() {
+    local owner_file="$1" host pid ts
+    [ -r "$owner_file" ] || return 0
+    read -r host pid ts < "$owner_file" 2>/dev/null || true
+    [ -n "${pid:-}" ] && printf ' (held by pid %s on %s)' "$pid" "${host:-?}"
+    return 0
+}
+
 agent_bus_append_event() {
     local event="$1"
-    local tries=0
 
     case "$event" in
         *$'\n'*|*$'\r'*)
@@ -211,18 +256,32 @@ agent_bus_append_event() {
         exit 1
     }
 
-    trap 'rmdir "$AGENT_BUS_LOCK" 2>/dev/null || true' EXIT INT TERM
+    local owner_file="$AGENT_BUS_LOCK/owner"
+    local stale_after="${AGENT_BUS_LOCK_STALE_SECS:-30}"
+    local max_wait="${AGENT_BUS_LOCK_TIMEOUT_SECS:-30}"
+    local deadline=$(( $(date +%s) + max_wait ))
+
+    trap 'rm -rf "$AGENT_BUS_LOCK" 2>/dev/null || true' EXIT INT TERM
     while ! mkdir "$AGENT_BUS_LOCK" 2>/dev/null; do
-        tries=$((tries + 1))
-        if [ "$tries" -ge 100 ]; then
-            echo "${AGENT_CMD}: timed out waiting for bus lock ($AGENT_BUS_LOCK)" >&2
+        # Contended. Break the lock if its holder is dead or it has gone stale,
+        # then retry; otherwise back off (with jitter to avoid lockstep) until the
+        # deadline. mkdir stays the single atomic arbiter, so even if two writers
+        # break-and-retry at once, only one wins the next mkdir.
+        if agent_bus_lock_is_stale "$owner_file" "$stale_after"; then
+            rm -rf "$AGENT_BUS_LOCK" 2>/dev/null || true
+            continue
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "${AGENT_CMD}: timed out waiting for bus lock ($AGENT_BUS_LOCK)$(agent_bus_lock_holder_note "$owner_file")" >&2
+            trap - EXIT INT TERM
             exit 1
         fi
-        sleep 0.1
+        sleep "0.$(( (RANDOM % 3) + 1 ))"
     done
 
+    printf '%s %s %s\n' "$(agent_bus_hostid)" "$$" "$(date +%s)" > "$owner_file" 2>/dev/null || true
     printf '%s\n' "$event" >> "$AGENT_BUS_FILE"
-    rmdir "$AGENT_BUS_LOCK"
+    rm -rf "$AGENT_BUS_LOCK"
     trap - EXIT INT TERM
 }
 
