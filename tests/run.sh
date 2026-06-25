@@ -787,7 +787,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-watchdog agent-wait agent-update; do
+    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-watchdog agent-recover agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -1929,6 +1929,72 @@ test_agent_wait_treats_timeout_as_terminal() {
     pass "agent-wait treats a watchdog timeout as terminal (exit 3)"
 }
 
+test_agent_recover_retry_and_escalate() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-recover"
+    workspace="$(new_workspace recover)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        # A timed-out handoff from the lead (codex/s1) to a live worker (claude/s2).
+        jq -nc '{id:"hr",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["a.ts"],body:"do it",created_at:1,ttl:1}' > .agents/bus.jsonl
+        jq -nc '{id:"tor",ts:"2026-05-05T00:01:00Z",from:"watchdog",to:"codex",type:"timeout",ref:"hr",status:"blocked",paths_claimed:[],body:"stale"}' >> .agents/bus.jsonl
+
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-recover" hr)
+        printf '%s' "$out" | grep -q "retry -> claude" || fail "recover did not retry the live worker"
+        tail -n1 .agents/bus.jsonl | jq -e '.type=="handoff" and .to=="claude" and .ref=="hr" and (.body|test("^RETRY:")) and .paths_claimed==["a.ts"]' >/dev/null \
+            || fail "retry handoff not appended correctly"
+
+        # Escalation once the retry cap is reached (max-retries 0 forces it).
+        jq -nc '{id:"hr2",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"do it",created_at:1,ttl:1}' > .agents/bus.jsonl
+        jq -nc '{id:"to2",ts:"2026-05-05T00:01:00Z",from:"watchdog",to:"codex",type:"timeout",ref:"hr2",status:"blocked",paths_claimed:[],body:"stale"}' >> .agents/bus.jsonl
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-recover" --max-retries 0 hr2)
+        printf '%s' "$out" | grep -q "escalate -> user" || fail "recover did not escalate at the cap"
+        tail -n1 .agents/bus.jsonl | jq -e '.type=="block" and .to=="user" and .ref=="hr2"' >/dev/null \
+            || fail "escalation block not appended"
+    )
+
+    pass "agent-recover retries a live worker and escalates at the cap"
+}
+
+test_agent_recover_reassigns_to_live_peer() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-recover-reassign"
+    workspace="$(new_workspace recover-reassign)"
+    mkdir -p "$fakebin"
+    # s1 (lead) and s3 (peer) are live; s2 (the assigned worker) is a dead pane.
+    cat > "$fakebin/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    printf 'surface:1 s1 type=terminal in_window=true\nsurface:3 s3 type=terminal in_window=true\n'
+    exit 0
+fi
+if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
+    [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+    exit 0
+fi
+exit 0
+CMUX
+    chmod +x "$fakebin/cmux"
+
+    (
+        cd "$workspace"
+        write_agents
+        # Worker claude (s2) is dead; deepseek (s3) is a live peer to reassign to.
+        jq -nc '{id:"hr3",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["b.ts"],body:"do it",created_at:1,ttl:1}' > .agents/bus.jsonl
+        jq -nc '{id:"to3",ts:"2026-05-05T00:01:00Z",from:"watchdog",to:"codex",type:"timeout",ref:"hr3",status:"blocked",paths_claimed:[],body:"worker_dead"}' >> .agents/bus.jsonl
+
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-recover" hr3)
+        printf '%s' "$out" | grep -q "reassign -> deepseek" || fail "recover did not reassign to the live peer"
+        tail -n1 .agents/bus.jsonl | jq -e '.type=="handoff" and .to=="deepseek" and .ref=="hr3" and (.body|test("^REASSIGNED from claude:"))' >/dev/null \
+            || fail "reassign handoff not appended correctly"
+    )
+
+    pass "agent-recover reassigns a dead worker's task to a live peer"
+}
+
 test_agent_rpc_prints_response_body() {
     local fakebin workspace output
     fakebin="$tmp_root/fakebin-rpc-body"
@@ -2779,6 +2845,8 @@ test_agent_watch_clear_truncates_bus_before_snapshot
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
 test_agent_wait_treats_timeout_as_terminal
+test_agent_recover_retry_and_escalate
+test_agent_recover_reassigns_to_live_peer
 test_agent_rpc_prints_response_body
 test_agent_rpc_json_and_blocked_status
 test_agent_rpc_rejects_invalid_recipients
