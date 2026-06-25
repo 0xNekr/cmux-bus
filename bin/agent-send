@@ -236,3 +236,11 @@ while IFS= read -r recipient; do
 done <<EOF
 $recipients
 EOF
+
+# A handoff carries a lease, so from here on a worker could stall and leave the
+# delegator waiting forever. Make sure a watchdog is running for this bus — this
+# is the real guarantee: it fires on every delegation, not just when a worker is
+# first spawned (a lead spawns once but delegates many times). Idempotent.
+if [ "$type" = "handoff" ]; then
+    agent_bus_ensure_watchdog "$AGENT_BUS_DIR_EFFECTIVE" "$AGENT_BIN_DIR" >/dev/null 2>&1 || true
+fi

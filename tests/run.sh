@@ -885,6 +885,38 @@ test_agent_send_stamps_handoff_deadlines() {
     pass "agent-send stamps handoff lease deadlines"
 }
 
+test_agent_send_handoff_autostarts_watchdog() {
+    local fakebin workspace pid
+    fakebin="$tmp_root/fakebin-send-wd"
+    workspace="$(new_workspace send-wd)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        # A handoff to an existing worker (no spawn) must still start a watchdog —
+        # this is the reuse case (spawn once, delegate many) that spawn-only missed.
+        env -u AGENT_BUS_NO_WATCHDOG PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 \
+            "$repo_root/bin/agent-send" claude handoff "do the thing" >/dev/null
+        [ -f .agents/watchdog.pid ] || fail "handoff did not start a watchdog"
+        pid="$(cat .agents/watchdog.pid)"
+        kill -0 "$pid" 2>/dev/null || fail "watchdog pid not alive after handoff"
+
+        # A second handoff must not start a second daemon.
+        env -u AGENT_BUS_NO_WATCHDOG PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 \
+            "$repo_root/bin/agent-send" claude handoff "again" >/dev/null
+        [ "$(cat .agents/watchdog.pid)" = "$pid" ] || { kill "$pid" 2>/dev/null; fail "a second watchdog was started"; }
+
+        # An ask (no lease) must NOT start one once we stop this.
+        kill "$pid" 2>/dev/null; sleep 1; rm -f .agents/watchdog.pid
+        env -u AGENT_BUS_NO_WATCHDOG PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 \
+            "$repo_root/bin/agent-send" claude ask "just asking" >/dev/null
+        [ ! -f .agents/watchdog.pid ] || { kill "$(cat .agents/watchdog.pid)" 2>/dev/null; fail "an ask should not start a watchdog"; }
+    )
+
+    pass "agent-send handoff auto-starts the bus watchdog (ask does not)"
+}
+
 test_agent_send_broadcast_fanout() {
     local fakebin workspace cmux_log ids
     fakebin="$tmp_root/fakebin-send-broadcast"
@@ -2883,6 +2915,7 @@ test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal
 test_agent_send_stamps_handoff_deadlines
+test_agent_send_handoff_autostarts_watchdog
 test_agent_send_broadcast_fanout
 test_agent_send_broadcast_rejects_invalid_batch
 test_agent_send_broadcast_normalizes_recipients
