@@ -1296,6 +1296,31 @@ test_agent_watchdog_detects_dead_worker() {
     pass "agent-watchdog flags a dead worker even before the ttl expires"
 }
 
+test_agent_watchdog_releases_paths_on_worker_death() {
+    local fakebin workspace now
+    fakebin="$tmp_root/fakebin-watchdog-release"
+    workspace="$(new_workspace watchdog-release)"
+    make_fake_cmux_live_s1_only "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        now=$(date +%s)
+        jq -nc --argjson t "$now" '{id:"hr1",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["src/api.ts"],body:"task",created_at:$t,ttl:99999,ack_by:99999}' > .agents/bus.jsonl
+
+        # The claim is active while the thread is open.
+        if "$repo_root/bin/agent-guard" check --agent codex src/api.ts >/dev/null 2>&1; then
+            fail "path was not claimed while the handoff was open"
+        fi
+        # Worker pane is dead -> watchdog closes the thread, releasing the claim.
+        PATH="$fakebin:$PATH" "$repo_root/bin/agent-watchdog" scan >/dev/null
+        "$repo_root/bin/agent-guard" check --agent codex src/api.ts >/dev/null \
+            || fail "path still claimed after the worker died and the thread timed out"
+    )
+
+    pass "agent-watchdog releases path claims when a worker dies"
+}
+
 test_agent_inbox_empty_bus() {
     local workspace output
     workspace="$(new_workspace inbox-empty)"
@@ -2724,6 +2749,7 @@ test_concurrent_writes_stay_valid
 test_bus_lock_breaks_stale_holder
 test_agent_watchdog_times_out_expired_and_dead
 test_agent_watchdog_detects_dead_worker
+test_agent_watchdog_releases_paths_on_worker_death
 test_agent_inbox_empty_bus
 test_agent_cancel_and_resume_smoke
 test_agent_cancel_and_resume_negative_cases
