@@ -336,6 +336,14 @@ jq --arg n "$name" --arg p "$provider" --arg m "$meta_model" --arg by "$me" --ar
     '.meta = ((.meta // {}) + {($n): {provider:$p, model:$m, spawned_by:$by, spawned_at:$at}})' \
     "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
 
+# Now that this bus has delegated work, make sure a watchdog is running so a
+# stalled or dead worker can never leave the lead blocked forever. Idempotent —
+# starts one only if none is alive for this bus.
+if agent_bus_ensure_watchdog "$AGENT_BUS_DIR_EFFECTIVE" "$AGENT_BIN_DIR"; then
+    agent_bus_watchdog_running "$AGENT_BUS_DIR_EFFECTIVE" \
+        && echo "agent-spawn: watchdog active for this bus (timeouts will wake the lead)"
+fi
+
 # Wait for the CLI's TUI to finish drawing before we type into it: poll the
 # rendered screen until it is non-empty and stable across two reads. Set
 # AGENT_SPAWN_SETTLE=0 to skip (fast path for tests / scripted spawns).

@@ -142,6 +142,11 @@ if [ "$mode" != "single" ]; then
 
     echo "agent-dismiss: $(jq -c .agents "$AGENT_BUS_AGENTS_FILE")"
     echo "agent-dismiss: dismissed $dismissed, skipped $skipped"
+    if [ "$(jq -r '(.meta // {}) | length' "$AGENT_BUS_AGENTS_FILE" 2>/dev/null || echo 0)" = "0" ] \
+        && agent_bus_watchdog_running "$AGENT_BUS_DIR_EFFECTIVE"; then
+        agent_bus_stop_watchdog "$AGENT_BUS_DIR_EFFECTIVE"
+        echo "agent-dismiss: stopped the bus watchdog (no spawned workers left)"
+    fi
     exit 0
 fi
 
@@ -164,3 +169,8 @@ fi
 
 dismiss_one "$name"
 echo "agent-dismiss: $(jq -c .agents "$AGENT_BUS_AGENTS_FILE")"
+if [ "$(jq -r '(.meta // {}) | length' "$AGENT_BUS_AGENTS_FILE" 2>/dev/null || echo 0)" = "0" ] \
+    && agent_bus_watchdog_running "$AGENT_BUS_DIR_EFFECTIVE"; then
+    agent_bus_stop_watchdog "$AGENT_BUS_DIR_EFFECTIVE"
+    echo "agent-dismiss: stopped the bus watchdog (no spawned workers left)"
+fi

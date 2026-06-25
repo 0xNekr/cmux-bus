@@ -192,6 +192,40 @@ agent_bus_live_surfaces() {
     cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}' || true
 }
 
+# ---- Watchdog auto-activation ----
+# The watchdog only protects a lead if it is actually running. Rather than rely on
+# someone launching it by hand, a lead that delegates (agent-spawn) starts a
+# detached daemon for the bus, tracked by <bus-dir>/watchdog.pid so we never run
+# two. agent-dismiss stops it when the team is gone. Opt out with
+# AGENT_BUS_NO_WATCHDOG (used by the test suite so it doesn't fork daemons).
+
+agent_bus_watchdog_running() {
+    local pidfile="$1/watchdog.pid" pid
+    [ -f "$pidfile" ] || return 1
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+agent_bus_ensure_watchdog() {
+    local bus_dir="$1" bin_dir="$2" interval="${3:-30}"
+    [ -n "${AGENT_BUS_NO_WATCHDOG:-}" ] && return 0
+    agent_bus_watchdog_running "$bus_dir" && return 0
+    [ -x "$bin_dir/agent-watchdog" ] || return 0
+    nohup "$bin_dir/agent-watchdog" --bus-dir "$bus_dir" daemon --interval "$interval" >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$bus_dir/watchdog.pid"
+    disown 2>/dev/null || true
+    return 0
+}
+
+agent_bus_stop_watchdog() {
+    local pidfile="$1/watchdog.pid" pid
+    [ -f "$pidfile" ] || return 0
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    rm -f "$pidfile" 2>/dev/null || true
+    return 0
+}
+
 # ---- Bus lock (used by agent_bus_append_event) ----
 # The bus lock is a directory (atomic mkdir). We stamp it with the holder's
 # host+PID+epoch in an `owner` file so a *stale* lock — one left behind by a

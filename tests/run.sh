@@ -3,7 +3,10 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_root="$(mktemp -d)"
-trap 'rm -rf "$tmp_root"' EXIT
+# Clean up the scratch dir and any watchdog daemons a test may have started
+# (matched by their --bus-dir living under tmp_root), so a failed test can't leak
+# a background process.
+trap 'pkill -f "agent-watchdog --bus-dir $tmp_root" 2>/dev/null || true; rm -rf "$tmp_root"' EXIT
 
 pass_count=0
 export AGENT_BUS_SCOPE=repo
@@ -17,6 +20,9 @@ export AGENT_BUS_POLICY_FILE="$tmp_root/.no-such-policy.json"
 # resolved registry is the built-in default. Provider tests set
 # AGENT_BUS_PROVIDERS_FILE per-invocation to override this.
 export AGENT_BUS_PROVIDERS_FILE="$tmp_root/.no-such-providers.json"
+# Don't let the ordinary spawn tests fork real watchdog daemons. The dedicated
+# auto-start test re-enables it with `env -u AGENT_BUS_NO_WATCHDOG`.
+export AGENT_BUS_NO_WATCHDOG=1
 
 fail() {
     echo "not ok - $1" >&2
@@ -2321,6 +2327,38 @@ test_agent_spawn_auto_accept_permission_modes() {
     pass "agent-spawn launches workers in auto-accept by default, with opt-outs"
 }
 
+test_agent_spawn_autostarts_and_dismiss_stops_watchdog() {
+    local fakebin workspace pid
+    fakebin="$tmp_root/fakebin-wd-auto"
+    workspace="$(new_workspace wd-auto)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+
+        # Spawn with the watchdog auto-start ENABLED (the suite disables it globally).
+        env -u AGENT_BUS_NO_WATCHDOG CMUX_LOG=/dev/null AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say wd-worker >/dev/null
+        [ -f .agents/watchdog.pid ] || fail "spawn did not start a watchdog"
+        pid="$(cat .agents/watchdog.pid)"
+        kill -0 "$pid" 2>/dev/null || fail "watchdog pid is not alive after spawn"
+
+        # A second spawn must not start a second daemon (pid unchanged).
+        env -u AGENT_BUS_NO_WATCHDOG CMUX_LOG=/dev/null AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say wd-worker2 >/dev/null
+        [ "$(cat .agents/watchdog.pid)" = "$pid" ] || { kill "$pid" 2>/dev/null; fail "a second watchdog was started"; }
+
+        # Dismissing the whole team stops the watchdog and cleans the pid file.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-dismiss" --all-spawned >/dev/null
+        [ ! -f .agents/watchdog.pid ] || { kill "$pid" 2>/dev/null; fail "watchdog pid file not cleaned up on dismiss"; }
+        sleep 1
+        ! kill -0 "$pid" 2>/dev/null || { kill "$pid" 2>/dev/null; fail "watchdog still alive after dismiss"; }
+    )
+
+    pass "agent-spawn auto-starts a watchdog and agent-dismiss stops it"
+}
+
 test_agent_spawn_rejects_bad_input() {
     local fakebin workspace
     fakebin="$tmp_root/fakebin-spawn-bad"
@@ -2823,6 +2861,7 @@ test_agent_roster_shows_lead
 test_agent_spawn_opens_split_and_registers
 test_agent_spawn_model_override_and_default
 test_agent_spawn_auto_accept_permission_modes
+test_agent_spawn_autostarts_and_dismiss_stops_watchdog
 test_agent_spawn_rejects_bad_input
 test_agent_spawn_refuses_live_name_collision
 test_agent_dismiss_closes_and_deregisters

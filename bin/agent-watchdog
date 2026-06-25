@@ -190,9 +190,29 @@ EOF
 if [ "$mode" = "scan" ]; then
     run_scan
 else
+    # Self-guard: never run two daemons on one bus (they would double-emit). If a
+    # live one already owns the pid file, step aside; otherwise claim it and clean
+    # up on exit so the slot frees when we stop.
+    pidfile="$AGENT_BUS_DIR_EFFECTIVE/watchdog.pid"
+    if [ -f "$pidfile" ]; then
+        other="$(cat "$pidfile" 2>/dev/null)"
+        if [ -n "$other" ] && [ "$other" != "$$" ] && kill -0 "$other" 2>/dev/null; then
+            echo "$AGENT_CMD: another watchdog (pid $other) already runs for this bus; exiting" >&2
+            exit 0
+        fi
+    fi
+    printf '%s\n' "$$" > "$pidfile"
+    # EXIT cleans the pid file; INT/TERM must explicitly exit (a signal trap
+    # otherwise runs the handler and RESUMES the loop), which then fires EXIT.
+    trap 'rm -f "$pidfile" 2>/dev/null || true' EXIT
+    trap 'exit 0' INT TERM
     echo "$AGENT_CMD: daemon scanning every ${interval}s (Ctrl-C to stop)"
     while :; do
         run_scan || echo "$AGENT_CMD: scan pass failed, continuing" >&2
-        sleep "$interval"
+        # Sleep in the background and wait on it so a SIGTERM/INT fires the trap
+        # immediately instead of being deferred until a foreground sleep returns
+        # (otherwise stopping the daemon would hang for up to one interval).
+        sleep "$interval" &
+        wait "$!"
     done
 fi

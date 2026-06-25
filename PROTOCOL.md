@@ -391,6 +391,11 @@ Three pieces make that true:
      which releases the worker's `paths_claimed` and unblocks any `agent-wait`.
    - The daemon is a single point of failure: if it dies, no timeouts surface.
      So waits must also be **bounded** — never rely on the watchdog alone.
+   - **Auto-activated:** `agent-spawn` starts a detached daemon for the bus the
+     first time a lead delegates (idempotent via `<bus-dir>/watchdog.pid`), and
+     `agent-dismiss` stops it once no spawned workers remain. So a lead that
+     delegates is protected without launching anything by hand. Opt out with
+     `AGENT_BUS_NO_WATCHDOG=1`.
 
 3. **Bounded waits.** `agent-wait` / `agent-rpc` always have a deadline and
    treat a `timeout` event as terminal, exiting **3** (distinct from a real
