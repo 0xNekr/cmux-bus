@@ -2275,6 +2275,49 @@ test_agent_spawn_model_override_and_default() {
     pass "agent-spawn honors --model override, the default sentinel, and --no-say"
 }
 
+test_agent_spawn_auto_accept_permission_modes() {
+    local fakebin workspace log
+    fakebin="$tmp_root/fakebin-spawn-perm"
+    workspace="$(new_workspace spawn-perm)"
+    log="$tmp_root/spawn-perm.log"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+
+        # Default: codex launches auto-accept (sandboxed, no human prompts) — NOT yolo.
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say worker-auto >/dev/null
+        grep -q 'codex --model gpt-5.4 --sandbox workspace-write --ask-for-approval never' "$log" \
+            || fail "codex did not launch in auto-accept by default"
+        ! grep -q 'dangerously-bypass' "$log" || fail "default codex should not be a full bypass"
+
+        # --interactive keeps normal prompting (no auto flags appended).
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --interactive --no-say worker-int >/dev/null
+        grep -q 'codex --model gpt-5.4' "$log" || fail "interactive codex lost its model"
+        ! grep -q 'ask-for-approval' "$log" || fail "interactive codex should not auto-accept"
+
+        # --yolo opts into full bypass explicitly.
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --yolo --no-say worker-yolo >/dev/null
+        grep -q 'codex --model gpt-5.4 --dangerously-bypass-approvals-and-sandbox' "$log" \
+            || fail "--yolo did not pass the full-bypass flag"
+
+        # claude auto-accepts via acceptEdits.
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as claude --no-say worker-cl >/dev/null
+        grep -q 'permission-mode acceptEdits' "$log" || fail "claude did not launch in acceptEdits"
+    )
+
+    pass "agent-spawn launches workers in auto-accept by default, with opt-outs"
+}
+
 test_agent_spawn_rejects_bad_input() {
     local fakebin workspace
     fakebin="$tmp_root/fakebin-spawn-bad"
@@ -2776,6 +2819,7 @@ test_agent_init_clears_purged_lead
 test_agent_roster_shows_lead
 test_agent_spawn_opens_split_and_registers
 test_agent_spawn_model_override_and_default
+test_agent_spawn_auto_accept_permission_modes
 test_agent_spawn_rejects_bad_input
 test_agent_spawn_refuses_live_name_collision
 test_agent_dismiss_closes_and_deregisters

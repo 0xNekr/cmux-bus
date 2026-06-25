@@ -52,7 +52,13 @@ usage: agent-spawn [--scope repo|workspace] [--bus-dir DIR] \\
   --paths "a,b"     paths_claimed for --task (passed through to agent-send)
   --say TEXT        custom onboarding message (default: a generic orientation)
   --no-say          do not send any onboarding message (spawn bare)
+  --interactive     keep the CLI's normal permission prompting (disable auto-accept)
+  --no-auto         alias for --interactive
+  --yolo            full permission bypass (DANGEROUS; opt-in, not the default)
   --ready-timeout N seconds to wait for registration / pane readiness [default: 25]
+
+  By default a worker launches in AUTO-ACCEPT: it acts within its workspace
+  without prompting a human for basic edits/commands, but it is not a full bypass.
 
   Models default per provider via the registry; override the registry with a
   config file (see 'agent-providers init').
@@ -83,10 +89,14 @@ tab_title=""
 title_set=0
 no_rename=0
 ready_timeout=25
+perm_mode="auto"
 args=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --as)            [ $# -ge 2 ] || usage; provider="$2"; shift;;
+        --interactive)   perm_mode="interactive";;
+        --no-auto)       perm_mode="interactive";;
+        --yolo)          perm_mode="yolo";;
         --as=*)          provider="${1#--as=}";;
         --model)         [ $# -ge 2 ] || usage; model="$2"; shift;;
         --model=*)       model="${1#--model=}";;
@@ -204,6 +214,36 @@ elif [ "$model_style" = "opencode" ]; then
 else
     launch_cmd="$launch ${model_flag:+$model_flag }$(printf '%q' "$model")"
 fi
+
+# Permission posture. By default a spawned worker runs in AUTO-ACCEPT: it may
+# read/edit/run within its workspace without prompting a human for every basic
+# action, but it is NOT a full bypass ("yolo"). --interactive/--no-auto keeps the
+# CLI's normal prompting; --yolo opts into full bypass explicitly. The flags are
+# appended after the model so they never disturb the "<launch> <model>" prefix
+# that the rest of the tooling (and tests) match on.
+perm_suffix=""
+case "$base_cmd" in
+    claude)
+        case "$perm_mode" in
+            auto)        perm_suffix="--permission-mode acceptEdits";;
+            yolo)        perm_suffix="--permission-mode bypassPermissions";;
+            interactive) perm_suffix="";;
+        esac
+        ;;
+    codex)
+        case "$perm_mode" in
+            auto)        perm_suffix="--sandbox workspace-write --ask-for-approval never";;
+            yolo)        perm_suffix="--dangerously-bypass-approvals-and-sandbox";;
+            interactive) perm_suffix="";;
+        esac
+        ;;
+    *)
+        # opencode and any other provider: no known non-interactive flag, so leave
+        # the launch untouched regardless of mode.
+        perm_suffix=""
+        ;;
+esac
+[ -n "$perm_suffix" ] && launch_cmd="$launch_cmd $perm_suffix"
 
 # Bus scope flags to forward — to the child's agent-init (so it lands on THIS
 # bus) and to our own agent-send for --task. Workspace scope needs nothing (same
