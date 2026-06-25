@@ -80,14 +80,18 @@ agent_bus_set_paths
 agent_bus_need_existing
 agent_bus_need_agents
 
-# Emit one compact JSON line per ACTIVE open handoff thread, with the timing
-# verdict. Liveness (pane death) is decided in bash below, since it needs cmux.
+# Emit one TSV row per ACTIVE open handoff thread, with the timing verdict and
+# the delegator/worker surfaces resolved here (agents.json is a second jq input)
+# so the bash loop below forks no jq per candidate. Liveness (pane death) is still
+# decided in bash, since it needs cmux. Columns:
+#   root  delegator  delegator_surface  worker  worker_surface  reason
 scan_candidates() {
     local now
     now="$(date +%s)"
-    jq -Rsc --argjson now "$now" '
-        def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
-        split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events
+    jq -Rsr --slurpfile agents "$AGENT_BUS_AGENTS_FILE" --argjson now "$now" '
+        def root($m;$e): if ($e.ref==null or ($m[$e.ref]==null)) then $e.id else root($m;$m[$e.ref]) end;
+        ($agents[0].agents // {}) as $surf
+        | split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events
         | ($events | map({key:.id,value:.}) | from_entries) as $m
         | ($events | map(. + {__root: root($m;.)}))
         | group_by(.__root)[]
@@ -102,7 +106,8 @@ scan_candidates() {
         | (if ($acked | not) and $ack_deadline != null and $now >= $ack_deadline then "no_ack"
            elif $now >= $ttl_deadline then (if $acked then "stale_ack" else "stale" end)
            else "none" end) as $reason
-        | {root: $rootev.id, delegator: $rootev.from, worker: $rootev.to, reason: $reason, acked: $acked}
+        | [$rootev.id, $rootev.from, ($surf[$rootev.from] // ""), $rootev.to, ($surf[$rootev.to] // ""), $reason]
+        | @tsv
     ' "$AGENT_BUS_FILE"
 }
 
@@ -133,20 +138,17 @@ run_scan() {
     emitted=0
 
     # Snapshot live surfaces once per pass (closed panes disappear from health).
-    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}' || true)
+    live=$(agent_bus_live_surfaces)
 
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        local root delegator worker reason worker_surface action id
-        root=$(printf '%s' "$line" | jq -r '.root')
-        delegator=$(printf '%s' "$line" | jq -r '.delegator')
-        worker=$(printf '%s' "$line" | jq -r '.worker')
-        reason=$(printf '%s' "$line" | jq -r '.reason')
+    # scan_candidates emits TSV with surfaces already resolved, so this loop forks
+    # no jq per candidate.
+    while IFS=$'\t' read -r root delegator deleg_surface worker worker_surface reason; do
+        [ -n "$root" ] || continue
+        local action id
 
         # Decide the action: a dead worker pane trumps a time-based verdict, since
         # a gone worker will never finish regardless of how much ttl is left.
         action=""
-        worker_surface=$(jq -r --arg n "$worker" '.agents[$n] // empty' "$AGENT_BUS_AGENTS_FILE")
         if [ -n "$worker_surface" ] && [ -n "$live" ] && ! printf '%s\n' "$live" | grep -qxF "$worker_surface"; then
             action="worker_dead"
         elif [ "$reason" != "none" ]; then
@@ -155,7 +157,7 @@ run_scan() {
         [ -n "$action" ] || continue
 
         id=$(emit_timeout "$root" "$delegator" "$worker" "$action")
-        printf '%s\t%s\n' "$delegator" "$id" >> "$signal_log"
+        printf '%s\t%s\t%s\n' "$delegator" "$deleg_surface" "$id" >> "$signal_log"
         emitted=$((emitted + 1))
         echo "$AGENT_CMD: timed out thread $root ($action), notified $delegator [$id]"
     done <<EOF
@@ -163,15 +165,16 @@ $(scan_candidates)
 EOF
 
     # Batch the wake-ups: one signal per delegator, even if several of its threads
-    # expired this pass, so a delegator is never flooded.
+    # expired this pass, so a delegator is never flooded. The delegator surface is
+    # already in the signal log, so no jq here either.
     if [ "$emitted" -gt 0 ]; then
-        local d count first
+        local d count first surface extra
         for d in $(cut -f1 "$signal_log" | sort -u); do
             [ "$d" = "user" ] && continue
             count=$(awk -F'\t' -v d="$d" '$1==d {n++} END{print n+0}' "$signal_log")
-            first=$(awk -F'\t' -v d="$d" '$1==d {print $2; exit}' "$signal_log")
-            local surface extra=""
-            surface=$(jq -r --arg n "$d" '.agents[$n] // empty' "$AGENT_BUS_AGENTS_FILE")
+            first=$(awk -F'\t' -v d="$d" '$1==d {print $3; exit}' "$signal_log")
+            surface=$(awk -F'\t' -v d="$d" '$1==d {print $2; exit}' "$signal_log")
+            extra=""
             [ "$count" -gt 1 ] && extra=" (+$((count - 1)) more)"
             if [ -n "$surface" ]; then
                 cmux send --surface "$surface" "new timeout id=$first from=watchdog$extra" >/dev/null 2>&1 || true

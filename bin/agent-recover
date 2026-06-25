@@ -71,7 +71,7 @@ agent_bus_export_env
 
 # Reconstruct the thread and pull the root handoff plus the attempt count.
 thread=$(jq -Rsc --arg ref "$ref" '
-    def root($m;$e): if $e.ref==null then $e.id else root($m;$m[$e.ref]) end;
+    def root($m;$e): if ($e.ref==null or ($m[$e.ref]==null)) then $e.id else root($m;$m[$e.ref]) end;
     split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events
     | ($events | map({key:.id,value:.}) | from_entries) as $m
     | if $m[$ref] == null then null
@@ -80,28 +80,25 @@ thread=$(jq -Rsc --arg ref "$ref" '
         | ($evs[0]) as $rootev
         | {root: $rootev.id, delegator: $rootev.from, worker: $rootev.to,
            body: $rootev.body, paths: ($rootev.paths_claimed // []),
-           handoffs: ($evs | map(select(.type=="handoff")) | length),
+           attempts: (($evs | map(select(.type=="handoff")) | length) - 1),
            last_type: ($evs[-1].type), last_status: ($evs[-1].status)}
       end
 ' "$AGENT_BUS_FILE")
 
 [ "$thread" != null ] && [ -n "$thread" ] || { echo "$AGENT_CMD: unknown thread '$ref'" >&2; exit 1; }
 
-root=$(printf '%s' "$thread" | jq -r '.root')
-delegator=$(printf '%s' "$thread" | jq -r '.delegator')
-worker=$(printf '%s' "$thread" | jq -r '.worker')
+# Destructure the tab-free scalar fields in one jq pass; body may contain tabs or
+# newlines, so pull it on its own.
+IFS=$'\t' read -r root delegator worker attempts last_type < <(printf '%s' "$thread" | jq -r '[.root,.delegator,.worker,.attempts,.last_type]|@tsv')
 body=$(printf '%s' "$thread" | jq -r '.body')
-attempts=$(( $(printf '%s' "$thread" | jq -r '.handoffs') - 1 ))
-[ "$attempts" -ge 0 ] || attempts=0
 paths_csv=$(printf '%s' "$thread" | jq -r '.paths | join(",")')
 
-last_type=$(printf '%s' "$thread" | jq -r '.last_type')
 if [ "$last_type" != "timeout" ]; then
     echo "$AGENT_CMD: warning: thread $root is not currently timed out (last event: $last_type)" >&2
 fi
 
 # Live peers (alive panes), excluding the delegator and the failed worker.
-live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}' || true)
+live=$(agent_bus_live_surfaces)
 is_live() {
     local name="$1" surface
     surface=$(jq -r --arg n "$name" '.agents[$n] // empty' "$AGENT_BUS_AGENTS_FILE")
@@ -120,9 +117,8 @@ first_live_peer() {
     return 0
 }
 
-# Decide the next step.
-action=""
-target=""
+# Decide the next step. Every branch assigns action (and target where it is used),
+# so no initialization is needed.
 if [ "$attempts" -ge "$max_retries" ]; then
     action="escalate"
 elif [ "$attempts" -eq 0 ] && is_live "$worker"; then

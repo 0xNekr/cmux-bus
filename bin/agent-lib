@@ -183,6 +183,15 @@ agent_bus_need_agents() {
     }
 }
 
+# Snapshot the set of live terminal surfaces, one per line. Closed panes drop out
+# of surface-health; a backgrounded-but-alive pane stays — do NOT filter on
+# in_window=true, which only marks the focused workspace and would make alive
+# peers in other workspaces look dead. Shared by every command that probes peer
+# liveness (agent-send, agent-spawn, agent-watchdog, agent-recover, ...).
+agent_bus_live_surfaces() {
+    cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}' || true
+}
+
 # ---- Bus lock (used by agent_bus_append_event) ----
 # The bus lock is a directory (atomic mkdir). We stamp it with the holder's
 # host+PID+epoch in an `owner` file so a *stale* lock — one left behind by a

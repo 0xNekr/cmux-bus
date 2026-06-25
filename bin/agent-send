@@ -195,8 +195,8 @@ created_at=$(date +%s)
 ttl_json='null'
 ack_by_json='null'
 if [ "$type" = "handoff" ]; then
-    ttl_json="${ttl:-300}"
-    ack_by_json="${ack_by:-45}"
+    ttl_json="${ttl:-${AGENT_BUS_HANDOFF_TTL:-300}}"
+    ack_by_json="${ack_by:-${AGENT_BUS_HANDOFF_ACK_BY:-45}}"
 else
     [ -n "$ttl" ] && ttl_json="$ttl"
     [ -n "$ack_by" ] && ack_by_json="$ack_by"
