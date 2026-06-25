@@ -787,7 +787,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
+    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-watchdog agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -1243,6 +1243,57 @@ test_bus_lock_breaks_stale_holder() {
     )
 
     pass "bus lock breaks a stale holder instead of deadlocking"
+}
+
+test_agent_watchdog_times_out_expired_and_dead() {
+    local fakebin workspace cmux_log past
+    fakebin="$tmp_root/fakebin-watchdog"
+    workspace="$(new_workspace watchdog)"
+    cmux_log="$tmp_root/cmux-watchdog.log"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        past=$(( $(date +%s) - 1000 ))
+        # An old handoff from the lead (codex -> s1) to a LIVE worker (claude -> s2),
+        # ttl long expired and never acked.
+        jq -nc --argjson t "$past" '{id:"hs1",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["x.ts"],cwd:".",body:"old task",created_at:$t,ttl:60,ack_by:30}' > .agents/bus.jsonl
+
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" "$repo_root/bin/agent-watchdog" scan >/dev/null
+        jq -s -e 'map(select(.type=="timeout")) as $t | ($t|length)==1 and $t[0].to=="codex" and $t[0].ref=="hs1" and $t[0].status=="blocked"' .agents/bus.jsonl >/dev/null \
+            || fail "watchdog did not emit one timeout for the expired thread"
+        grep -q "send --surface s1 new timeout id=" "$cmux_log" || fail "watchdog did not signal the delegator"
+
+        # Idempotent: a second scan must not add another timeout (thread now closed).
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" "$repo_root/bin/agent-watchdog" scan >/dev/null
+        [ "$(jq -s 'map(select(.type=="timeout")) | length' .agents/bus.jsonl)" = "1" ] || fail "watchdog double-timed-out a thread"
+    )
+
+    pass "agent-watchdog times out an expired thread once and wakes the delegator"
+}
+
+test_agent_watchdog_detects_dead_worker() {
+    local fakebin workspace cmux_log now
+    fakebin="$tmp_root/fakebin-watchdog-dead"
+    workspace="$(new_workspace watchdog-dead)"
+    cmux_log="$tmp_root/cmux-watchdog-dead.log"
+    # Only s1 is live; claude (s2) is a dead pane.
+    make_fake_cmux_live_s1_only "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        now=$(date +%s)
+        # A fresh handoff well within its ttl, so only liveness can trip it.
+        jq -nc --argjson t "$now" '{id:"hd1",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],cwd:".",body:"task",created_at:$t,ttl:99999,ack_by:99999}' > .agents/bus.jsonl
+
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" "$repo_root/bin/agent-watchdog" scan >/dev/null
+        jq -s -e 'map(select(.type=="timeout")) as $t | ($t|length)==1 and $t[0].to=="codex" and ($t[0].body | test("worker_dead"))' .agents/bus.jsonl >/dev/null \
+            || fail "watchdog did not flag the dead worker"
+    )
+
+    pass "agent-watchdog flags a dead worker even before the ttl expires"
 }
 
 test_agent_inbox_empty_bus() {
@@ -2648,6 +2699,8 @@ test_agent_done_routes_to_delegator_after_own_ack
 test_agent_done_rejects_unknown_id
 test_concurrent_writes_stay_valid
 test_bus_lock_breaks_stale_holder
+test_agent_watchdog_times_out_expired_and_dead
+test_agent_watchdog_detects_dead_worker
 test_agent_inbox_empty_bus
 test_agent_cancel_and_resume_smoke
 test_agent_cancel_and_resume_negative_cases
