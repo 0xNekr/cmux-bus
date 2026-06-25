@@ -221,6 +221,15 @@ fi
 # CLI's normal prompting; --yolo opts into full bypass explicitly. The flags are
 # appended after the model so they never disturb the "<launch> <model>" prefix
 # that the rest of the tooling (and tests) match on.
+#
+# codex's workspace-write sandbox confines writes to the workspace cwd — but the
+# bus (and the cmux socket used to signal peers) live under the state home,
+# OUTSIDE the workspace. Without granting that, a sandboxed worker silently can't
+# post ack/done (agent-* fails) and the lead waits forever. So in auto mode we add
+# the cmux state home (covers the workspace-scope bus + the cmux socket) and the
+# resolved bus dir as writable roots. Network stays sandboxed — that is not
+# "basic" access; use --yolo for tasks that need it (git push, npm install).
+state_home="$(agent_bus_state_home 2>/dev/null || printf '%s' "$HOME/.local/state")"
 perm_suffix=""
 case "$base_cmd" in
     claude)
@@ -232,7 +241,7 @@ case "$base_cmd" in
         ;;
     codex)
         case "$perm_mode" in
-            auto)        perm_suffix="--sandbox workspace-write --ask-for-approval never";;
+            auto)        perm_suffix="--sandbox workspace-write --ask-for-approval never --add-dir $(printf '%q' "$state_home") --add-dir $(printf '%q' "$AGENT_BUS_DIR_EFFECTIVE")";;
             yolo)        perm_suffix="--dangerously-bypass-approvals-and-sandbox";;
             interactive) perm_suffix="";;
         esac

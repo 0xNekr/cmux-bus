@@ -420,3 +420,10 @@ every action, `agent-spawn` launches it in **auto-accept** by default (claude
 `--permission-mode acceptEdits`, codex `--sandbox workspace-write
 --ask-for-approval never`) — sandboxed, not a full bypass. `--interactive`
 keeps normal prompting; `--yolo` opts into full bypass explicitly.
+
+codex's `workspace-write` sandbox confines writes to the workspace cwd, but the
+bus and the cmux socket live under the state home **outside** it — so auto-accept
+also passes `--add-dir <state-home> --add-dir <bus-dir>`, otherwise a sandboxed
+worker silently can't post `ack`/`done` and the lead waits forever. Network stays
+sandboxed (that isn't "basic" access); tasks that need it — `git push`,
+`npm install` — require `--yolo`.

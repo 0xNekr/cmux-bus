@@ -2293,6 +2293,9 @@ test_agent_spawn_auto_accept_permission_modes() {
         grep -q 'codex --model gpt-5.4 --sandbox workspace-write --ask-for-approval never' "$log" \
             || fail "codex did not launch in auto-accept by default"
         ! grep -q 'dangerously-bypass' "$log" || fail "default codex should not be a full bypass"
+        # Auto-accept codex must be granted the bus/socket state home so it can
+        # post ack/done — otherwise the workspace-write sandbox blocks the bus.
+        grep -q -- '--add-dir' "$log" || fail "auto codex did not get the bus dir as a writable root"
 
         # --interactive keeps normal prompting (no auto flags appended).
         : > "$log"
