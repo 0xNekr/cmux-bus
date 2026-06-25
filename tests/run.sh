@@ -11,6 +11,12 @@ export AGENT_BUS_SCOPE=repo
 # path that never exists, so the resolved policy is the built-in "open". Policy
 # tests set AGENT_BUS_POLICY_FILE per-invocation to override this.
 export AGENT_BUS_POLICY_FILE="$tmp_root/.no-such-policy.json"
+# Likewise isolate the provider registry: without this the suite reads the real
+# user providers.json (~/.config/cmux-bus/providers.json), so a customized launch
+# line silently breaks the spawn tests. Pin it to a path that never exists so the
+# resolved registry is the built-in default. Provider tests set
+# AGENT_BUS_PROVIDERS_FILE per-invocation to override this.
+export AGENT_BUS_PROVIDERS_FILE="$tmp_root/.no-such-providers.json"
 
 fail() {
     echo "not ok - $1" >&2
