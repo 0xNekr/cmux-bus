@@ -1881,6 +1881,29 @@ test_agent_wait_timeout_and_unknown_id() {
     pass "agent-wait times out and rejects unknown ids"
 }
 
+test_agent_wait_treats_timeout_as_terminal() {
+    local workspace rc out
+    workspace="$(new_workspace wait-timeout-event)"
+
+    (
+        cd "$workspace"
+        write_agents
+        # An open handoff plus a watchdog timeout closing it. agent-wait must stop
+        # immediately with exit 3 even though the caller asked for 'done'.
+        jq -nc '{id:"hw1",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"task",created_at:1,ttl:1}' > .agents/bus.jsonl
+        jq -nc '{id:"to1",ts:"2026-05-05T00:01:00Z",from:"watchdog",to:"codex",type:"timeout",ref:"hw1",status:"blocked",paths_claimed:[],body:"stale"}' >> .agents/bus.jsonl
+
+        set +e
+        out="$("$repo_root/bin/agent-wait" --timeout 2 --status done hw1 2>/dev/null)"
+        rc=$?
+        set -e
+        [ "$rc" -eq 3 ] || fail "agent-wait did not exit 3 on a timeout event (got $rc)"
+        printf '%s' "$out" | jq -e '.type == "timeout"' >/dev/null || fail "agent-wait did not print the timeout event"
+    )
+
+    pass "agent-wait treats a watchdog timeout as terminal (exit 3)"
+}
+
 test_agent_rpc_prints_response_body() {
     local fakebin workspace output
     fakebin="$tmp_root/fakebin-rpc-body"
@@ -2729,6 +2752,7 @@ test_agent_watch_accepts_no_color
 test_agent_watch_clear_truncates_bus_before_snapshot
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
+test_agent_wait_treats_timeout_as_terminal
 test_agent_rpc_prints_response_body
 test_agent_rpc_json_and_blocked_status
 test_agent_rpc_rejects_invalid_recipients

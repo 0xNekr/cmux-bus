@@ -106,13 +106,21 @@ while :; do
         exit 1
     }
     status="$(printf '%s' "$last" | jq -r .status)"
+    ltype="$(printf '%s' "$last" | jq -r .type)"
+    # A watchdog timeout is terminal for ANY target: the thread was abandoned, so a
+    # waiter (even one asking specifically for 'done') must stop instead of blocking
+    # to its own deadline. Exit 3 marks "timed out" distinctly from done/blocked.
+    if [ "$ltype" = "timeout" ]; then
+        printf '%s\n' "$last"
+        exit 3
+    fi
     if matches_target "$status"; then
         printf '%s\n' "$last"
         exit 0
     fi
     if [ "$(date +%s)" -ge "$deadline" ]; then
         echo "agent-wait: timed out waiting for '$id' to reach $target_status (last status: $status)" >&2
-        exit 1
+        exit 3
     fi
     sleep "$interval"
 done
