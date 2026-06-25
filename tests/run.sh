@@ -845,6 +845,40 @@ test_agent_send_peer_paths_status_and_signal() {
     pass "agent-send records paths/status and signals peer"
 }
 
+test_agent_send_stamps_handoff_deadlines() {
+    local fakebin workspace cmux_log hid aid
+    fakebin="$tmp_root/fakebin-send-ttl"
+    workspace="$(new_workspace send-ttl)"
+    cmux_log="$tmp_root/cmux-send-ttl.log"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        # A handoff gets default lease deadlines (ttl/ack_by/created_at).
+        hid=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff "default lease")
+        jq -s -e --arg id "$hid" '
+            (map(select(.id == $id)) | .[0]) as $e
+            | $e.ttl == 300 and $e.ack_by == 45 and ($e.created_at | type == "number")
+        ' .agents/bus.jsonl >/dev/null || fail "handoff missing default lease deadlines"
+
+        # Explicit overrides are honored.
+        hid=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff --ttl 120 --ack-by 10 "tight lease")
+        jq -s -e --arg id "$hid" 'map(select(.id == $id)) | .[0] | .ttl == 120 and .ack_by == 10' .agents/bus.jsonl >/dev/null || fail "handoff did not honor --ttl/--ack-by"
+
+        # A non-handoff stays deadline-free unless asked.
+        aid=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude ask "no lease")
+        jq -s -e --arg id "$aid" 'map(select(.id == $id)) | .[0] | (has("ttl") | not) and (has("ack_by") | not)' .agents/bus.jsonl >/dev/null || fail "ask should not carry a lease"
+
+        # A bad value is rejected.
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff --ttl abc "bad" >/dev/null 2>&1; then
+            fail "agent-send accepted a non-numeric --ttl"
+        fi
+    )
+
+    pass "agent-send stamps handoff lease deadlines"
+}
+
 test_agent_send_broadcast_fanout() {
     local fakebin workspace cmux_log ids
     fakebin="$tmp_root/fakebin-send-broadcast"
@@ -2597,6 +2631,7 @@ test_agent_lead_guard_install_merges_settings
 test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal
+test_agent_send_stamps_handoff_deadlines
 test_agent_send_broadcast_fanout
 test_agent_send_broadcast_rejects_invalid_batch
 test_agent_send_broadcast_normalizes_recipients

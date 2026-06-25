@@ -245,12 +245,17 @@ agent_bus_append_event() {
         and (.ts | type == "string")
         and (.from | type == "string")
         and (.to | type == "string")
-        and (.type | IN("ask","handoff","done","block","ack"))
+        and (.type | IN("ask","handoff","done","block","ack","timeout","reassigned"))
         and ((.ref == null) or (.ref | type == "string"))
         and (.status | IN("open","in_progress","done","blocked"))
         and (.paths_claimed | type == "array")
         and ((.cwd == null) or (.cwd | type == "string"))
         and (.body | type == "string")
+        and ((.ttl == null) or (.ttl | type == "number"))
+        and ((.ack_by == null) or (.ack_by | type == "number"))
+        and ((.created_at == null) or (.created_at | type == "number"))
+        and ((.stale_after == null) or (.stale_after | type == "number"))
+        and ((.hard_deadline == null) or (.hard_deadline | type == "number"))
     ' >/dev/null || {
         echo "${AGENT_CMD}: generated event does not match the bus schema" >&2
         exit 1

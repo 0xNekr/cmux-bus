@@ -24,6 +24,9 @@ usage: agent-send [--scope repo|workspace] [--bus-dir DIR] <to> <type> [flags] <
   --ref ID         parent event id (chains the thread)
   --paths "p1,p2"  comma-separated paths_claimed
   --status STATUS  open | in_progress | done | blocked (default: type-derived)
+  --ttl SEC        work deadline in seconds (handoff default 300); the watchdog
+                   times the thread out and wakes the delegator past it
+  --ack-by SEC     ack window in seconds (handoff default 45)
 
 prints new event id(s) on stdout, one per line
 EOF
@@ -59,16 +62,26 @@ fi
 ref=""
 paths_csv=""
 status=""
+ttl=""
+ack_by=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --ref)    ref="$2"; shift 2;;
         --paths)  paths_csv="$2"; shift 2;;
         --status) status="$2"; shift 2;;
+        --ttl)    ttl="$2"; shift 2;;
+        --ack-by) ack_by="$2"; shift 2;;
         --)       shift; break;;
         --*)      echo "agent-send: unknown flag '$1'" >&2; exit 1;;
         *)        break;;
     esac
+done
+
+for _n in ttl ack_by; do
+    _v="${!_n}"
+    [ -z "$_v" ] && continue
+    case "$_v" in ''|*[!0-9]*) echo "agent-send: --${_n//_/-} must be a non-negative integer (seconds)" >&2; exit 1;; esac
 done
 
 [ $# -ge 1 ] || { echo "agent-send: missing body" >&2; exit 1; }
@@ -174,6 +187,21 @@ fi
 ref_json='null'
 [ -n "$ref" ] && ref_json=$(jq -nc --arg r "$ref" '$r')
 
+# Lease deadlines. A handoff carries a TTL (work deadline) and an ack window so
+# the watchdog can time it out and wake the delegator if the worker never acks or
+# never finishes. Defaults apply to handoffs only; other event types stay
+# deadline-free unless the caller passes them explicitly. created_at anchors both.
+created_at=$(date +%s)
+ttl_json='null'
+ack_by_json='null'
+if [ "$type" = "handoff" ]; then
+    ttl_json="${ttl:-300}"
+    ack_by_json="${ack_by:-45}"
+else
+    [ -n "$ttl" ] && ttl_json="$ttl"
+    [ -n "$ack_by" ] && ack_by_json="$ack_by"
+fi
+
 while IFS= read -r recipient; do
     [ -n "$recipient" ] || continue
     id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
@@ -189,7 +217,12 @@ while IFS= read -r recipient; do
         --arg status "$status" \
         --argjson paths_claimed "$paths_json" \
         --arg body "$body" \
-        '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, cwd:$cwd, body:$body}')
+        --argjson created_at "$created_at" \
+        --argjson ttl "$ttl_json" \
+        --argjson ack_by "$ack_by_json" \
+        '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, cwd:$cwd, body:$body}
+         + (if $ttl != null then {ttl:$ttl, created_at:$created_at} else {} end)
+         + (if $ack_by != null then {ack_by:$ack_by} else {} end)')
 
     agent_bus_append_event "$event"
 
