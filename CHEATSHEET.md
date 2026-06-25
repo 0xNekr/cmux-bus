@@ -145,7 +145,24 @@ agent-playbook run <name> [K=V] # workflow JSON (send/wait/rpc + interpolation)
 ```sh
 agent-cancel <id> [reason]      # abandonne un thread (block vers user)
 agent-resume <id> [body]        # relance un thread bloqué/crashé vers son destinataire
+agent-recover <id> [--max-retries N] [--dry-run]
+#   → cascade auto après un timeout : retry (même worker) → reassign (autre peer)
+#     → escalate (block vers user). Plafonné, ne boucle jamais.
 ```
+
+---
+
+## ⏱️ Anti-blocage (watchdog & lease)
+
+```sh
+agent-send X handoff --ttl 300 --ack-by 45 "..."  # un handoff = un bail (défauts 300/45s)
+agent-watchdog scan                  # une passe : time-out les threads morts/expirés, réveille le lead
+agent-watchdog daemon --interval 30  # boucle ; émet un event `timeout` (status blocked) au délégateur
+agent-wait <id>                      # borné ; sort en code 3 si le thread a timeout
+```
+> Principe : le lead attend le **bus**, jamais le worker. Le réveil vient d'un
+> timer indépendant (le watchdog), donc un worker mort ne bloque jamais le lead.
+> Le `timeout` clôt le thread → libère ses `paths_claimed` et débloque `agent-wait`.
 
 ---
 
@@ -202,8 +219,10 @@ agent-synthesize $ids
 ## 📋 Aide-mémoire schéma d'événement
 
 ```json
-{ "id","ts","from","to","type","ref","status","paths_claimed","cwd","body" }
+{ "id","ts","from","to","type","ref","status","paths_claimed","cwd","body",
+  "created_at","ttl","ack_by" }   // 3 derniers = bail (handoffs)
 ```
+`type` : `ask | handoff | ack | done | block | timeout | reassigned`.
 État d'un thread = **dernier** événement de sa chaîne (`ref`). Le bus est append-only.
 
 > Toute commande accepte `--scope repo|workspace` et `--bus-dir DIR`.

@@ -55,14 +55,23 @@ the repo-scoped thread first.
   "ts":             "ISO-8601 UTC",
   "from":           "agent name",
   "to":             "agent name (or 'user')",
-  "type":           "ask|handoff|done|block|ack",
+  "type":           "ask|handoff|done|block|ack|timeout|reassigned",
   "ref":            "id of parent event, or null",
   "status":         "open|in_progress|done|blocked",
   "paths_claimed":  ["glob", ...],
   "cwd":            "sender working directory",
-  "body":           "free text"
+  "body":           "free text",
+
+  "created_at":     "epoch seconds (handoffs) — anchors the lease",
+  "ttl":            "work-deadline seconds (handoffs, default 300)",
+  "ack_by":         "ack-window seconds (handoffs, default 45)"
 }
 ```
+
+The last three are **lease** fields, optional and numeric. `agent-send`
+stamps them on every `handoff` (defaults `ttl=300`, `ack_by=45`) so the
+watchdog can time the thread out; other event types omit them unless passed
+explicitly with `--ttl` / `--ack-by`.
 
 The bus is **append-only**: `status` is *declared* by an event, not mutated
 on prior events. The effective state of a thread is the **last** event whose
@@ -79,6 +88,10 @@ partial JSON into `bus.jsonl`.
 - `ack` — acknowledge receipt; declares `in_progress`
 - `done` — close a thread with the result
 - `block` — escalate to user when stuck
+- `timeout` — emitted by `agent-watchdog` when a handoff's worker died or its
+  lease expired; addressed to the delegator, `status=blocked` (so it closes the
+  thread, releases its path claims, and unblocks any `agent-wait` on it)
+- `reassigned` — reserved marker for recovery bookkeeping
 
 When `ref` is not `null`, it must point to an existing event id in the
 same `bus.jsonl`. Writers should refuse orphan references.
@@ -350,3 +363,60 @@ Manual cleanup of an arbitrary thread is also possible with
 - `agent-done` if **you** are completing or accepting the close
 - `agent-cancel` if **the work is dropped** and should be escalated/audited
 - `agent-resume` if **the work should be retried** by the original peer
+
+## Watchdog & lease deadlines
+
+The stuck heuristic above is passive — it only shows up if someone runs
+`agent-inbox`. The **watchdog** is the active guarantee that a lead is never
+blocked forever waiting on a worker. The rule it enforces:
+
+> A lead waits on the **bus**, never directly on a worker. Its wake-up must come
+> from a source independent of the worker, because the worker may be dead.
+
+Three pieces make that true:
+
+1. **Lease on every handoff.** `agent-send … handoff` stamps `created_at`,
+   `ttl` (work deadline, default 300s) and `ack_by` (ack window, default 45s).
+   A handoff is a *lease*, not an open-ended wait.
+
+2. **`agent-watchdog`** — an independent timer.
+   - `agent-watchdog scan` runs one pass: for each open handoff thread whose
+     worker pane has died (gone from `surface-health`) or whose `ack_by`/`ttl`
+     has passed, it appends a `timeout` event (`status=blocked`) addressed to
+     the delegator and signals its pane.
+   - `agent-watchdog daemon [--interval SEC]` runs `scan` on a loop.
+   - It is **idempotent** (a closed/timed-out thread is skipped) and **batched**
+     (at most one wake-up signal per delegator per pass).
+   - Because the timeout is `status=blocked`, it also **closes the thread**,
+     which releases the worker's `paths_claimed` and unblocks any `agent-wait`.
+   - The daemon is a single point of failure: if it dies, no timeouts surface.
+     So waits must also be **bounded** — never rely on the watchdog alone.
+
+3. **Bounded waits.** `agent-wait` / `agent-rpc` always have a deadline and
+   treat a `timeout` event as terminal, exiting **3** (distinct from a real
+   `done`/`blocked`). A lead that blocks on a reply uses `agent-wait <id>`
+   (or `agent-rpc`) and reacts to exit 3 — it never spins forever.
+
+### Recovery cascade — `agent-recover`
+
+On receiving a `timeout`, the lead runs `agent-recover <thread>` to take the
+next bounded step automatically:
+
+```
+RETRY (same worker, if alive) → REASSIGN (another live peer) → ESCALATE (block to user)
+```
+
+The action is derived from how many handoffs the thread already carries, so
+re-running `agent-recover` advances the cascade rather than repeating a step.
+It stops at `--max-retries` (default 2) and escalates with a `block` to `user`,
+so it never loops. Each retry/reassign is a fresh handoff with its own lease, so
+the watchdog covers the retry too. `--dry-run` prints the chosen action without
+appending anything.
+
+### Spawned workers run auto-accept
+
+So a delegated worker can actually *do* the work without a human babysitting
+every action, `agent-spawn` launches it in **auto-accept** by default (claude
+`--permission-mode acceptEdits`, codex `--sandbox workspace-write
+--ask-for-approval never`) — sandboxed, not a full bypass. `--interactive`
+keeps normal prompting; `--yolo` opts into full bypass explicitly.
