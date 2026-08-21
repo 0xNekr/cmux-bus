@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Optional read-only bridge from bus events to native cmux notifications.
+# Automatic, read-only bridge from bus events to native cmux notifications.
 
 set -euo pipefail
 
@@ -20,15 +20,19 @@ usage() {
 usage: agent-notify [--scope repo|workspace] [--bus-dir DIR] <command> [options]
 
 Commands:
-  start [--interval SEC] [--label TEXT] [--replay]  start one notifier for this bus
-  stop                                             stop the notifier
-  status                                           show whether it is running
+  enable [--interval SEC] [--label TEXT] [--replay] enable persistent notifications
+  disable                                          persistently disable notifications
+  ensure [--interval SEC] [--label TEXT]            enable unless explicitly disabled
+  start [options]                                   alias for enable
+  stop                                              alias for disable
+  status                                            show enabled/disabled and runtime state
   once [--label TEXT] [--replay]                   process pending events once
   run [--interval SEC] [--label TEXT]              run in the foreground
 
-The notifier is read-only with respect to bus.jsonl. By default start begins at
-the end of the current bus, so old events do not create a notification storm.
-Use --replay explicitly to process the existing history.
+Notifications are enabled automatically by agent-init. `disable` is a durable
+per-bus opt-out; `enable` removes it. A persistent macOS LaunchAgent keeps the
+notifier alive across terminal, cmux, and login restarts. The notifier is
+read-only with respect to bus.jsonl and starts at the current end by default.
 EOF
     agent_bus_common_usage >&2
     exit 2
@@ -50,11 +54,144 @@ is_running() {
     kill -0 "$pid" 2>/dev/null
 }
 
+stop_process() {
+    local tries=0
+    if is_running; then
+        kill "$pid" 2>/dev/null || true
+        while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 50 ]; do
+            sleep 0.1
+            tries=$((tries + 1))
+        done
+    fi
+    rm -f "$pid_file"
+}
+
 write_cursor() {
     local value="$1" tmp
     tmp="$cursor_file.tmp.$$"
     printf '%s\n' "$value" > "$tmp"
     mv "$tmp" "$cursor_file"
+}
+
+xml_escape() {
+    printf '%s' "$1" | sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\\&apos;/g"
+}
+
+resolve_label() {
+    local detected=""
+    if [ -n "$label" ]; then
+        return 0
+    fi
+    if [ -f "$label_file" ]; then
+        label="$(sed -n '1p' "$label_file" 2>/dev/null || true)"
+    fi
+    if [ -z "$label" ] && [ -n "$workspace_id" ]; then
+        detected="$(cmux --id-format both tree --workspace "$workspace_id" 2>/dev/null \
+            | sed -n '1s/.*"\([^"]*\)".*/\1/p')"
+        [ -n "$detected" ] && label="$detected"
+    fi
+    [ -n "$label" ] || label="cmux-bus"
+}
+
+stage_runtime() {
+    mkdir -p "$runtime_dir"
+    if [ "$AGENT_SCRIPT_PATH" != "$runtime_script" ]; then
+        install -m 755 "$AGENT_SCRIPT_PATH" "$runtime_script"
+    fi
+    if [ "$AGENT_BIN_DIR/agent-lib" != "$runtime_dir/agent-lib" ]; then
+        install -m 644 "$AGENT_BIN_DIR/agent-lib" "$runtime_dir/agent-lib"
+    fi
+}
+
+launch_service_running() {
+    command -v launchctl >/dev/null 2>&1 || return 1
+    launchctl print "$launch_domain/$service_label" >/dev/null 2>&1
+}
+
+write_launch_agent() {
+    local tmp label_xml runtime_xml bus_xml notify_label_xml path_xml home_xml socket_xml workspace_xml
+    mkdir -p "$launch_agents_dir" "$state_dir"
+    tmp="$plist_file.tmp.$$"
+    label_xml="$(xml_escape "$service_label")"
+    runtime_xml="$(xml_escape "$runtime_script")"
+    bus_xml="$(xml_escape "$AGENT_BUS_DIR_EFFECTIVE")"
+    notify_label_xml="$(xml_escape "$label")"
+    path_xml="$(xml_escape "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin")"
+    home_xml="$(xml_escape "$HOME")"
+    socket_xml="$(xml_escape "$socket_path")"
+    workspace_xml="$(xml_escape "$workspace_id")"
+    cat > "$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label_xml</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$runtime_xml</string>
+    <string>--bus-dir</string>
+    <string>$bus_xml</string>
+    <string>run</string>
+    <string>--label</string>
+    <string>$notify_label_xml</string>
+    <string>--interval</string>
+    <string>$interval</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>$home_xml</string>
+    <key>PATH</key><string>$path_xml</string>
+    <key>CMUX_SOCKET_PATH</key><string>$socket_xml</string>
+    <key>CMUX_WORKSPACE_ID</key><string>$workspace_xml</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>5</integer>
+  <key>StandardOutPath</key><string>$(xml_escape "$state_dir/launchd.out")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$state_dir/launchd.err")</string>
+</dict>
+</plist>
+EOF
+    mv "$tmp" "$plist_file"
+}
+
+enable_persistent() {
+    local reset_cursor="$1"
+    command -v launchctl >/dev/null 2>&1 || {
+        echo "agent-notify: launchctl is required for persistent notifications" >&2
+        return 1
+    }
+    resolve_label
+    stage_runtime
+    rm -f "$disabled_file"
+    printf '%s\n' "$label" > "$label_file"
+    if [ "$replay" -eq 1 ]; then
+        write_cursor 0
+    elif [ "$reset_cursor" -eq 1 ] || [ ! -f "$cursor_file" ]; then
+        write_cursor "$(wc -l < "$AGENT_BUS_FILE" | tr -d ' ')"
+    fi
+    write_launch_agent
+    launchctl bootout "$launch_domain/$service_label" >/dev/null 2>&1 || true
+    stop_process
+    launchctl bootstrap "$launch_domain" "$plist_file"
+    launchctl kickstart -k "$launch_domain/$service_label" >/dev/null 2>&1 || true
+    echo "agent-notify: enabled for $AGENT_BUS_DIR_EFFECTIVE ($label)"
+}
+
+disable_persistent() {
+    touch "$disabled_file"
+    if command -v launchctl >/dev/null 2>&1; then
+        launchctl bootout "$launch_domain/$service_label" >/dev/null 2>&1 || true
+    fi
+    stop_process
+    rm -f "$plist_file" "$pid_file"
+    echo "agent-notify: disabled for $AGENT_BUS_DIR_EFFECTIVE"
 }
 
 notification_target() {
@@ -142,7 +279,7 @@ process_pending() {
 }
 
 interval=1
-label="cmux-bus"
+label=""
 replay=0
 
 agent_bus_parse_common "$@"
@@ -184,15 +321,15 @@ if ! jq -en --arg interval "$interval" '($interval | tonumber) > 0' >/dev/null 2
 fi
 
 case "$command" in
-    start|stop|status|once|run) ;;
+    enable|disable|ensure|start|stop|status|once|run) ;;
     *) usage;;
 esac
 
-if [ "$command" = "stop" ] || [ "$command" = "status" ]; then
+if [ "$command" = "disable" ] || [ "$command" = "stop" ] || [ "$command" = "status" ]; then
     replay=0
 fi
-if [ "$command" != "start" ] && [ "$command" != "once" ] && [ "$replay" -eq 1 ]; then
-    echo "agent-notify: --replay is only valid with start or once" >&2
+if [ "$command" != "enable" ] && [ "$command" != "start" ] && [ "$command" != "once" ] && [ "$replay" -eq 1 ]; then
+    echo "agent-notify: --replay is only valid with enable, start, or once" >&2
     exit 2
 fi
 
@@ -205,39 +342,68 @@ state_dir="$AGENT_BUS_DIR_EFFECTIVE/notifier"
 pid_file="$state_dir/pid"
 cursor_file="$state_dir/cursor"
 log_file="$state_dir/daemon.log"
+disabled_file="$state_dir/disabled"
+label_file="$state_dir/label"
+workspace_id="${CMUX_WORKSPACE_ID:-}"
+if [ -z "$workspace_id" ] && [ "$AGENT_BUS_SCOPE_EFFECTIVE" = "workspace" ]; then
+    workspace_id="$(basename "$AGENT_BUS_DIR_EFFECTIVE")"
+fi
+bus_key="$(printf '%s' "$AGENT_BUS_DIR_EFFECTIVE" | cksum | awk '{print $1}')"
+service_label="com.cmux-bus.notify.$bus_key"
+launch_domain="gui/$(id -u)"
+launch_agents_dir="${AGENT_BUS_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+plist_file="$launch_agents_dir/$service_label.plist"
+runtime_dir="${AGENT_BUS_NOTIFY_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/cmux-bus/bin}"
+runtime_script="$runtime_dir/agent-notify"
+socket_path="${CMUX_SOCKET_PATH:-$(agent_bus_state_home)/cmux/cmux-$(id -u).sock}"
 mkdir -p "$state_dir"
 
 case "$command" in
     status)
+        if [ -f "$disabled_file" ]; then
+            echo "agent-notify: disabled for $AGENT_BUS_DIR_EFFECTIVE"
+            exit 0
+        fi
+        if launch_service_running; then
+            echo "agent-notify: enabled and running for $AGENT_BUS_DIR_EFFECTIVE"
+            exit 0
+        fi
         if is_running; then
             echo "agent-notify: running (pid $pid) for $AGENT_BUS_DIR_EFFECTIVE"
             exit 0
         fi
-        echo "agent-notify: stopped for $AGENT_BUS_DIR_EFFECTIVE"
+        echo "agent-notify: enabled by default but not running for $AGENT_BUS_DIR_EFFECTIVE"
         exit 1
         ;;
-    stop)
-        if ! is_running; then
-            rm -f "$pid_file"
-            echo "agent-notify: already stopped"
+    disable|stop)
+        disable_persistent
+        ;;
+    enable|start)
+        enable_persistent 1
+        ;;
+    ensure)
+        if [ -f "$disabled_file" ]; then
+            echo "agent-notify: disabled for $AGENT_BUS_DIR_EFFECTIVE"
             exit 0
         fi
-        kill "$pid"
-        tries=0
-        while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 50 ]; do
-            sleep 0.1
-            tries=$((tries + 1))
-        done
-        rm -f "$pid_file"
-        echo "agent-notify: stopped"
+        if launch_service_running; then
+            exit 0
+        fi
+        if [ -f "$plist_file" ]; then
+            enable_persistent 0
+        else
+            enable_persistent 1
+        fi
         ;;
     once)
+        resolve_label
         if [ "$replay" -eq 1 ]; then
             write_cursor 0
         fi
         process_pending
         ;;
     run)
+        resolve_label
         if is_running && [ "$pid" != "$$" ]; then
             echo "agent-notify: already running (pid $pid)" >&2
             exit 1
@@ -249,29 +415,5 @@ case "$command" in
             process_pending
             sleep "$interval"
         done
-        ;;
-    start)
-        if is_running; then
-            echo "agent-notify: already running (pid $pid)"
-            exit 0
-        fi
-        rm -f "$pid_file"
-        if [ "$replay" -eq 1 ]; then
-            write_cursor 0
-        else
-            # Pop-ups are transient UI, not a durable queue. Every explicit
-            # start begins "now" so restarting after a pause cannot replay a
-            # backlog of old work. The bus itself remains the history.
-            write_cursor "$(wc -l < "$AGENT_BUS_FILE" | tr -d ' ')"
-        fi
-        nohup "$AGENT_SCRIPT_PATH" --bus-dir "$AGENT_BUS_DIR_EFFECTIVE" run --interval "$interval" --label "$label" > "$log_file" 2>&1 &
-        child_pid=$!
-        printf '%s\n' "$child_pid" > "$pid_file"
-        sleep 0.1
-        if ! kill -0 "$child_pid" 2>/dev/null; then
-            echo "agent-notify: failed to start; see $log_file" >&2
-            exit 1
-        fi
-        echo "agent-notify: started (pid $child_pid) for $AGENT_BUS_DIR_EFFECTIVE"
         ;;
 esac

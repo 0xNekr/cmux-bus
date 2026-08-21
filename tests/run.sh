@@ -7,6 +7,7 @@ trap 'rm -rf "$tmp_root"' EXIT
 
 pass_count=0
 export AGENT_BUS_SCOPE=repo
+export AGENT_BUS_NOTIFY_AUTO=0
 # Isolate the suite from any real user/repo spawn policy: point the override at a
 # path that never exists, so the resolved policy is the built-in "open". Policy
 # tests set AGENT_BUS_POLICY_FILE per-invocation to override this.
@@ -52,6 +53,39 @@ fi
 exit 0
 CMUX
     chmod +x "$dir/cmux"
+}
+
+make_fake_launchctl() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/launchctl" <<'LAUNCHCTL'
+#!/usr/bin/env bash
+set -u
+state_dir="${FAKE_LAUNCHCTL_STATE_DIR:?}"
+log="${FAKE_LAUNCHCTL_LOG:-}"
+mkdir -p "$state_dir"
+[ -z "$log" ] || printf '%s\n' "$*" >> "$log"
+case "$1" in
+    print)
+        service="${2##*/}"
+        [ -f "$state_dir/$service" ]
+        ;;
+    bootout)
+        service="${2##*/}"
+        rm -f "$state_dir/$service"
+        ;;
+    bootstrap)
+        plist="$3"
+        service="$(basename "$plist" .plist)"
+        touch "$state_dir/$service"
+        ;;
+    kickstart)
+        exit 0
+        ;;
+    *) exit 1;;
+esac
+LAUNCHCTL
+    chmod +x "$dir/launchctl"
 }
 
 make_fake_cmux_live_s1_only() {
@@ -785,6 +819,8 @@ test_install_links_all_commands() {
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
+    cmp -s "$home/.local/share/cmux-bus/bin/agent-notify" "$repo_root/bin/agent-notify" || fail "notification runtime script was not installed"
+    cmp -s "$home/.local/share/cmux-bus/bin/agent-lib" "$repo_root/bin/agent-lib" || fail "notification runtime library was not installed"
 
     pass "install.sh links all commands"
 }
@@ -2571,47 +2607,98 @@ EOF
     pass "agent-notify formats actionable pop-ups, skips ack, targets recipients, and deduplicates"
 }
 
-test_agent_notify_daemon_lifecycle() {
-    local fakebin workspace cmux_log N output seen
-    fakebin="$tmp_root/fakebin-notify-daemon"
-    workspace="$(new_workspace notify-daemon)"
-    cmux_log="$tmp_root/cmux-notify-daemon.log"
+test_agent_notify_persistent_lifecycle() {
+    local fakebin home workspace launch_state launch_log runtime_dir launch_dir N output service bootstrap_count
+    fakebin="$tmp_root/fakebin-notify-persistent"
+    home="$tmp_root/home-notify-persistent"
+    workspace="$(new_workspace notify-persistent)"
+    launch_state="$tmp_root/launch-state-notify"
+    launch_log="$tmp_root/launch-notify.log"
+    runtime_dir="$home/runtime/bin"
+    launch_dir="$home/Library/LaunchAgents"
     N="$repo_root/bin/agent-notify"
     make_fake_cmux "$fakebin"
+    make_fake_launchctl "$fakebin"
+    mkdir -p "$home" "$launch_state"
 
     (
         cd "$workspace"
         write_agents
-        export PATH="$fakebin:$PATH"
-        export CMUX_LOG="$cmux_log"
-        export CMUX_WORKSPACE_ID=ws-test
-        trap '"$N" stop >/dev/null 2>&1 || true' EXIT
-
         printf '%s\n' '{"id":"old00001","ts":"2026-08-21T09:00:00Z","from":"codex","to":"claude","type":"handoff","ref":null,"status":"open","paths_claimed":[],"body":"Old event"}' >> .agents/bus.jsonl
-        "$N" start --interval 0.05 --label "Bus Test" >/dev/null
+        export PATH="$fakebin:$PATH"
+        export HOME="$home"
+        export CMUX_WORKSPACE_ID=ws-test
+        export AGENT_BUS_LAUNCH_AGENTS_DIR="$launch_dir"
+        export AGENT_BUS_NOTIFY_RUNTIME_DIR="$runtime_dir"
+        export FAKE_LAUNCHCTL_STATE_DIR="$launch_state"
+        export FAKE_LAUNCHCTL_LOG="$launch_log"
+
+        "$N" enable --label "Test & Review" >/dev/null
+        service="$(basename "$launch_dir"/*.plist .plist)"
+        [ -f "$launch_state/$service" ] || fail "persistent notifier was not bootstrapped"
+        [ -x "$runtime_dir/agent-notify" ] || fail "runtime notifier was not staged"
+        [ -f "$runtime_dir/agent-lib" ] || fail "runtime library was not staged"
+        grep -q 'Test &amp; Review' "$launch_dir/$service.plist" || fail "notification label was not XML escaped"
+        grep -q '<key>KeepAlive</key><true/>' "$launch_dir/$service.plist" || fail "LaunchAgent is not persistent"
+        [ "$(cat .agents/notifier/cursor)" -eq 1 ] || fail "enable did not start at the current bus end"
         output="$("$N" status)"
-        printf '%s\n' "$output" | grep -q "running" || fail "notifier status did not report running"
+        printf '%s\n' "$output" | grep -q "enabled and running" || fail "status did not report persistent notifier"
 
-        printf '%s\n' '{"id":"daemon01","ts":"2026-08-21T10:00:00Z","from":"codex","to":"claude","type":"handoff","ref":null,"status":"open","paths_claimed":[],"body":"Daemon event"}' >> .agents/bus.jsonl
-        seen=0
-        for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-            if grep -q "Daemon event" "$cmux_log" 2>/dev/null; then
-                seen=1
-                break
-            fi
-            sleep 0.05
-        done
-        [ "$seen" -eq 1 ] || fail "notifier daemon did not process a new event"
-        ! grep -q "Old event" "$cmux_log" || fail "notifier replayed history on a normal start"
+        bootstrap_count="$(grep -c '^bootstrap ' "$launch_log")"
+        "$N" ensure >/dev/null
+        [ "$(grep -c '^bootstrap ' "$launch_log")" -eq "$bootstrap_count" ] || fail "ensure restarted an already running service"
 
-        "$N" stop >/dev/null
-        if "$N" status >/dev/null 2>&1; then
-            fail "notifier status still reports running after stop"
-        fi
-        trap - EXIT
+        "$N" disable >/dev/null
+        [ -f .agents/notifier/disabled ] || fail "disable marker was not persisted"
+        [ ! -f "$launch_dir/$service.plist" ] || fail "disable left the LaunchAgent plist"
+        output="$("$N" status)"
+        printf '%s\n' "$output" | grep -q "disabled" || fail "status did not report durable opt-out"
+        "$N" ensure >/dev/null
+        [ "$(grep -c '^bootstrap ' "$launch_log")" -eq "$bootstrap_count" ] || fail "ensure ignored durable opt-out"
+
+        printf '%s\n' '{"id":"new00001","ts":"2026-08-21T10:00:00Z","from":"codex","to":"claude","type":"ask","ref":null,"status":"open","paths_claimed":[],"body":"New event"}' >> .agents/bus.jsonl
+        "$N" enable --label "Test Review" >/dev/null
+        [ ! -f .agents/notifier/disabled ] || fail "enable did not remove opt-out"
+        [ "$(cat .agents/notifier/cursor)" -eq 2 ] || fail "re-enable replayed work from disabled period"
     )
 
-    pass "agent-notify daemon starts at EOF, processes new events, reports status, and stops"
+    pass "agent-notify persists with launchd, starts at EOF, and honors durable disable/enable"
+}
+
+test_agent_init_enables_notifications_by_default() {
+    local fakebin home workspace launch_state launch_log runtime_dir launch_dir bootstrap_count
+    fakebin="$tmp_root/fakebin-init-notify"
+    home="$tmp_root/home-init-notify"
+    workspace="$(new_workspace init-notify)"
+    launch_state="$tmp_root/launch-state-init-notify"
+    launch_log="$tmp_root/launch-init-notify.log"
+    runtime_dir="$home/runtime/bin"
+    launch_dir="$home/Library/LaunchAgents"
+    make_fake_cmux "$fakebin"
+    make_fake_launchctl "$fakebin"
+    mkdir -p "$home" "$launch_state"
+
+    (
+        cd "$workspace"
+        export PATH="$fakebin:$PATH"
+        export HOME="$home"
+        export CMUX_SURFACE_ID=s1
+        export CMUX_WORKSPACE_ID=ws-auto
+        export AGENT_BUS_NOTIFY_AUTO=1
+        export AGENT_BUS_LAUNCH_AGENTS_DIR="$launch_dir"
+        export AGENT_BUS_NOTIFY_RUNTIME_DIR="$runtime_dir"
+        export FAKE_LAUNCHCTL_STATE_DIR="$launch_state"
+        export FAKE_LAUNCHCTL_LOG="$launch_log"
+
+        "$repo_root/bin/agent-init" codex >/dev/null
+        grep -q '^bootstrap ' "$launch_log" || fail "agent-init did not auto-enable notifications"
+        bootstrap_count="$(grep -c '^bootstrap ' "$launch_log")"
+        "$repo_root/bin/agent-notify" disable >/dev/null
+        "$repo_root/bin/agent-init" codex >/dev/null
+        [ "$(grep -c '^bootstrap ' "$launch_log")" -eq "$bootstrap_count" ] || fail "agent-init overrode notification opt-out"
+    )
+
+    pass "agent-init enables notifications by default and respects durable opt-out"
 }
 
 test_agent_init_syncs_protocol_and_template
@@ -2695,7 +2782,8 @@ test_agent_watch_truncates_long_bodies_unless_full
 test_agent_watch_accepts_no_color
 test_agent_watch_clear_truncates_bus_before_snapshot
 test_agent_notify_formats_filters_and_deduplicates
-test_agent_notify_daemon_lifecycle
+test_agent_notify_persistent_lifecycle
+test_agent_init_enables_notifications_by_default
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
 test_agent_rpc_prints_response_body

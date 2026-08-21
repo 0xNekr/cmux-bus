@@ -32,7 +32,7 @@ Covered areas:
   output, and unknown thread failures
 - `agent-watch` snapshots and current-agent filtering
 - `agent-notify` cmux pop-up formatting, event filtering, cursor deduplication,
-  recipient targeting, and daemon lifecycle
+  recipient targeting, persistent LaunchAgent lifecycle, and durable opt-out
 - `agent-wait` final-status waits, timeouts, and unknown ids
 
 The fake `cmux` implements only the contract the scripts need:
