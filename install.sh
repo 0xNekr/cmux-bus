@@ -47,6 +47,14 @@ for tool in "${tools[@]}"; do
     chmod +x "$src"
 done
 
+# launchd cannot execute scripts from macOS-protected folders such as
+# ~/Documents. Keep a minimal runtime copy in Application Support-like user
+# data so persistent notification jobs work regardless of the repo location.
+runtime_dir="${XDG_DATA_HOME:-$HOME/.local/share}/cmux-bus/bin"
+mkdir -p "$runtime_dir"
+install -m 755 "$src_bin/agent-notify" "$runtime_dir/agent-notify"
+install -m 644 "$src_bin/agent-lib" "$runtime_dir/agent-lib"
+
 linked=()
 for tool in "${tools[@]}"; do
     src="$src_bin/$tool"
@@ -59,6 +67,7 @@ echo "installed:"
 for line in "${linked[@]}"; do
     echo "  $line"
 done
+echo "  notification runtime -> $runtime_dir"
 
 claude_rules="$HOME/.claude/rules"
 if [ -d "$claude_rules" ]; then

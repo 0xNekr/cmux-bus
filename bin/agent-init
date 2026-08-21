@@ -410,3 +410,18 @@ fi
 if [ -n "$purged" ]; then
     echo "agent-init: purged stale entries: $purged"
 fi
+
+# Native cmux bus notifications are on by default. `agent-notify disable`
+# writes a durable per-bus opt-out marker, which `ensure` respects. Notification
+# startup is best-effort so a launchd problem never blocks agent registration.
+if [ "${AGENT_BUS_NOTIFY_AUTO:-1}" != "0" ] && [ -x "$AGENT_BIN_DIR/agent-notify" ]; then
+    if "$AGENT_BIN_DIR/agent-notify" --bus-dir "$dir" ensure >/dev/null 2>&1; then
+        if [ -f "$dir/notifier/disabled" ]; then
+            echo "agent-init: native notifications disabled (agent-notify enable to restore)"
+        else
+            echo "agent-init: native notifications enabled (agent-notify disable to opt out)"
+        fi
+    else
+        echo "agent-init: warning: could not ensure native notifications; run 'agent-notify enable' to retry" >&2
+    fi
+fi
