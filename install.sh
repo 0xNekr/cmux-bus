@@ -18,7 +18,7 @@ done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src_bin="$repo_root/bin"
-tools=(agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update)
+tools=(agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-wait agent-update)
 
 missing=()
 command -v jq >/dev/null 2>&1 || missing+=("jq")

@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Optional read-only bridge from bus events to native cmux notifications.
+
+set -euo pipefail
+
+AGENT_CMD="agent-notify"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<'EOF'
+usage: agent-notify [--scope repo|workspace] [--bus-dir DIR] <command> [options]
+
+Commands:
+  start [--interval SEC] [--label TEXT] [--replay]  start one notifier for this bus
+  stop                                             stop the notifier
+  status                                           show whether it is running
+  once [--label TEXT] [--replay]                   process pending events once
+  run [--interval SEC] [--label TEXT]              run in the foreground
+
+The notifier is read-only with respect to bus.jsonl. By default start begins at
+the end of the current bus, so old events do not create a notification storm.
+Use --replay explicitly to process the existing history.
+EOF
+    agent_bus_common_usage >&2
+    exit 2
+}
+
+display_name() {
+    printf '%s\n' "$1" | awk -F '[-_]' '{
+        for (i = 1; i <= NF; i++) {
+            if (i > 1) printf " "
+            printf "%s%s", toupper(substr($i, 1, 1)), substr($i, 2)
+        }
+    }'
+}
+
+is_running() {
+    [ -f "$pid_file" ] || return 1
+    pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+    case "$pid" in ''|*[!0-9]*) return 1;; esac
+    kill -0 "$pid" 2>/dev/null
+}
+
+write_cursor() {
+    local value="$1" tmp
+    tmp="$cursor_file.tmp.$$"
+    printf '%s\n' "$value" > "$tmp"
+    mv "$tmp" "$cursor_file"
+}
+
+notification_target() {
+    local recipient="$1"
+    jq -r --arg recipient "$recipient" '.agents[$recipient] // empty' "$AGENT_BUS_AGENTS_FILE" 2>/dev/null || true
+}
+
+send_notification() {
+    local event="$1" type from to ref body from_label to_label title subtitle target
+
+    type="$(printf '%s\n' "$event" | jq -r '.type // empty')"
+    case "$type" in
+        handoff|ask|done|block|timeout) ;;
+        *) return 0;;
+    esac
+
+    from="$(printf '%s\n' "$event" | jq -r '.from // "agent"')"
+    to="$(printf '%s\n' "$event" | jq -r '.to // "user"')"
+    ref="$(printf '%s\n' "$event" | jq -r '.ref // empty')"
+    body="$(printf '%s\n' "$event" | jq -r '(.body // "") | gsub("[\\r\\n\\t ]+"; " ") | .[0:180]')"
+    from_label="$(display_name "$from")"
+    to_label="$(display_name "$to")"
+
+    case "$type" in
+        handoff) title="$from_label a confié une tâche à $to_label";;
+        ask)
+            if [ -n "$ref" ]; then
+                title="$from_label a répondu à $to_label"
+            else
+                title="$from_label a envoyé un message à $to_label"
+            fi
+            ;;
+        done)
+            if [ "$to" = "user" ]; then
+                title="$from_label a terminé son travail"
+            else
+                title="$from_label a terminé son travail pour $to_label"
+            fi
+            ;;
+        block)
+            if [ "$to" = "user" ]; then
+                title="$from_label est bloqué"
+            else
+                title="$from_label a signalé un blocage à $to_label"
+            fi
+            ;;
+        timeout) title="Le travail de $to_label a expiré";;
+    esac
+
+    subtitle="$label"
+    target="$(notification_target "$to")"
+
+    if [ -n "$target" ]; then
+        cmux notify --title "$title" --subtitle "$subtitle" --body "$body" --surface "$target" >/dev/null 2>&1 && return 0
+    fi
+    if [ -n "${CMUX_WORKSPACE_ID:-}" ]; then
+        cmux notify --title "$title" --subtitle "$subtitle" --body "$body" --workspace "$CMUX_WORKSPACE_ID" >/dev/null 2>&1 && return 0
+    fi
+    cmux notify --title "$title" --subtitle "$subtitle" --body "$body" >/dev/null 2>&1 || {
+        echo "agent-notify: cmux notify failed for event $(printf '%s\n' "$event" | jq -r '.id // "unknown"')" >&2
+    }
+}
+
+process_pending() {
+    local cursor total line_number start_line event
+    cursor=0
+    if [ -f "$cursor_file" ]; then
+        cursor="$(sed -n '1p' "$cursor_file" 2>/dev/null || printf '0')"
+    fi
+    case "$cursor" in ''|*[!0-9]*) cursor=0;; esac
+
+    total="$(wc -l < "$AGENT_BUS_FILE" | tr -d ' ')"
+    [ "$total" -ge "$cursor" ] || cursor=0
+    [ "$total" -gt "$cursor" ] || return 0
+
+    line_number="$cursor"
+    start_line=$((cursor + 1))
+    while IFS= read -r event || [ -n "$event" ]; do
+        line_number=$((line_number + 1))
+        if printf '%s\n' "$event" | jq -e 'type == "object" and (.id | type == "string")' >/dev/null 2>&1; then
+            send_notification "$event"
+        fi
+        write_cursor "$line_number"
+    done < <(tail -n "+$start_line" "$AGENT_BUS_FILE")
+}
+
+interval=1
+label="cmux-bus"
+replay=0
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
+[ $# -ge 1 ] || usage
+command="$1"
+shift
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --interval)
+            [ $# -ge 2 ] || usage
+            interval="$2"
+            shift 2
+            ;;
+        --label)
+            [ $# -ge 2 ] || usage
+            label="$2"
+            shift 2
+            ;;
+        --replay)
+            replay=1
+            shift
+            ;;
+        --*) echo "agent-notify: unknown flag '$1'" >&2; exit 2;;
+        *) usage;;
+    esac
+done
+
+case "$interval" in ''|*[!0-9.]*) echo "agent-notify: --interval must be a positive number" >&2; exit 2;; esac
+if ! jq -en --arg interval "$interval" '($interval | tonumber) > 0' >/dev/null 2>&1; then
+    echo "agent-notify: --interval must be a positive number" >&2
+    exit 2
+fi
+
+case "$command" in
+    start|stop|status|once|run) ;;
+    *) usage;;
+esac
+
+if [ "$command" = "stop" ] || [ "$command" = "status" ]; then
+    replay=0
+fi
+if [ "$command" != "start" ] && [ "$command" != "once" ] && [ "$replay" -eq 1 ]; then
+    echo "agent-notify: --replay is only valid with start or once" >&2
+    exit 2
+fi
+
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+command -v cmux >/dev/null 2>&1 || { echo "agent-notify: cmux is required" >&2; exit 1; }
+
+state_dir="$AGENT_BUS_DIR_EFFECTIVE/notifier"
+pid_file="$state_dir/pid"
+cursor_file="$state_dir/cursor"
+log_file="$state_dir/daemon.log"
+mkdir -p "$state_dir"
+
+case "$command" in
+    status)
+        if is_running; then
+            echo "agent-notify: running (pid $pid) for $AGENT_BUS_DIR_EFFECTIVE"
+            exit 0
+        fi
+        echo "agent-notify: stopped for $AGENT_BUS_DIR_EFFECTIVE"
+        exit 1
+        ;;
+    stop)
+        if ! is_running; then
+            rm -f "$pid_file"
+            echo "agent-notify: already stopped"
+            exit 0
+        fi
+        kill "$pid"
+        tries=0
+        while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 50 ]; do
+            sleep 0.1
+            tries=$((tries + 1))
+        done
+        rm -f "$pid_file"
+        echo "agent-notify: stopped"
+        ;;
+    once)
+        if [ "$replay" -eq 1 ]; then
+            write_cursor 0
+        fi
+        process_pending
+        ;;
+    run)
+        if is_running && [ "$pid" != "$$" ]; then
+            echo "agent-notify: already running (pid $pid)" >&2
+            exit 1
+        fi
+        printf '%s\n' "$$" > "$pid_file"
+        trap 'current=$(sed -n "1p" "$pid_file" 2>/dev/null || true); [ "$current" != "$$" ] || rm -f "$pid_file"' EXIT
+        trap 'exit 0' INT TERM
+        while :; do
+            process_pending
+            sleep "$interval"
+        done
+        ;;
+    start)
+        if is_running; then
+            echo "agent-notify: already running (pid $pid)"
+            exit 0
+        fi
+        rm -f "$pid_file"
+        if [ "$replay" -eq 1 ]; then
+            write_cursor 0
+        else
+            # Pop-ups are transient UI, not a durable queue. Every explicit
+            # start begins "now" so restarting after a pause cannot replay a
+            # backlog of old work. The bus itself remains the history.
+            write_cursor "$(wc -l < "$AGENT_BUS_FILE" | tr -d ' ')"
+        fi
+        nohup "$AGENT_SCRIPT_PATH" --bus-dir "$AGENT_BUS_DIR_EFFECTIVE" run --interval "$interval" --label "$label" > "$log_file" 2>&1 &
+        child_pid=$!
+        printf '%s\n' "$child_pid" > "$pid_file"
+        sleep 0.1
+        if ! kill -0 "$child_pid" 2>/dev/null; then
+            echo "agent-notify: failed to start; see $log_file" >&2
+            exit 1
+        fi
+        echo "agent-notify: started (pid $child_pid) for $AGENT_BUS_DIR_EFFECTIVE"
+        ;;
+esac
