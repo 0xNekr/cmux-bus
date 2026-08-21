@@ -35,7 +35,7 @@ surface:3 s3 type=terminal in_window=true
 OUT
     exit 0
 fi
-if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
+if [ "$1" = "send" ] || [ "$1" = "send-key" ] || [ "$1" = "notify" ]; then
     if [ -n "${CMUX_LOG:-}" ]; then
         printf '%s\n' "$*" >> "$CMUX_LOG"
     fi
@@ -781,7 +781,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-wait agent-update; do
+    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -2522,6 +2522,98 @@ test_agent_lead_guard_install_merges_settings() {
     pass "agent-lead-guard install merges into settings.json idempotently and uninstall is clean"
 }
 
+test_agent_notify_formats_filters_and_deduplicates() {
+    local fakebin workspace cmux_log N count
+    fakebin="$tmp_root/fakebin-notify"
+    workspace="$(new_workspace notify)"
+    cmux_log="$tmp_root/cmux-notify.log"
+    N="$repo_root/bin/agent-notify"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        cat > .agents/bus.jsonl <<'EOF'
+{"id":"handoff1","ts":"2026-08-21T10:00:00Z","from":"codex","to":"claude","type":"handoff","ref":null,"status":"open","paths_claimed":[],"body":"Review API"}
+{"id":"ack00001","ts":"2026-08-21T10:00:01Z","from":"claude","to":"codex","type":"ack","ref":"handoff1","status":"in_progress","paths_claimed":[],"body":"Working"}
+{"id":"reply001","ts":"2026-08-21T10:00:30Z","from":"claude","to":"codex","type":"ask","ref":"handoff1","status":"open","paths_claimed":[],"body":"One reply"}
+{"id":"done0001","ts":"2026-08-21T10:01:00Z","from":"claude","to":"codex","type":"done","ref":"handoff1","status":"done","paths_claimed":[],"body":"Review complete"}
+{"id":"block001","ts":"2026-08-21T10:02:00Z","from":"deepseek","to":"user","type":"block","ref":null,"status":"blocked","paths_claimed":[],"body":"Need a decision"}
+EOF
+
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_WORKSPACE_ID=ws-test \
+            "$N" once --replay --label "Recherche IA"
+
+        grep -Fq "notify --title Codex a confié une tâche à Claude --subtitle Recherche IA --body Review API --surface s2" "$cmux_log" \
+            || fail "handoff notification was not formatted or targeted correctly"
+        grep -Fq "notify --title Claude a terminé son travail pour Codex --subtitle Recherche IA --body Review complete --surface s1" "$cmux_log" \
+            || fail "done notification was not formatted or targeted correctly"
+        grep -Fq "notify --title Claude a répondu à Codex --subtitle Recherche IA --body One reply --surface s1" "$cmux_log" \
+            || fail "reply notification was not formatted correctly"
+        grep -Fq "notify --title Deepseek est bloqué --subtitle Recherche IA --body Need a decision --workspace ws-test" "$cmux_log" \
+            || fail "user-directed block notification did not fall back to the workspace"
+        ! grep -q "Working" "$cmux_log" || fail "ack event generated a notification"
+        count="$(grep -c '^notify ' "$cmux_log")"
+        [ "$count" -eq 4 ] || fail "expected 4 notifications, got $count"
+
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_WORKSPACE_ID=ws-test \
+            "$N" once --label "Recherche IA"
+        [ "$(grep -c '^notify ' "$cmux_log")" -eq 4 ] || fail "cursor replayed already processed notifications"
+
+        printf '%s\n' '{"id":"ask00001","ts":"2026-08-21T10:03:00Z","from":"codex","to":"claude","type":"ask","ref":null,"status":"open","paths_claimed":[],"body":"One question"}' >> .agents/bus.jsonl
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_WORKSPACE_ID=ws-test \
+            "$N" once --label "Recherche IA"
+        grep -Fq "notify --title Codex a envoyé un message à Claude --subtitle Recherche IA --body One question --surface s2" "$cmux_log" \
+            || fail "new ask event was not notified"
+        [ "$(grep -c '^notify ' "$cmux_log")" -eq 5 ] || fail "new event notification count is wrong"
+    )
+
+    pass "agent-notify formats actionable pop-ups, skips ack, targets recipients, and deduplicates"
+}
+
+test_agent_notify_daemon_lifecycle() {
+    local fakebin workspace cmux_log N output seen
+    fakebin="$tmp_root/fakebin-notify-daemon"
+    workspace="$(new_workspace notify-daemon)"
+    cmux_log="$tmp_root/cmux-notify-daemon.log"
+    N="$repo_root/bin/agent-notify"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        export PATH="$fakebin:$PATH"
+        export CMUX_LOG="$cmux_log"
+        export CMUX_WORKSPACE_ID=ws-test
+        trap '"$N" stop >/dev/null 2>&1 || true' EXIT
+
+        printf '%s\n' '{"id":"old00001","ts":"2026-08-21T09:00:00Z","from":"codex","to":"claude","type":"handoff","ref":null,"status":"open","paths_claimed":[],"body":"Old event"}' >> .agents/bus.jsonl
+        "$N" start --interval 0.05 --label "Bus Test" >/dev/null
+        output="$("$N" status)"
+        printf '%s\n' "$output" | grep -q "running" || fail "notifier status did not report running"
+
+        printf '%s\n' '{"id":"daemon01","ts":"2026-08-21T10:00:00Z","from":"codex","to":"claude","type":"handoff","ref":null,"status":"open","paths_claimed":[],"body":"Daemon event"}' >> .agents/bus.jsonl
+        seen=0
+        for _try in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+            if grep -q "Daemon event" "$cmux_log" 2>/dev/null; then
+                seen=1
+                break
+            fi
+            sleep 0.05
+        done
+        [ "$seen" -eq 1 ] || fail "notifier daemon did not process a new event"
+        ! grep -q "Old event" "$cmux_log" || fail "notifier replayed history on a normal start"
+
+        "$N" stop >/dev/null
+        if "$N" status >/dev/null 2>&1; then
+            fail "notifier status still reports running after stop"
+        fi
+        trap - EXIT
+    )
+
+    pass "agent-notify daemon starts at EOF, processes new events, reports status, and stops"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_defaults_to_workspace_scope
@@ -2602,6 +2694,8 @@ test_agent_watch_skips_malformed_lines
 test_agent_watch_truncates_long_bodies_unless_full
 test_agent_watch_accepts_no_color
 test_agent_watch_clear_truncates_bus_before_snapshot
+test_agent_notify_formats_filters_and_deduplicates
+test_agent_notify_daemon_lifecycle
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
 test_agent_rpc_prints_response_body

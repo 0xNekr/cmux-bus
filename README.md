@@ -165,6 +165,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | `agent-synthesize [--scope repo\|workspace] [--bus-dir DIR] [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>` | Wait for multiple threads to finish, bundle their final replies, and ask the synthesis agent (default `claude`) for consensus, disagreements, and a recommendation. |
 | `agent-thread [--scope repo\|workspace] [--bus-dir DIR] [--json] <id>` | Show the full event history for any event id in a thread. |
 | `agent-watch [--scope repo\|workspace] [--bus-dir DIR] [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, `--full` to avoid body truncation, and `--clear` to truncate the resolved `bus.jsonl` before watching. |
+| `agent-notify [--scope repo\|workspace] [--bus-dir DIR] <start\|stop\|status\|once\|run> [--interval SEC] [--label TEXT] [--replay]` | Optional read-only bridge from bus events to native cmux pop-ups. It notifies `ask`, `handoff`, `done`, `block`, and future `timeout` events; acknowledgements stay silent. `start` begins at the current end of the bus by default, so enabling it never replays old work unless `--replay` is explicit. The notification targets the recipient surface when available, so clicking it opens the relevant agent. |
 | `agent-wait [--scope repo\|workspace] [--bus-dir DIR] [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON and exits non-zero on timeout or unknown id. |
 
 `agent-guard` treats `paths_claimed` as meaningful on open `handoff` events.
@@ -204,6 +205,20 @@ of several raw replies:
 ids=$(agent-send claude,deepseek ask "Pick the next feature")
 agent-synthesize $ids
 ```
+
+## Native cmux pop-ups (optional)
+
+Enable one notifier for the current bus:
+
+```sh
+agent-notify start --label "Recherche IA"
+```
+
+Typical pop-ups are “Claude a confié une tâche à Codex”, “Codex a terminé son
+travail pour Claude”, or “Codex est bloqué”. The notifier only reads
+`bus.jsonl`; it stores its PID and cursor under the runtime bus directory and
+does not change the protocol or append events. Manage it with
+`agent-notify status` and `agent-notify stop`.
 
 ## Recovery — what to do when a peer crashes
 
