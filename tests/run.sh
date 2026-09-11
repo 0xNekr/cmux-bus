@@ -49,7 +49,7 @@ surface:3 s3 type=terminal in_window=true
 OUT
     exit 0
 fi
-if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
+if [ "$1" = "send" ] || [ "$1" = "send-key" ] || [ "$1" = "notify" ]; then
     if [ -n "${CMUX_LOG:-}" ]; then
         printf '%s\n' "$*" >> "$CMUX_LOG"
     fi
@@ -66,6 +66,39 @@ fi
 exit 0
 CMUX
     chmod +x "$dir/cmux"
+}
+
+make_fake_launchctl() {
+    local dir="$1"
+    mkdir -p "$dir"
+    cat > "$dir/launchctl" <<'LAUNCHCTL'
+#!/usr/bin/env bash
+set -u
+state_dir="${FAKE_LAUNCHCTL_STATE_DIR:?}"
+log="${FAKE_LAUNCHCTL_LOG:-}"
+mkdir -p "$state_dir"
+[ -z "$log" ] || printf '%s\n' "$*" >> "$log"
+case "$1" in
+    print)
+        service="${2##*/}"
+        [ -f "$state_dir/$service" ]
+        ;;
+    bootout)
+        service="${2##*/}"
+        rm -f "$state_dir/$service"
+        ;;
+    bootstrap)
+        plist="$3"
+        service="$(basename "$plist" .plist)"
+        touch "$state_dir/$service"
+        ;;
+    kickstart)
+        exit 0
+        ;;
+    *) exit 1;;
+esac
+LAUNCHCTL
+    chmod +x "$dir/launchctl"
 }
 
 make_fake_cmux_live_s1_only() {
@@ -825,10 +858,12 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-watchdog agent-recover agent-wait agent-update; do
+    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-worktree agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-watchdog agent-recover agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
+    cmp -s "$home/.local/share/cmux-bus/bin/agent-notify" "$repo_root/bin/agent-notify" || fail "notification runtime script was not installed"
+    cmp -s "$home/.local/share/cmux-bus/bin/agent-lib" "$repo_root/bin/agent-lib" || fail "notification runtime library was not installed"
 
     pass "install.sh links all commands"
 }
@@ -2911,6 +2946,149 @@ test_agent_lead_guard_install_merges_settings() {
     pass "agent-lead-guard install merges into settings.json idempotently and uninstall is clean"
 }
 
+test_agent_notify_formats_filters_and_deduplicates() {
+    local fakebin workspace cmux_log N count
+    fakebin="$tmp_root/fakebin-notify"
+    workspace="$(new_workspace notify)"
+    cmux_log="$tmp_root/cmux-notify.log"
+    N="$repo_root/bin/agent-notify"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        cat > .agents/bus.jsonl <<'EOF'
+{"id":"handoff1","ts":"2026-08-21T10:00:00Z","from":"codex","to":"claude","type":"handoff","ref":null,"status":"open","paths_claimed":[],"body":"Review API"}
+{"id":"ack00001","ts":"2026-08-21T10:00:01Z","from":"claude","to":"codex","type":"ack","ref":"handoff1","status":"in_progress","paths_claimed":[],"body":"Working"}
+{"id":"reply001","ts":"2026-08-21T10:00:30Z","from":"claude","to":"codex","type":"ask","ref":"handoff1","status":"open","paths_claimed":[],"body":"One reply"}
+{"id":"done0001","ts":"2026-08-21T10:01:00Z","from":"claude","to":"codex","type":"done","ref":"handoff1","status":"done","paths_claimed":[],"body":"Review complete"}
+{"id":"block001","ts":"2026-08-21T10:02:00Z","from":"deepseek","to":"user","type":"block","ref":null,"status":"blocked","paths_claimed":[],"body":"Need a decision"}
+EOF
+
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_WORKSPACE_ID=ws-test \
+            "$N" once --replay --label "Recherche IA"
+
+        grep -Fq "notify --title Codex a confié une tâche à Claude --subtitle Recherche IA --body Review API --surface s2" "$cmux_log" \
+            || fail "handoff notification was not formatted or targeted correctly"
+        grep -Fq "notify --title Claude a terminé son travail pour Codex --subtitle Recherche IA --body Review complete --surface s1" "$cmux_log" \
+            || fail "done notification was not formatted or targeted correctly"
+        grep -Fq "notify --title Claude a répondu à Codex --subtitle Recherche IA --body One reply --surface s1" "$cmux_log" \
+            || fail "reply notification was not formatted correctly"
+        grep -Fq "notify --title Deepseek est bloqué --subtitle Recherche IA --body Need a decision --workspace ws-test" "$cmux_log" \
+            || fail "user-directed block notification did not fall back to the workspace"
+        ! grep -q "Working" "$cmux_log" || fail "ack event generated a notification"
+        count="$(grep -c '^notify ' "$cmux_log")"
+        [ "$count" -eq 4 ] || fail "expected 4 notifications, got $count"
+
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_WORKSPACE_ID=ws-test \
+            "$N" once --label "Recherche IA"
+        [ "$(grep -c '^notify ' "$cmux_log")" -eq 4 ] || fail "cursor replayed already processed notifications"
+
+        printf '%s\n' '{"id":"ask00001","ts":"2026-08-21T10:03:00Z","from":"codex","to":"claude","type":"ask","ref":null,"status":"open","paths_claimed":[],"body":"One question"}' >> .agents/bus.jsonl
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_WORKSPACE_ID=ws-test \
+            "$N" once --label "Recherche IA"
+        grep -Fq "notify --title Codex a envoyé un message à Claude --subtitle Recherche IA --body One question --surface s2" "$cmux_log" \
+            || fail "new ask event was not notified"
+        [ "$(grep -c '^notify ' "$cmux_log")" -eq 5 ] || fail "new event notification count is wrong"
+    )
+
+    pass "agent-notify formats actionable pop-ups, skips ack, targets recipients, and deduplicates"
+}
+
+test_agent_notify_persistent_lifecycle() {
+    local fakebin home workspace launch_state launch_log runtime_dir launch_dir N output service bootstrap_count
+    fakebin="$tmp_root/fakebin-notify-persistent"
+    home="$tmp_root/home-notify-persistent"
+    workspace="$(new_workspace notify-persistent)"
+    launch_state="$tmp_root/launch-state-notify"
+    launch_log="$tmp_root/launch-notify.log"
+    runtime_dir="$home/runtime/bin"
+    launch_dir="$home/Library/LaunchAgents"
+    N="$repo_root/bin/agent-notify"
+    make_fake_cmux "$fakebin"
+    make_fake_launchctl "$fakebin"
+    mkdir -p "$home" "$launch_state"
+
+    (
+        cd "$workspace"
+        write_agents
+        printf '%s\n' '{"id":"old00001","ts":"2026-08-21T09:00:00Z","from":"codex","to":"claude","type":"handoff","ref":null,"status":"open","paths_claimed":[],"body":"Old event"}' >> .agents/bus.jsonl
+        export PATH="$fakebin:$PATH"
+        export HOME="$home"
+        export CMUX_WORKSPACE_ID=ws-test
+        export AGENT_BUS_LAUNCH_AGENTS_DIR="$launch_dir"
+        export AGENT_BUS_NOTIFY_RUNTIME_DIR="$runtime_dir"
+        export FAKE_LAUNCHCTL_STATE_DIR="$launch_state"
+        export FAKE_LAUNCHCTL_LOG="$launch_log"
+
+        "$N" enable --label "Test & Review" >/dev/null
+        service="$(basename "$launch_dir"/*.plist .plist)"
+        [ -f "$launch_state/$service" ] || fail "persistent notifier was not bootstrapped"
+        [ -x "$runtime_dir/agent-notify" ] || fail "runtime notifier was not staged"
+        [ -f "$runtime_dir/agent-lib" ] || fail "runtime library was not staged"
+        grep -q 'Test &amp; Review' "$launch_dir/$service.plist" || fail "notification label was not XML escaped"
+        grep -q '<key>KeepAlive</key><true/>' "$launch_dir/$service.plist" || fail "LaunchAgent is not persistent"
+        [ "$(cat .agents/notifier/cursor)" -eq 1 ] || fail "enable did not start at the current bus end"
+        output="$("$N" status)"
+        printf '%s\n' "$output" | grep -q "enabled and running" || fail "status did not report persistent notifier"
+
+        bootstrap_count="$(grep -c '^bootstrap ' "$launch_log")"
+        "$N" ensure >/dev/null
+        [ "$(grep -c '^bootstrap ' "$launch_log")" -eq "$bootstrap_count" ] || fail "ensure restarted an already running service"
+
+        "$N" disable >/dev/null
+        [ -f .agents/notifier/disabled ] || fail "disable marker was not persisted"
+        [ ! -f "$launch_dir/$service.plist" ] || fail "disable left the LaunchAgent plist"
+        output="$("$N" status)"
+        printf '%s\n' "$output" | grep -q "disabled" || fail "status did not report durable opt-out"
+        "$N" ensure >/dev/null
+        [ "$(grep -c '^bootstrap ' "$launch_log")" -eq "$bootstrap_count" ] || fail "ensure ignored durable opt-out"
+
+        printf '%s\n' '{"id":"new00001","ts":"2026-08-21T10:00:00Z","from":"codex","to":"claude","type":"ask","ref":null,"status":"open","paths_claimed":[],"body":"New event"}' >> .agents/bus.jsonl
+        "$N" enable --label "Test Review" >/dev/null
+        [ ! -f .agents/notifier/disabled ] || fail "enable did not remove opt-out"
+        [ "$(cat .agents/notifier/cursor)" -eq 2 ] || fail "re-enable replayed work from disabled period"
+    )
+
+    pass "agent-notify persists with launchd, starts at EOF, and honors durable disable/enable"
+}
+
+test_agent_init_enables_notifications_by_default() {
+    local fakebin home workspace launch_state launch_log runtime_dir launch_dir bootstrap_count
+    fakebin="$tmp_root/fakebin-init-notify"
+    home="$tmp_root/home-init-notify"
+    workspace="$(new_workspace init-notify)"
+    launch_state="$tmp_root/launch-state-init-notify"
+    launch_log="$tmp_root/launch-init-notify.log"
+    runtime_dir="$home/runtime/bin"
+    launch_dir="$home/Library/LaunchAgents"
+    make_fake_cmux "$fakebin"
+    make_fake_launchctl "$fakebin"
+    mkdir -p "$home" "$launch_state"
+
+    (
+        cd "$workspace"
+        export PATH="$fakebin:$PATH"
+        export HOME="$home"
+        export CMUX_SURFACE_ID=s1
+        export CMUX_WORKSPACE_ID=ws-auto
+        export AGENT_BUS_NOTIFY_AUTO=1
+        export AGENT_BUS_LAUNCH_AGENTS_DIR="$launch_dir"
+        export AGENT_BUS_NOTIFY_RUNTIME_DIR="$runtime_dir"
+        export FAKE_LAUNCHCTL_STATE_DIR="$launch_state"
+        export FAKE_LAUNCHCTL_LOG="$launch_log"
+
+        "$repo_root/bin/agent-init" codex >/dev/null
+        grep -q '^bootstrap ' "$launch_log" || fail "agent-init did not auto-enable notifications"
+        bootstrap_count="$(grep -c '^bootstrap ' "$launch_log")"
+        "$repo_root/bin/agent-notify" disable >/dev/null
+        "$repo_root/bin/agent-init" codex >/dev/null
+        [ "$(grep -c '^bootstrap ' "$launch_log")" -eq "$bootstrap_count" ] || fail "agent-init overrode notification opt-out"
+    )
+
+    pass "agent-init enables notifications by default and respects durable opt-out"
+}
+
 test_agent_init_syncs_protocol_and_template
 test_agent_init_via_symlink
 test_agent_init_defaults_to_workspace_scope
@@ -3000,6 +3178,9 @@ test_agent_watch_skips_malformed_lines
 test_agent_watch_truncates_long_bodies_unless_full
 test_agent_watch_accepts_no_color
 test_agent_watch_clear_truncates_bus_before_snapshot
+test_agent_notify_formats_filters_and_deduplicates
+test_agent_notify_persistent_lifecycle
+test_agent_init_enables_notifications_by_default
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
 test_agent_wait_treats_timeout_as_terminal

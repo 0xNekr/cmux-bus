@@ -168,6 +168,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | `agent-synthesize [--scope repo\|workspace] [--bus-dir DIR] [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>` | Wait for multiple threads to finish, bundle their final replies, and ask the synthesis agent (default `claude`) for consensus, disagreements, and a recommendation. |
 | `agent-thread [--scope repo\|workspace] [--bus-dir DIR] [--json] <id>` | Show the full event history for any event id in a thread. |
 | `agent-watch [--scope repo\|workspace] [--bus-dir DIR] [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, `--full` to avoid body truncation, and `--clear` to truncate the resolved `bus.jsonl` before watching. |
+| `agent-notify [--scope repo\|workspace] [--bus-dir DIR] <enable\|disable\|ensure\|status\|once\|run> [--interval SEC] [--label TEXT] [--replay]` | Automatic read-only bridge from bus events to native cmux pop-ups. `agent-init` enables a persistent per-bus LaunchAgent by default; `disable` is a durable opt-out and `enable` restores it. It notifies `ask`, `handoff`, `done`, `block`, and `timeout` events while acknowledgements stay silent. The recipient surface is targeted so clicking opens the relevant agent. `start`/`stop` remain aliases for `enable`/`disable`. |
 | `agent-wait [--scope repo\|workspace] [--bus-dir DIR] [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON. A watchdog `timeout` event is terminal for any target and exits **3** (distinct from a real done/blocked); the wait's own deadline also exits 3; unknown id exits 1. |
 
 `agent-guard` treats `paths_claimed` as meaningful on open `handoff` events.
@@ -303,6 +304,27 @@ is rejected. If the old agent is still registered/live, dismiss it first.
 `agent-recover` can retry the same live worker, but escalates with the retained
 path instead of silently transferring an isolated worker's task to another
 checkout. The fresh handoff gets a new watchdog lease.
+
+## Native cmux pop-ups (automatic)
+
+`agent-init` automatically installs and starts one persistent notifier for the
+current bus. It survives terminal, cmux, and login restarts through a macOS
+LaunchAgent. No per-agent setup is needed.
+
+Notifications are enabled by default. Opt out for one bus with:
+
+```sh
+agent-notify disable
+```
+
+Restore the default with `agent-notify enable`; inspect it with
+`agent-notify status`. Use `--label "Recherche IA"` with `enable` to override
+the workspace label.
+
+Typical pop-ups are “Claude a confié une tâche à Codex”, “Codex a terminé son
+travail pour Claude”, or “Codex est bloqué”. The notifier only reads
+`bus.jsonl`; it stores its PID, cursor, and opt-out state under the runtime bus
+directory and does not change the protocol or append events.
 
 ## Recovery — what to do when a peer crashes
 

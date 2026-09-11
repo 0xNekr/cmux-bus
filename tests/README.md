@@ -32,6 +32,8 @@ Covered areas:
 - `agent-synthesize` multi-thread collection, custom synthesis agent, JSON
   output, and unknown thread failures
 - `agent-watch` snapshots and current-agent filtering
+- `agent-notify` cmux pop-up formatting, event filtering, cursor deduplication,
+  recipient targeting, persistent LaunchAgent lifecycle, and durable opt-out
 - `agent-wait` final-status waits, timeouts, and unknown ids
 
 The fake `cmux` implements only the contract the scripts need:
@@ -39,8 +41,10 @@ The fake `cmux` implements only the contract the scripts need:
 - `cmux --id-format both surface-health`
 - `cmux send`
 - `cmux send-key`
+- `cmux notify`
 
-Set `CMUX_LOG` inside a test to capture fake `send` / `send-key` calls.
+Set `CMUX_LOG` inside a test to capture fake `send`, `send-key`, and `notify`
+calls.
 
 `worktrees.sh` uses real temporary Git repositories and a cmux stub which
 executes the actual child bootstrap with fake provider CLIs. It covers isolated
