@@ -246,7 +246,14 @@ agent_bus_stop_watchdog() {
 
 # Portable mtime (epoch seconds) of a path; empty if it can't be read.
 agent_bus_mtime() {
-    stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || true
+    local stamp
+    # GNU stat may print filesystem data before rejecting BSD's -f %m form.
+    # Capture each attempt separately so failed output cannot enter arithmetic.
+    if stamp="$(stat -f %m "$1" 2>/dev/null)" || stamp="$(stat -c %Y "$1" 2>/dev/null)"; then
+        case "$stamp" in ''|*[!0-9]*) return 0;; esac
+        printf '%s\n' "$stamp"
+    fi
+    return 0
 }
 
 # Stable-ish host id so we only trust `kill -0` for a holder on the same host.
@@ -477,7 +484,7 @@ agent_operation_lock() {
                 fi
             fi
         else
-            stamp="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || true)"
+            stamp="$(agent_bus_mtime "$lock")"
             if [[ "$stamp" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - stamp )) -ge 30 ]; then
                 rmdir "$lock" 2>/dev/null || true
             fi

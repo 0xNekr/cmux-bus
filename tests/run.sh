@@ -1320,6 +1320,26 @@ test_concurrent_writes_stay_valid() {
     pass "concurrent agent-send writes remain valid JSONL"
 }
 
+test_bus_mtime_handles_stat_variants() {
+    (
+        source "$repo_root/bin/agent-lib"
+        stat() {
+            case "$1" in
+                -f) printf '  File: "lock"\n'; return 1;;
+                -c) printf '1700000000\n';;
+            esac
+        }
+        [ "$(agent_bus_mtime lock)" = 1700000000 ] || fail "failed BSD stat output contaminated the GNU timestamp"
+        stat() { [ "$1" = -f ] || return 1; printf '1700000001\n'; }
+        [ "$(agent_bus_mtime lock)" = 1700000001 ] || fail "BSD timestamp was not read"
+        stat() { printf 'not a timestamp\n'; }
+        [ -z "$(agent_bus_mtime lock)" ] || fail "invalid stat output reached lock arithmetic"
+        stat() { printf 'failed output\n'; return 1; }
+        [ -z "$(agent_bus_mtime lock)" ] || fail "unreadable path returned a timestamp"
+    )
+    pass "lock timestamps support BSD/GNU stat and discard failed or invalid output"
+}
+
 test_bus_lock_breaks_stale_holder() {
     local workspace deadpid
     workspace="$(new_workspace lock-stale)"
@@ -3148,6 +3168,7 @@ test_agent_done_smoke
 test_agent_done_routes_to_delegator_after_own_ack
 test_agent_done_rejects_unknown_id
 test_concurrent_writes_stay_valid
+test_bus_mtime_handles_stat_variants
 test_bus_lock_breaks_stale_holder
 test_agent_watchdog_times_out_expired_and_dead
 test_agent_watchdog_detects_dead_worker
