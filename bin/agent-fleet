@@ -38,6 +38,8 @@ usage: agent-fleet [--scope repo|workspace] [--bus-dir DIR] [--dir left|right|up
   Workers open as background tabs by default; pass --split (optionally with
   --dir) to lay them out as pane splits instead. --no-say, --ready-timeout and
   the bus scope flags are forwarded to each agent-spawn.
+  --worktree gives each member a dedicated checkout; --base REF selects their
+  common starting commit (default HEAD). Existing worktrees are reused.
 EOF
     agent_bus_common_usage >&2
     exit 2
@@ -54,10 +56,16 @@ dir="right"
 split_mode=0
 no_say=0
 ready_timeout=25
+worktree_mode=0
+worktree_base=""
+worktree_base_explicit=0
 specs=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --split)           split_mode=1;;
+        --worktree)        worktree_mode=1;;
+        --base)            [ $# -ge 2 ] || usage; worktree_base="$2"; worktree_base_explicit=1; shift;;
+        --base=*)          worktree_base="${1#--base=}"; worktree_base_explicit=1;;
         --dir)             [ $# -ge 2 ] || usage; dir="$2"; split_mode=1; shift;;
         --dir=*)           dir="${1#--dir=}"; split_mode=1;;
         --no-say)          no_say=1;;
@@ -70,6 +78,11 @@ while [ $# -gt 0 ]; do
 done
 
 [ "${#specs[@]}" -ge 1 ] || usage
+[ -z "$worktree_base" ] || [ "$worktree_mode" -eq 1 ] || { echo "agent-fleet: --base requires --worktree" >&2; exit 2; }
+if [ "$worktree_mode" -eq 1 ]; then
+    # Resolve once so every member starts from the same immutable commit.
+    worktree_base="$(git rev-parse --verify "${worktree_base:-HEAD}^{commit}")" || exit 1
+fi
 
 # Resolve the bus so we can identify the caller and pre-check the spawn policy
 # for the whole team before launching anything (fail fast, like spec validation).
@@ -113,6 +126,11 @@ for spec in "${specs[@]}"; do
     [ -n "$name" ] && [ -n "$provider" ] || {
         echo "agent-fleet: bad spec '$spec' — name and provider are required" >&2; exit 1
     }
+    [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || { echo "agent-fleet: invalid name '$name'" >&2; exit 2; }
+    agent_provider_known "$provider" || { echo "agent-fleet: unknown provider '$provider'" >&2; exit 2; }
+    for existing in ${parsed_names[@]+"${parsed_names[@]}"}; do
+        [ "$existing" != "$name" ] || { echo "agent-fleet: duplicate name '$name'" >&2; exit 2; }
+    done
     parsed_names+=("$name")
     parsed_providers+=("$provider")
     parsed_models+=("$model")
@@ -137,6 +155,14 @@ for i in "${!parsed_names[@]}"; do
     model="${parsed_models[$i]}"
     # Guard the array expansion for bash 3.2 (empty "${a[@]}" errors under set -u).
     spawn_args=(${bus_args[@]+"${bus_args[@]}"} --as "$provider" --ready-timeout "$ready_timeout")
+    if [ "$worktree_mode" -eq 1 ]; then
+        spawn_args+=(--worktree)
+        # Default HEAD applies to new members; restarting a fleet must not
+        # reset or reject a retained branch just because the caller advanced.
+        if [ "$worktree_base_explicit" -eq 1 ] || [ "$(agent_worktree_json "$name")" = null ]; then
+            spawn_args+=(--base "$worktree_base")
+        fi
+    fi
     [ "$split_mode" -eq 1 ] && spawn_args+=(--split --dir "$dir")
     [ -n "$model" ] && spawn_args+=(--model "$model")
     [ "$no_say" -eq 1 ] && spawn_args+=(--no-say)

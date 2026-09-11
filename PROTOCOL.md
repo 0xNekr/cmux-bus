@@ -55,14 +55,23 @@ the repo-scoped thread first.
   "ts":             "ISO-8601 UTC",
   "from":           "agent name",
   "to":             "agent name (or 'user')",
-  "type":           "ask|handoff|done|block|ack",
+  "type":           "ask|handoff|done|block|ack|timeout|reassigned",
   "ref":            "id of parent event, or null",
   "status":         "open|in_progress|done|blocked",
   "paths_claimed":  ["glob", ...],
   "cwd":            "sender working directory",
-  "body":           "free text"
+  "body":           "free text",
+
+  "created_at":     "epoch seconds (handoffs) — anchors the lease",
+  "ttl":            "work-deadline seconds (handoffs, default 300)",
+  "ack_by":         "ack-window seconds (handoffs, default 45)"
 }
 ```
+
+The last three are **lease** fields, optional and numeric. `agent-send`
+stamps them on every `handoff` (defaults `ttl=300`, `ack_by=45`) so the
+watchdog can time the thread out; other event types omit them unless passed
+explicitly with `--ttl` / `--ack-by`.
 
 The bus is **append-only**: `status` is *declared* by an event, not mutated
 on prior events. The effective state of a thread is the **last** event whose
@@ -79,6 +88,10 @@ partial JSON into `bus.jsonl`.
 - `ack` — acknowledge receipt; declares `in_progress`
 - `done` — close a thread with the result
 - `block` — escalate to user when stuck
+- `timeout` — emitted by `agent-watchdog` when a handoff's worker died or its
+  lease expired; addressed to the delegator, `status=blocked` (so it closes the
+  thread, releases its path claims, and unblocks any `agent-wait` on it)
+- `reassigned` — reserved marker for recovery bookkeeping
 
 When `ref` is not `null`, it must point to an existing event id in the
 same `bus.jsonl`. Writers should refuse orphan references.
@@ -262,6 +275,12 @@ in their current pane, or you must intentionally rerun the command with
 
 ## Path ownership
 
+For managed Git worktrees, a handoff also carries `claims_cwd` (the recipient's
+checkout directory) and a `worktree` object (`name`, `path`, `branch`, `base`,
+`repo`). Resolve claims against `claims_cwd` when present, otherwise against
+`cwd`. The latter remains the sender's directory. The same relative file in two
+different worktrees is not a conflicting reservation.
+
 When sending a `handoff`, declare `paths_claimed` (array of file paths or
 globs). Claims are interpreted relative to the event `cwd` when present,
 which keeps claims unambiguous when one cmux workspace contains multiple
@@ -296,6 +315,40 @@ The recipient is expected to read the bus on signal. The signal is a
 wake-up; the bus is the source of truth.
 
 ## Surface lifecycle
+
+### Managed worktrees
+
+`agent-spawn --worktree` / `agent-fleet --worktree` create an isolated branch and
+checkout per worker, starting at committed HEAD or `--base REF`. All workers
+retain the same absolute bus directory. Their shell starts in the checkout and
+uses `agent-init --no-files`, preserving tracked project instructions and files.
+Read this protocol from the bus path supplied in the initial handoff/onboarding.
+
+- Work only in your assigned checkout. Prepare its dependencies/configuration
+  explicitly; ignored files and local edits are not copied from the caller.
+- Commit your delivery and include verification evidence in `agent-done`.
+  Managed-worker `done` events additionally carry a worktree snapshot with
+  `head` and `dirty`. A finished thread is not an integrated branch.
+- `agent-dismiss` closes the surface and drops registration, but retains the
+  worktree record, branch and files. Restart with the same name and `--worktree`
+  to reuse them; then `agent-resume --force <id>` if needed.
+- Recovery must not silently move a managed task to a different checkout.
+  `agent-recover` retries the original live worker or escalates with the retained
+  location. Resumed handoffs use their new lease, not the first attempt's lease.
+- The lead reviews `agent-worktree diff <name>`, dismisses the finished worker,
+  then calls `agent-worktree integrate <name> --check '<command>'`. Integration
+  requires a clean worker checkout and no open handoffs. Contributions merge
+  sequentially into a dedicated integration checkout. Checks run before the
+  merge commit; conflicts/failed checks remain there for explicit resolution or
+  `git merge --abort`. The original checkout is untouched.
+- `agent-worktree remove <name>` removes only clean, integrated checkouts with
+  no registered worker/open handoff. `--keep-branch` allows removing a clean
+  unmerged checkout. Branches are always kept; ignored files block removal too.
+
+Records under `<bus-dir>/worktrees/records/` outlive registration. Inspect them
+through `agent-worktree list/show/path`; do not infer missing work from an empty
+roster. Worktrees share repository metadata and do not isolate ports, databases
+or other external resources.
 
 `agent-init` purges entries in `agents.json` whose `cmux_surface_id` no
 longer corresponds to a live terminal surface in the current workspace
@@ -350,3 +403,77 @@ Manual cleanup of an arbitrary thread is also possible with
 - `agent-done` if **you** are completing or accepting the close
 - `agent-cancel` if **the work is dropped** and should be escalated/audited
 - `agent-resume` if **the work should be retried** by the original peer
+
+## Watchdog & lease deadlines
+
+The stuck heuristic above is passive — it only shows up if someone runs
+`agent-inbox`. The **watchdog** is the active guarantee that a lead is never
+blocked forever waiting on a worker. The rule it enforces:
+
+> A lead waits on the **bus**, never directly on a worker. Its wake-up must come
+> from a source independent of the worker, because the worker may be dead.
+
+Three pieces make that true:
+
+1. **Lease on every handoff.** `agent-send … handoff` stamps `created_at`,
+   `ttl` (work deadline, default 300s) and `ack_by` (ack window, default 45s).
+   A handoff is a *lease*, not an open-ended wait.
+
+2. **`agent-watchdog`** — an independent timer.
+   - `agent-watchdog scan` runs one pass: for each open handoff thread whose
+     worker pane has died (gone from `surface-health`) or whose `ack_by`/`ttl`
+     has passed, it appends a `timeout` event (`status=blocked`) addressed to
+     the delegator and signals its pane.
+   - `agent-watchdog daemon [--interval SEC]` runs `scan` on a loop.
+   - It is **idempotent** (a closed/timed-out thread is skipped) and **batched**
+     (at most one wake-up signal per delegator per pass).
+   - Because the timeout is `status=blocked`, it also **closes the thread**,
+     which releases the worker's `paths_claimed` and unblocks any `agent-wait`.
+   - The daemon is a single point of failure: if it dies, no timeouts surface.
+     So waits must also be **bounded** — never rely on the watchdog alone.
+   - **Auto-activated:** every `agent-send … handoff` (and `agent-spawn`) starts
+     a detached daemon for the bus if none is running (idempotent via
+     `<bus-dir>/watchdog.pid`), and `agent-dismiss` stops it once no spawned
+     workers remain. Binding it to the *handoff* — not just the spawn — is what
+     matters: a lead spawns a worker once but delegates to it many times, so the
+     guarantee has to fire on each delegation. A lead is thus protected without
+     launching anything by hand. Opt out with `AGENT_BUS_NO_WATCHDOG=1`.
+
+3. **Bounded waits.** `agent-wait` / `agent-rpc` always have a deadline and
+   treat a `timeout` event as terminal, exiting **3** (distinct from a real
+   `done`/`blocked`). A lead that blocks on a reply uses `agent-wait <id>`
+   (or `agent-rpc`) and reacts to exit 3 — it never spins forever.
+
+### Recovery cascade — `agent-recover`
+
+On receiving a `timeout`, the lead runs `agent-recover <thread>` to take the
+next bounded step automatically:
+
+```
+RETRY (same worker, if alive) → REASSIGN (another live peer) → ESCALATE (block to user)
+```
+
+The action is derived from how many handoffs the thread already carries, so
+re-running `agent-recover` advances the cascade rather than repeating a step.
+It stops at `--max-retries` (default 2) and escalates with a `block` to `user`,
+so it never loops. Each retry/reassign is a fresh handoff with its own lease, so
+the watchdog covers the retry too. `--dry-run` prints the chosen action without
+appending anything.
+
+### Spawned workers run auto-accept
+
+So a delegated worker can actually *do* the work without a human babysitting
+every action, `agent-spawn` launches it in **auto-accept** by default (claude
+`--permission-mode acceptEdits`, codex `--ask-for-approval never` with a scoped
+permission profile) — sandboxed, not a full bypass. `--interactive` keeps normal
+prompting; `--yolo` opts into full bypass explicitly.
+
+Codex permission profiles treat filesystem writes and Unix-socket connections
+as separate capabilities. Auto-accept grants write access only to the resolved
+bus directory and allowlists the cmux socket paths discovered from
+`CMUX_SOCKET_PATH`, cmux's `last-socket-path`, and the legacy `cmux.sock`
+fallback. The profile's network sandbox is enabled so the socket allowlist
+takes effect, but no Internet domains are allowed. This replaces the older
+`--add-dir <state-home>` approach, which allowed filesystem writes but still
+left cmux IPC blocked by the sandbox. Tasks that need broader access —
+`git push`, `npm install` — still require `--yolo`.

@@ -36,8 +36,15 @@ jobs:
 
       - name: Syntax check
         shell: bash
-        run: bash -n bin/agent-* install.sh tests/run.sh
+        run: |
+          for file in bin/agent-* install.sh tests/*.sh; do
+            bash -n "$file"
+          done
 
       - name: Run smoke tests
         shell: bash
         run: ./tests/run.sh
+
+      - name: Run worktree lifecycle tests
+        shell: bash
+        run: ./tests/worktrees.sh

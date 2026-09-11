@@ -9,8 +9,8 @@ coding agents working side by side in adjacent panes. It gives them a
 shared message bus, structured handoffs, file-ownership claims, and a
 clean escalation path back to the human.
 
-No daemon. No HTTP server. No MCP layer. No Node or Python. Just
-~4 bash scripts, `jq`, and the `cmux` CLI you already have.
+Bash scripts, `jq`, and the `cmux` CLI, with optional Git worktrees for isolated
+workers. No HTTP server, MCP layer, Node or Python runtime.
 
 ## Why
 
@@ -142,12 +142,13 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 
 | Command | What it does |
 |---|---|
+| `agent-worktree [--scope repo\|workspace] [--bus-dir DIR] create\|list\|show\|path\|diff\|integrate\|remove ...` | Manage persistent worker checkouts, inspect their deliveries, merge into a dedicated integration checkout, and remove clean checkouts explicitly. See [Isolated workers](#isolated-workers-with-git-worktrees). |
 | `agent-init [--scope repo\|workspace] [--bus-dir DIR] [--lead] [--as PROVIDER] <name>` | Bootstrap or refresh this bus for `<name>`. Creates the resolved bus dir, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, and purges stale entries from previous sessions. `--lead` declares `<name>` as the bus lead (strict by default — see Lead mode). `--as PROVIDER` records your provider in `.meta` so the spawn policy can classify you. |
-| `agent-spawn [--scope repo\|workspace] [--bus-dir DIR] --as <claude\|codex\|opencode> [--model M] [--task TEXT [--paths "a,b"]] [--split [--dir left\|right\|up\|down]] [--title TEXT\|--no-rename] [--focus] [--say TEXT\|--no-say] <name>` | Open the worker as a **background tab** in your pane (one click away, unfocused), register `<name>` on **this** bus, and launch the chosen agent CLI in it. `--split` lays it out as a pane split instead. The new surface runs `agent-init` in its shell *before* the CLI starts (deterministic registration) and inherits your `CMUX_WORKSPACE_ID` so it lands on the same bus. The tab is renamed `"<model> - <provider>"` (`--title` / `--no-rename`). `--task` seeds a first handoff; default models come from the registry (`agent-providers`); `--model default` uses the CLI's own default. opencode's model is applied via `OPENCODE_CONFIG_CONTENT` (its TUI has no `--model` flag). Enforced by the spawn policy. |
+| `agent-spawn [--scope repo\|workspace] [--bus-dir DIR] --as <claude\|codex\|opencode> [--model M] [--task TEXT [--paths "a,b"]] [--split [--dir left\|right\|up\|down]] [--title TEXT\|--no-rename] [--focus] [--say TEXT\|--no-say] <name>` | Open the worker as a **background tab** in your pane (one click away, unfocused), register `<name>` on **this** bus, and launch the chosen agent CLI in it. `--split` lays it out as a pane split instead. The new surface runs `agent-init` in its shell *before* the CLI starts (deterministic registration) and inherits your `CMUX_WORKSPACE_ID` so it lands on the same bus. The tab is renamed `"<model> - <provider>"` (`--title` / `--no-rename`). `--task` seeds a first handoff; default models come from the registry (`agent-providers`); `--model default` uses the CLI's own default. opencode's model is applied via `OPENCODE_CONFIG_CONTENT` (its TUI has no `--model` flag). Workers launch in **auto-accept** by default (claude `--permission-mode acceptEdits`; codex `--ask-for-approval never` plus a scoped profile for the bus directory and cmux Unix socket) so a delegated worker can act within its workspace without prompting a human — sandboxed, not a full bypass; `--interactive`/`--no-auto` keeps normal prompting and `--yolo` opts into full bypass. Enforced by the spawn policy. |
 | `agent-dismiss [--scope repo\|workspace] [--bus-dir DIR] [--keep-pane] [--force] (<name>\|--all-spawned\|--done)` | The inverse of `agent-spawn`: close a worker's cmux pane and remove it from the registry (and its `.meta`). `--all-spawned` dismisses every lead-spawned worker; `--done` dismisses spawned workers with no open inbound thread. `--keep-pane` deregisters only; `--force` is required to dismiss yourself or the lead (dismissing the lead clears the lead pointer). |
 | `agent-fleet [--scope repo\|workspace] [--bus-dir DIR] [--split [--dir DIR]] [--no-say] <name=provider[:model]> ...` | Spawn a whole team in one shot — one `agent-spawn` per spec (`fixer=codex`, `b=opencode:opencode-go/qwen3.7-max`). Workers open as background tabs by default (`--split` for panes). Validates all specs before spawning so a typo can't leave a half-built team. |
 | `agent-providers [list\|init\|path\|get <provider> <field>] [--json] [--force]` | Inspect and scaffold the provider registry used by `agent-spawn` / `agent-fleet`. Built-in defaults (claude/codex/opencode) are deep-merged with a config at `$AGENT_BUS_PROVIDERS_FILE` or `${XDG_CONFIG_HOME:-~/.config}/cmux-bus/providers.json`; the config survives `./install.sh`. `init` writes the defaults to edit; `get` reads one field for scripts. |
-| `agent-send [--scope repo\|workspace] [--bus-dir DIR] <to> <type> [flags] <body>` | Append event(s) and signal recipient(s). Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`. For `ask`, `<to>` may be `all` or comma-separated names (`claude,deepseek`); this fans out into one thread per peer. Refuses unknown refs and stale recipients. |
+| `agent-send [--scope repo\|workspace] [--bus-dir DIR] <to> <type> [flags] <body>` | Append event(s) and signal recipient(s). Types: `ask`, `handoff`, `done`, `block`, `ack`. Flags: `--ref ID`, `--paths "p1,p2"`, `--status STATUS`, `--ttl SEC`, `--ack-by SEC`. A `handoff` is stamped with a lease (`created_at`, `ttl` default 300s, `ack_by` default 45s) the watchdog uses to time it out. For `ask`, `<to>` may be `all` or comma-separated names (`claude,deepseek`); this fans out into one thread per peer. Refuses unknown refs and stale recipients. |
 | `agent-inbox [--scope repo\|workspace] [--bus-dir DIR] [--json] [--no-stale\|--only-stale] [--no-stuck\|--only-stuck] [--stuck-after MIN]` | List open threads addressed to you, grouped by thread root. Threads whose sender is no longer registered appear with `[stale]`. Threads whose last event is `in_progress` and older than the stuck threshold (default 10 min, configurable via `AGENT_BUS_STUCK_AFTER_MIN` env) appear with `[stuck Xm]`. |
 | `agent-roster [--scope repo\|workspace] [--bus-dir DIR] [--json]` | List the agents registered in the resolved bus and tell you, up front, which one you are (resolved from `CMUX_SURFACE_ID`). Marks your own row `(you)`, shows who is `lead`, and flags each peer `live`/`stale` by presence in `surface-health`. Read-only. |
 | `agent-lead [--scope repo\|workspace] [--bus-dir DIR] [show\|set <name> [--relaxed]\|clear\|strict\|relaxed] [--json]` | Show, set, or clear the bus **lead** — the orchestrator agent that plans, delegates via `handoff`, and reviews results while the other agents execute. A lead is **strict** by default (delegates everything, executes nothing itself unless the user explicitly asks); `set --relaxed`, `relaxed`, and `strict` manage that policy. `set` requires a registered agent name. |
@@ -156,6 +157,8 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | `agent-done [--scope repo\|workspace] [--bus-dir DIR] <id> [body]` | Close a thread by appending a `done` event referencing `<id>`. |
 | `agent-cancel [--scope repo\|workspace] [--bus-dir DIR] <id> [--force] [reason]` | Drop a thread by appending a `block` event to `user` with `status: blocked`. Refuses if the thread is already done/blocked unless `--force`. |
 | `agent-resume [--scope repo\|workspace] [--bus-dir DIR] <id> [--force] [body]` | Re-open a stuck/crashed thread by appending a fresh `handoff` to its **original recipient**. Default body: `RESUME: <previous>`. Refuses if the thread is already done/blocked unless `--force`. |
+| `agent-watchdog [--scope repo\|workspace] [--bus-dir DIR] scan\|daemon [--interval SEC]` | The independent timer that keeps a lead from blocking forever on a worker. `scan` runs one pass: for each open `handoff` whose worker pane died or whose `ack_by`/`ttl` lease expired, it appends a `timeout` event (`status=blocked`) to the delegator and signals its pane — closing the thread, releasing its claims, and unblocking any `agent-wait`. Idempotent and batched (one wake per delegator per pass). `daemon` loops `scan` every `--interval` seconds (default 30). |
+| `agent-recover [--scope repo\|workspace] [--bus-dir DIR] [--max-retries N] [--dry-run] <id>` | Advance the bounded recovery cascade for a timed-out handoff: **retry** the same worker (first attempt, if alive) → **reassign** to another live peer → **escalate** to the user with a `block`. Capped at `--max-retries` (default 2) so it never loops; the next action is derived from the thread's handoff count, so re-running advances it. Each retry/reassign is a fresh leased handoff. |
 | `agent-doctor [--scope repo\|workspace] [--bus-dir DIR]` | Validate the resolved bus and registry without mutating anything. Reports malformed JSONL, schema errors, duplicate ids, orphan refs, and open/stale/stuck thread counts. |
 | `agent-repair [--scope repo\|workspace] [--bus-dir DIR] [--dry-run]` | Repair the resolved `bus.jsonl` when old malformed records contain raw newlines. Dry-run reports what would change; write mode creates a timestamped backup before replacing the bus. |
 | `agent-guard [--scope repo\|workspace] [--bus-dir DIR] check [--json] [--staged] [--agent NAME\|--all] [PATH...]` | Detect files that overlap `paths_claimed` by open threads. By default it ignores claims owned by the current registered surface; use `--agent NAME` outside cmux or `--all` to include every claim. `--staged` checks staged git paths for pre-commit usage. |
@@ -165,8 +168,8 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 | `agent-synthesize [--scope repo\|workspace] [--bus-dir DIR] [--agent NAME] [--timeout SEC] [--interval SEC] [--json] <id...>` | Wait for multiple threads to finish, bundle their final replies, and ask the synthesis agent (default `claude`) for consensus, disagreements, and a recommendation. |
 | `agent-thread [--scope repo\|workspace] [--bus-dir DIR] [--json] <id>` | Show the full event history for any event id in a thread. |
 | `agent-watch [--scope repo\|workspace] [--bus-dir DIR] [--once] [--me] [--full] [--no-color] [--clear] [--lines N] [--interval SEC]` | Watch bus events as they are appended. Use `--once` for a snapshot, `--me` to show only events involving the current registered surface, `--full` to avoid body truncation, and `--clear` to truncate the resolved `bus.jsonl` before watching. |
-| `agent-notify [--scope repo\|workspace] [--bus-dir DIR] <enable\|disable\|ensure\|status\|once\|run> [--interval SEC] [--label TEXT] [--replay]` | Automatic read-only bridge from bus events to native cmux pop-ups. `agent-init` enables a persistent per-bus LaunchAgent by default; `disable` is a durable opt-out and `enable` restores it. It notifies `ask`, `handoff`, `done`, `block`, and future `timeout` events while acknowledgements stay silent. The recipient surface is targeted so clicking opens the relevant agent. `start`/`stop` remain aliases for `enable`/`disable`. |
-| `agent-wait [--scope repo\|workspace] [--bus-dir DIR] [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON and exits non-zero on timeout or unknown id. |
+| `agent-notify [--scope repo\|workspace] [--bus-dir DIR] <enable\|disable\|ensure\|status\|once\|run> [--interval SEC] [--label TEXT] [--replay]` | Automatic read-only bridge from bus events to native cmux pop-ups. `agent-init` enables a persistent per-bus LaunchAgent by default; `disable` is a durable opt-out and `enable` restores it. It notifies `ask`, `handoff`, `done`, `block`, and `timeout` events while acknowledgements stay silent. The recipient surface is targeted so clicking opens the relevant agent. `start`/`stop` remain aliases for `enable`/`disable`. |
+| `agent-wait [--scope repo\|workspace] [--bus-dir DIR] [--timeout SEC] [--interval SEC] [--status done\|blocked\|final] <id>` | Wait for a thread to reach `done`, `blocked`, or either final state. Prints the final event as JSON. A watchdog `timeout` event is terminal for any target and exits **3** (distinct from a real done/blocked); the wait's own deadline also exits 3; unknown id exits 1. |
 
 `agent-guard` treats `paths_claimed` as meaningful on open `handoff` events.
 Claims use Bash pattern matching, so glob characters such as `*`, `?`, and
@@ -205,6 +208,102 @@ of several raw replies:
 ids=$(agent-send claude,deepseek ask "Pick the next feature")
 agent-synthesize $ids
 ```
+
+## Isolated workers with Git worktrees
+
+Use `--worktree` to give each coding worker a **separate directory, branch and
+Git index**, while keeping the same cmux message bus. Git is required for this
+mode, and the source repository must have at least one commit.
+
+```sh
+agent-spawn --as codex --worktree --task "Implement the API" --paths "src/api/*" api
+agent-spawn --as claude --worktree --task "Implement the UI" --paths "src/ui/*" ui
+
+# Or prepare a whole team at one immutable starting commit:
+agent-fleet --worktree --base HEAD api=codex ui=claude reviewer=codex
+```
+
+`--base REF` defaults to committed `HEAD`. Local edits, untracked files, `.env`,
+installed dependencies and ignored artifacts are **not copied**. Prepare each
+checkout's environment as needed; assign separate ports/databases when the
+project uses shared services. Worktrees isolate working files, not OS processes
+or external services. They still share Git objects, refs and repository config.
+
+The bootstrap changes directory before launching the provider, exports the
+absolute bus path (including in repo scope), and uses `agent-init --no-files` so
+runtime setup does not modify tracked `AGENTS.md` or `.gitignore` files. Existing
+project instructions remain present; the onboarding/handoff points to the bus
+protocol. Auto-accept Codex workers also get access to the shared Git metadata
+needed for commits. `--worktree` remains opt-in; ordinary spawns are unchanged.
+
+Records live in `<bus-dir>/worktrees/records/<name>.json`, independently of the
+surface registry, and checkouts in `<bus-dir>/worktrees/checkouts/<name>`.
+Each record stores the repository, branch, base commit and checkout path.
+`agent-roster` shows the active workers' branches and paths; `agent-worktree list`
+also shows retained worktrees after their agents disappear.
+
+```sh
+agent-worktree list --json
+agent-worktree show api
+agent-worktree diff api              # tracked changes since the starting commit
+cd "$(agent-worktree path api)"
+```
+
+Relative `--paths` on a handoff to a managed worker are resolved against **that
+worker's checkout**, using the additive `claims_cwd` event field. `cwd` keeps its
+original meaning (sender directory). Thus two workers can both claim `src/api.ts`
+in their own worktrees; reservations still protect agents sharing a checkout.
+Managed handoffs reject absolute paths and `..` components in claims.
+
+### Deliver, integrate, and clean up
+
+Workers commit their contribution on their own branch, run the relevant checks,
+then call `agent-done`. Its event includes the worktree, commit and dirty state;
+`done` means the worker has delivered, **not** that the code has been merged.
+
+```sh
+# Once the worker has finished its handoff:
+agent-dismiss api                   # closes the pane; retains all work
+agent-worktree integrate api --check './tests/run.sh'
+agent-dismiss ui
+agent-worktree integrate ui --check './tests/run.sh'
+agent-worktree show ui --json        # .integration.path / branch / commit
+agent-worktree remove api
+```
+
+Integration requires a dismissed worker, no open handoff and a clean worker
+checkout. It serializes integrations per Git repository and merges committed
+changes into a **dedicated integration worktree/branch per repository and bus**.
+The original checkout and branch are untouched. `--check` runs in that combined
+checkout **before** the merge commit; omitting it performs no automatic tests.
+Check commands must not modify tracked files or the index.
+
+A conflict or failed check exits non-zero and leaves the pending merge in the
+integration checkout for inspection. Resolve and commit there, or run
+`git -C <integration-path> merge --abort`, then retry. After a manual resolution,
+rerunning `integrate` records the integration and can rerun checks. Review and
+promote the resulting integration branch with your normal Git/PR workflow;
+there is no automatic merge into `main`, push or PR creation.
+
+`remove` refuses registered workers, open handoffs, dirty/ignored files and
+commits absent from the integration checkout. `remove --keep-branch` permits
+removing a clean, unmerged checkout while retaining its commits on the branch.
+**Branches are always retained**, and there is no forced deletion. Recreating a
+removed name archives its old record under `worktrees/history/`.
+
+### Resume an interrupted worker
+
+```sh
+agent-spawn --as codex --worktree --no-say api
+agent-resume --force <thread-id>
+```
+
+Reusing the same name on the same bus reuses its branch and checkout, including
+uncommitted work. A live name, another repository or a conflicting explicit base
+is rejected. If the old agent is still registered/live, dismiss it first.
+`agent-recover` can retry the same live worker, but escalates with the retained
+path instead of silently transferring an isolated worker's task to another
+checkout. The fresh handoff gets a new watchdog lease.
 
 ## Native cmux pop-ups (automatic)
 
@@ -482,10 +581,10 @@ Override freely based on what each agent is best at for the task at hand.
 
 ## What this is not
 
-- Not an orchestrator (no scheduler, no worktree management)
+- No autonomous task scheduler (workflows and worktree operations are explicit)
 - Not a tmux thing (uses cmux's native API; tmux users have plenty of
   better-fit projects)
-- Not a daemon, broker, or service
+- No central broker or HTTP service (watchdog and notification helpers run locally)
 - Not opinionated about which agents you run — anything that runs in a
   terminal and can read/write files works
 

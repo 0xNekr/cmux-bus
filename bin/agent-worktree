@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# Manage isolated worker checkouts and integrate their committed contributions.
+set -euo pipefail
+AGENT_CMD="agent-worktree"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in /*) script_path="$link_target";; *) script_path="$script_dir/$link_target";; esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<'EOF'
+usage: agent-worktree [--scope repo|workspace] [--bus-dir DIR] <command>
+  create NAME [--base REF]             create or reuse a worker checkout
+  list [--json]                       include retained/dismissed workers
+  show NAME [--json]                   show branch, path, base and Git status
+  path NAME                           print the checkout directory
+  diff NAME                           review changes since its base commit
+  integrate NAME [--check COMMAND]     merge into a dedicated integration checkout
+  remove NAME [--keep-branch]          remove a clean, unregistered checkout
+
+Creation uses committed HEAD by default; local edits and ignored files are not
+copied. Reusing a name preserves its checkout and branch. Integration never
+modifies the original checkout; conflicts or failed checks are left for review.
+Remove requires integration unless --keep-branch is used, and never discards
+dirty/ignored files or deletes a branch. No --force is provided.
+EOF
+    exit 2
+}
+die() { echo "$AGENT_CMD: $*" >&2; exit 1; }
+get() { jq -r "$1 // empty" "$record"; }
+save() {
+    local tmp
+    tmp="$(mktemp "$record.tmp.XXXXXX")"
+    jq "$@" "$record" > "$tmp" && mv "$tmp" "$record"
+}
+clean() {
+    [ -z "$(git -C "$1" status --porcelain --untracked-files=all)" ] || die "uncommitted files in $1; commit or preserve them first"
+    local state
+    for state in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-merge rebase-apply; do
+        [ ! -e "$(git -C "$1" rev-parse --git-path "$state")" ] || die "unfinished Git operation in $1"
+    done
+}
+validate_checkout() {
+    [ -f "$checkout/.git" ] || die "managed checkout missing at $checkout; retained metadata was not deleted"
+    [ "$(agent_worktree_common_dir "$checkout")" = "$common" ] || die "checkout belongs to another repository"
+    [ "$(git -C "$checkout" symbolic-ref --quiet --short HEAD || true)" = "$branch" ] || die "checkout switched away from managed branch $branch"
+}
+require_closed() {
+    # A live registered worker must be dismissed before its checkout is merged
+    # or removed. Even a 'done' worker could otherwise keep committing mid-merge.
+    ! jq -e --arg n "$name" '.agents | has($n)' "$AGENT_BUS_AGENTS_FILE" >/dev/null ||
+        die "dismiss '$name' before $command (its worktree will be retained)"
+    local count
+    count="$(jq -Rs --arg n "$name" '
+      def root($m;$e): if $e.ref == null or $m[$e.ref] == null then $e.id else root($m;$m[$e.ref]) end;
+      split("\n") | map(fromjson?) | map(select(type == "object" and .id)) as $ev
+      | ($ev | map({key:.id,value:.}) | from_entries) as $m
+      | $ev | map(. + {root:root($m;.)}) | group_by(.root)
+      | map(select((.[-1].status | IN("done","blocked") | not) and
+          (map(select(.type == "handoff")) | last | .to == $n))) | length
+    ' "$AGENT_BUS_FILE")"
+    [ "$count" = 0 ] || die "'$name' still has $count open handoff(s); finish or cancel them first"
+}
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then set -- "${AGENT_BUS_REMAINING_ARGS[@]}"; else set --; fi
+[ $# -ge 1 ] || usage
+command="$1"; shift
+case "$command" in create|list|show|path|diff|integrate|remove) ;; *) usage;; esac
+name=""; base=""; check=""; json=0; keep_branch=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --base) [ $# -ge 2 ] || usage; base="$2"; shift;;
+        --check) [ $# -ge 2 ] || usage; check="$2"; shift;;
+        --json) json=1;;
+        --keep-branch) keep_branch=1;;
+        -*) usage;;
+        *) [ -z "$name" ] || usage; name="$1";;
+    esac
+    shift
+done
+[ -z "$base" ] || [ "$command" = create ] || usage
+[ -z "$check" ] || [ "$command" = integrate ] || usage
+[ "$keep_branch" -eq 0 ] || [ "$command" = remove ] || usage
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+AGENT_BUS_DIR_EFFECTIVE="$(cd "$AGENT_BUS_DIR_EFFECTIVE" && pwd -P)"
+state="$AGENT_BUS_DIR_EFFECTIVE/worktrees"
+if [ "$command" = list ]; then
+    [ -z "$name" ] || usage
+    records=()
+    for file in "$state"/records/*.json; do [ ! -f "$file" ] || records+=("$file"); done
+    if [ "${#records[@]}" -eq 0 ]; then
+        [ "$json" -eq 0 ] && echo "agent-worktree: no managed worktrees" || echo '[]'
+    elif [ "$json" -eq 1 ]; then jq -s '.' "${records[@]}"
+    else jq -rs '.[] | [.name,.status,.branch,.path] | @tsv' "${records[@]}"; fi
+    exit 0
+fi
+record="$(agent_worktree_record "$name")" || die "invalid worker name '$name'"
+case "$command" in
+    create|integrate|remove)
+        mkdir -p "$state/locks"
+        if [ "$command" != create ]; then
+            agent_operation_lock "$state/locks/$name.spawn.lock"
+        fi
+        agent_operation_lock "$state/locks/$name.record.lock"
+        ;;
+esac
+
+if [ "$command" = create ]; then
+    repo="$(git rev-parse --show-toplevel)" || die "creation requires a Git repository with a commit"
+    repo="$(cd "$repo" && pwd -P)"
+    common="$(agent_worktree_common_dir "$repo")"
+    agent_operation_lock "$common/cmux-bus-worktrees.lock"
+    if [ -f "$record" ] && [ "$(get '.status')" != removed ]; then
+        [ "$(get '.git_common_dir')" = "$common" ] || die "'$name' already belongs to a different repository on this bus"
+        checkout="$(get '.path')"; branch="$(get '.branch')"
+        if [ "$(get '.status')" = creating ]; then
+            if [ ! -e "$checkout" ]; then
+                if git -C "$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+                    git -C "$repo" worktree add "$checkout" "$branch" >&2
+                else
+                    git -C "$repo" worktree add -b "$branch" "$checkout" "$(get '.base')" >&2
+                fi
+            fi
+            validate_checkout
+            save '.status = "active"'
+        fi
+        validate_checkout
+        if [ -n "$base" ]; then
+            requested="$(git -C "$repo" rev-parse --verify "${base}^{commit}")"
+            [ "$requested" = "$(get '.base')" ] || die "existing worktree has a different base; use another name"
+        fi
+        printf '%s\n' "$checkout"
+        exit 0
+    fi
+    base_commit="$(git -C "$repo" rev-parse --verify "${base:-HEAD}^{commit}")" || die "base '${base:-HEAD}' is not a commit"
+    [ -z "$(git -C "$repo" status --porcelain --untracked-files=normal)" ] ||
+        echo "agent-worktree: using committed ${base:-HEAD}; local edits and untracked files are not copied" >&2
+    mkdir -p "$state/records" "$state/checkouts"
+    checkout="$state/checkouts/$name"
+    [ ! -e "$checkout" ] || die "unmanaged directory already exists at $checkout"
+    unique="$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+    branch="cmux-bus/$name-$unique"
+    if [ -f "$record" ]; then
+        mkdir -p "$state/history"
+        cp "$record" "$state/history/$name-$unique.json"
+    fi
+    # Persist intent before Git runs so a failure/interruption remains inspectable.
+    record_tmp="$(mktemp "$record.tmp.XXXXXX")"
+    jq -n --arg n "$name" --arg path "$checkout" --arg repo "$repo" --arg common "$common" \
+        --arg branch "$branch" --arg base "$base_commit" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{name:$n,path:$path,repo:$repo,git_common_dir:$common,branch:$branch,base:$base,created_at:$ts,status:"creating"}' > "$record_tmp"
+    mv "$record_tmp" "$record"
+    if ! git -C "$repo" worktree add -b "$branch" "$checkout" "$base_commit" >&2; then
+        die "Git creation failed; inspect $record and git worktree list before retrying"
+    fi
+    save '.status = "active"'
+    printf '%s\n' "$checkout"
+    exit 0
+fi
+
+[ -f "$record" ] || die "unknown managed worker '$name'"
+checkout="$(get '.path')"; branch="$(get '.branch')"; common="$(get '.git_common_dir')"
+if [ "$command" = show ]; then
+    if [ "$json" -eq 1 ]; then cat "$record"
+    else
+        jq -r '"\(.name): \(.status)\nbranch: \(.branch)\npath: \(.path)\nbase: \(.base)" +
+            (if .integration then "\nintegration: \(.integration.path)" else "" end)' "$record"
+        [ ! -d "$checkout" ] || git -C "$checkout" status --short
+    fi
+    exit 0
+fi
+[ "$(get '.status')" != removed ] || die "worktree '$name' has been removed (branch retained: $branch)"
+validate_checkout
+case "$command" in
+    path) printf '%s\n' "$checkout"; exit 0;;
+    diff) git -C "$checkout" diff "$(get '.base')" --; exit 0;;
+esac
+agent_operation_lock "$common/cmux-bus-worktrees.lock"
+require_closed
+validate_checkout
+clean "$checkout"
+head="$(git -C "$checkout" rev-parse HEAD)"
+
+if [ "$command" = integrate ]; then
+    repo_key="$(printf '%s' "$common" | cksum | awk '{print $1}')"
+    bus_key="$(printf '%s' "$AGENT_BUS_DIR_EFFECTIVE" | cksum | awk '{print $1}')"
+    target="$state/integration/$repo_key"
+    target_branch="cmux-bus/integration-$bus_key-$repo_key"
+    if [ ! -e "$target" ]; then
+        mkdir -p "$state/integration"
+        git -C "$checkout" worktree add -b "$target_branch" "$target" "$(get '.base')" >&2
+    fi
+    [ "$(agent_worktree_common_dir "$target")" = "$common" ] || die "integration checkout belongs to another repository"
+    [ "$(git -C "$target" symbolic-ref --quiet --short HEAD || true)" = "$target_branch" ] || die "integration checkout changed branch"
+    clean "$target"
+    if ! git -C "$target" merge-base --is-ancestor "$head" HEAD; then
+        if ! git -C "$target" merge --no-ff --no-commit "$head"; then
+            die "merge needs resolution in $target; resolve and commit there, or run git merge --abort there"
+        fi
+    fi
+    if [ -n "$check" ]; then
+        expected_tree="$(git -C "$target" write-tree)"
+        echo "agent-worktree: checking in $target: $check"
+        (cd "$target" && bash -c "$check") || die "check failed; inspect $target (pending merge retained)"
+        git -C "$target" diff --quiet || die "check changed tracked files in $target; inspect before committing"
+        [ "$(git -C "$target" write-tree)" = "$expected_tree" ] || die "check changed the index in $target; inspect before committing"
+    fi
+    if [ -f "$(git -C "$target" rev-parse --git-path MERGE_HEAD)" ]; then
+        git -C "$target" commit -m "Integrate agent $name ($branch)"
+    fi
+    integrated_head="$(git -C "$target" rev-parse HEAD)"
+    save --arg p "$target" --arg b "$target_branch" --arg h "$head" --arg c "$integrated_head" --arg check "$check" \
+        '.status = "integrated" | .integration = {path:$p,branch:$b,source_head:$h,commit:$c,check:$check}'
+    echo "agent-worktree: integrated $name into $target_branch"
+    echo "agent-worktree: review and promote from $target"
+else
+    [ -z "$(git -C "$checkout" status --porcelain --ignored --untracked-files=all)" ] || die "ignored or untracked files remain in $checkout; preserve/remove them explicitly"
+    if [ "$keep_branch" -eq 0 ]; then
+        target="$(get '.integration.path')"
+        [ -n "$target" ] && [ -d "$target" ] || die "not integrated; use --keep-branch to retain unmerged commits"
+        [ "$(agent_worktree_common_dir "$target")" = "$common" ] || die "integration repository changed"
+        git -C "$target" merge-base --is-ancestor "$head" HEAD || die "latest worker commits are not integrated"
+    fi
+    git -C "$checkout" worktree remove "$checkout"
+    save --arg h "$head" '.status = "removed" | .last_head = $h'
+    echo "agent-worktree: removed checkout for $name; branch retained: $branch"
+fi

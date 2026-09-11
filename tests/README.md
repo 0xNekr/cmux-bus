@@ -4,6 +4,7 @@ Run the smoke suite from the repository root:
 
 ```sh
 ./tests/run.sh
+./tests/worktrees.sh
 ```
 
 The suite is intentionally plain Bash: no Bats, Python, or Node dependency.
@@ -44,3 +45,13 @@ The fake `cmux` implements only the contract the scripts need:
 
 Set `CMUX_LOG` inside a test to capture fake `send`, `send-key`, and `notify`
 calls.
+
+`worktrees.sh` uses real temporary Git repositories and a cmux stub which
+executes the actual child bootstrap with fake provider CLIs. It covers isolated
+launches (including quoted paths), committed bases, common-bus registration,
+claims in recipient checkouts, delivery metadata, dirty-work restart, renewed
+watchdog leases, safe recovery, multi-worker integration, failed checks/merge
+conflicts, retained branches, ignored-file protection, fleet validation and
+concurrent creation. It disables notification/watchdog startup and uses no real
+provider, cmux socket, user Git configuration or network. Both suites run on
+macOS and Linux in CI.

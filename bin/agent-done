@@ -44,8 +44,17 @@ rfrom=$(printf '%s' "$root_event" | jq -r .from)
 rto=$(printf '%s' "$root_event" | jq -r .to)
 if [ "$rfrom" = "$from" ]; then to="$rto"; else to="$rfrom"; fi
 id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n'); ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+worktree_json="$(agent_worktree_json "$from")"
+if [ "$worktree_json" != null ]; then
+  worktree_path="$(printf '%s' "$worktree_json" | jq -r '.path')"
+  worktree_head="$(git -C "$worktree_path" rev-parse HEAD)"
+  worktree_dirty=false
+  [ -z "$(git -C "$worktree_path" status --porcelain --untracked-files=all)" ] || worktree_dirty=true
+  worktree_json="$(printf '%s' "$worktree_json" | jq -c --arg head "$worktree_head" --argjson dirty "$worktree_dirty" '{name,path,branch,base,repo} + {head:$head,dirty:$dirty}')"
+fi
 event=$(jq -nc --arg id "$id" --arg ts "$ts" --arg from "$from" --arg to "$to" --arg ref "$root" --arg cwd "$PWD" --arg body "$body" \
-  '{id:$id,ts:$ts,from:$from,to:$to,type:"done",ref:$ref,status:"done",paths_claimed:[],cwd:$cwd,body:$body}')
+  --argjson wt "$worktree_json" \
+  '{id:$id,ts:$ts,from:$from,to:$to,type:"done",ref:$ref,status:"done",paths_claimed:[],cwd:$cwd,body:$body} + (if $wt != null then {worktree:$wt} else {} end)')
 agent_bus_append_event "$event"
 if [ "$to" != user ]; then
   target_surface=$(jq -r --arg n "$to" '.agents[$n]//empty' "$AGENT_BUS_AGENTS_FILE")

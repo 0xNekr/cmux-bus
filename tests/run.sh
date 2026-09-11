@@ -3,15 +3,28 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_root="$(mktemp -d)"
-trap 'rm -rf "$tmp_root"' EXIT
+# Clean up the scratch dir and any watchdog daemons a test may have started
+# (matched by their --bus-dir living under tmp_root), so a failed test can't leak
+# a background process.
+trap 'pkill -f "agent-watchdog --bus-dir $tmp_root" 2>/dev/null || true; rm -rf "$tmp_root"' EXIT
 
 pass_count=0
 export AGENT_BUS_SCOPE=repo
-export AGENT_BUS_NOTIFY_AUTO=0
 # Isolate the suite from any real user/repo spawn policy: point the override at a
 # path that never exists, so the resolved policy is the built-in "open". Policy
 # tests set AGENT_BUS_POLICY_FILE per-invocation to override this.
 export AGENT_BUS_POLICY_FILE="$tmp_root/.no-such-policy.json"
+# Likewise isolate the provider registry: without this the suite reads the real
+# user providers.json (~/.config/cmux-bus/providers.json), so a customized launch
+# line silently breaks the spawn tests. Pin it to a path that never exists so the
+# resolved registry is the built-in default. Provider tests set
+# AGENT_BUS_PROVIDERS_FILE per-invocation to override this.
+export AGENT_BUS_PROVIDERS_FILE="$tmp_root/.no-such-providers.json"
+# Don't let the ordinary spawn tests fork real watchdog daemons. The dedicated
+# auto-start test re-enables it with `env -u AGENT_BUS_NO_WATCHDOG`.
+export AGENT_BUS_NO_WATCHDOG=1
+# Runtime notification startup must never touch the real user's launchd state.
+export AGENT_BUS_NOTIFY_AUTO=0
 
 fail() {
     echo "not ok - $1" >&2
@@ -697,6 +710,36 @@ CMUX
     pass "agent-roster lists peers and tells the caller who they are"
 }
 
+test_agent_roster_reports_sandboxed_cmux() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-roster-sandbox"
+    workspace="$(new_workspace roster-sandbox)"
+    mkdir -p "$fakebin"
+    cat > "$fakebin/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    echo "Error: Failed to connect to socket (Operation not permitted)" >&2
+    exit 1
+fi
+exit 0
+CMUX
+    chmod +x "$fakebin/cmux"
+
+    (
+        cd "$workspace"
+        write_agents
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-roster" 2>&1)
+        printf '%s\n' "$out" | grep -q "cmux access denied by the sandbox" \
+            || fail "roster hid the cmux sandbox denial"
+        printf '%s\n' "$out" | grep -q "agent-spawn" \
+            || fail "roster sandbox denial omitted the remediation"
+        printf '%s\n' "$out" | grep -q "agent-roster: bus" \
+            || fail "roster aborted instead of returning best-effort state"
+    )
+
+    pass "agent-roster explains sandboxed cmux access instead of failing silently"
+}
+
 test_agent_lead_set_show_clear() {
     local workspace out
     workspace="$(new_workspace lead-cmd)"
@@ -815,7 +858,7 @@ test_install_links_all_commands() {
     mkdir -p "$home"
 
     PATH="$fakebin:$PATH" HOME="$home" "$repo_root/install.sh" >/dev/null
-    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-wait agent-update; do
+    for tool in agent-init agent-spawn agent-dismiss agent-fleet agent-worktree agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-watchdog agent-recover agent-wait agent-update; do
         [ -L "$home/.local/bin/$tool" ] || fail "$tool was not symlinked"
         [ "$(readlink "$home/.local/bin/$tool")" = "$repo_root/bin/$tool" ] || fail "$tool symlink target is wrong"
     done
@@ -873,6 +916,72 @@ test_agent_send_peer_paths_status_and_signal() {
     )
 
     pass "agent-send records paths/status and signals peer"
+}
+
+test_agent_send_stamps_handoff_deadlines() {
+    local fakebin workspace cmux_log hid aid
+    fakebin="$tmp_root/fakebin-send-ttl"
+    workspace="$(new_workspace send-ttl)"
+    cmux_log="$tmp_root/cmux-send-ttl.log"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        # A handoff gets default lease deadlines (ttl/ack_by/created_at).
+        hid=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff "default lease")
+        jq -s -e --arg id "$hid" '
+            (map(select(.id == $id)) | .[0]) as $e
+            | $e.ttl == 300 and $e.ack_by == 45 and ($e.created_at | type == "number")
+        ' .agents/bus.jsonl >/dev/null || fail "handoff missing default lease deadlines"
+
+        # Explicit overrides are honored.
+        hid=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff --ttl 120 --ack-by 10 "tight lease")
+        jq -s -e --arg id "$hid" 'map(select(.id == $id)) | .[0] | .ttl == 120 and .ack_by == 10' .agents/bus.jsonl >/dev/null || fail "handoff did not honor --ttl/--ack-by"
+
+        # A non-handoff stays deadline-free unless asked.
+        aid=$(PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude ask "no lease")
+        jq -s -e --arg id "$aid" 'map(select(.id == $id)) | .[0] | (has("ttl") | not) and (has("ack_by") | not)' .agents/bus.jsonl >/dev/null || fail "ask should not carry a lease"
+
+        # A bad value is rejected.
+        if PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff --ttl abc "bad" >/dev/null 2>&1; then
+            fail "agent-send accepted a non-numeric --ttl"
+        fi
+    )
+
+    pass "agent-send stamps handoff lease deadlines"
+}
+
+test_agent_send_handoff_autostarts_watchdog() {
+    local fakebin workspace pid
+    fakebin="$tmp_root/fakebin-send-wd"
+    workspace="$(new_workspace send-wd)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        # A handoff to an existing worker (no spawn) must still start a watchdog —
+        # this is the reuse case (spawn once, delegate many) that spawn-only missed.
+        env -u AGENT_BUS_NO_WATCHDOG PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 \
+            "$repo_root/bin/agent-send" claude handoff "do the thing" >/dev/null
+        [ -f .agents/watchdog.pid ] || fail "handoff did not start a watchdog"
+        pid="$(cat .agents/watchdog.pid)"
+        kill -0 "$pid" 2>/dev/null || fail "watchdog pid not alive after handoff"
+
+        # A second handoff must not start a second daemon.
+        env -u AGENT_BUS_NO_WATCHDOG PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 \
+            "$repo_root/bin/agent-send" claude handoff "again" >/dev/null
+        [ "$(cat .agents/watchdog.pid)" = "$pid" ] || { kill "$pid" 2>/dev/null; fail "a second watchdog was started"; }
+
+        # An ask (no lease) must NOT start one once we stop this.
+        kill "$pid" 2>/dev/null; sleep 1; rm -f .agents/watchdog.pid
+        env -u AGENT_BUS_NO_WATCHDOG PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 \
+            "$repo_root/bin/agent-send" claude ask "just asking" >/dev/null
+        [ ! -f .agents/watchdog.pid ] || { kill "$(cat .agents/watchdog.pid)" 2>/dev/null; fail "an ask should not start a watchdog"; }
+    )
+
+    pass "agent-send handoff auto-starts the bus watchdog (ask does not)"
 }
 
 test_agent_send_broadcast_fanout() {
@@ -1209,6 +1318,132 @@ test_concurrent_writes_stay_valid() {
     )
 
     pass "concurrent agent-send writes remain valid JSONL"
+}
+
+test_bus_mtime_handles_stat_variants() {
+    (
+        source "$repo_root/bin/agent-lib"
+        stat() {
+            case "$1" in
+                -f) printf '  File: "lock"\n'; return 1;;
+                -c) printf '1700000000\n';;
+            esac
+        }
+        [ "$(agent_bus_mtime lock)" = 1700000000 ] || fail "failed BSD stat output contaminated the GNU timestamp"
+        stat() { [ "$1" = -f ] || return 1; printf '1700000001\n'; }
+        [ "$(agent_bus_mtime lock)" = 1700000001 ] || fail "BSD timestamp was not read"
+        stat() { printf 'not a timestamp\n'; }
+        [ -z "$(agent_bus_mtime lock)" ] || fail "invalid stat output reached lock arithmetic"
+        stat() { printf 'failed output\n'; return 1; }
+        [ -z "$(agent_bus_mtime lock)" ] || fail "unreadable path returned a timestamp"
+    )
+    pass "lock timestamps support BSD/GNU stat and discard failed or invalid output"
+}
+
+test_bus_lock_breaks_stale_holder() {
+    local workspace deadpid
+    workspace="$(new_workspace lock-stale)"
+
+    (
+        cd "$workspace"
+        write_agents
+        export HOSTNAME=testhost
+
+        # (A) Dead holder on this host: a lock stamped with a PID that is gone must
+        # be broken so the write still lands. This is the SIGKILL-leaves-the-lock
+        # deadlock that previously froze the bus forever.
+        sleep 100 & deadpid=$!
+        kill "$deadpid" 2>/dev/null || true
+        wait "$deadpid" 2>/dev/null || true
+        mkdir .agents/bus.lock
+        printf '%s %s %s\n' testhost "$deadpid" "$(date +%s)" > .agents/bus.lock/owner
+        CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" user block "after-dead" >/dev/null
+        [ "$(jq -s length .agents/bus.jsonl)" = "1" ] || fail "stale (dead-pid) lock was not broken"
+        [ ! -e .agents/bus.lock ] || fail "lock dir left behind after write"
+
+        # (B) Aged lock with no owner stamp: stale once older than the threshold.
+        mkdir .agents/bus.lock
+        AGENT_BUS_LOCK_STALE_SECS=0 CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" user block "after-aged" >/dev/null
+        [ "$(jq -s length .agents/bus.jsonl)" = "2" ] || fail "aged lock was not broken"
+    )
+
+    pass "bus lock breaks a stale holder instead of deadlocking"
+}
+
+test_agent_watchdog_times_out_expired_and_dead() {
+    local fakebin workspace cmux_log past
+    fakebin="$tmp_root/fakebin-watchdog"
+    workspace="$(new_workspace watchdog)"
+    cmux_log="$tmp_root/cmux-watchdog.log"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        past=$(( $(date +%s) - 1000 ))
+        # An old handoff from the lead (codex -> s1) to a LIVE worker (claude -> s2),
+        # ttl long expired and never acked.
+        jq -nc --argjson t "$past" '{id:"hs1",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["x.ts"],cwd:".",body:"old task",created_at:$t,ttl:60,ack_by:30}' > .agents/bus.jsonl
+
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" "$repo_root/bin/agent-watchdog" scan >/dev/null
+        jq -s -e 'map(select(.type=="timeout")) as $t | ($t|length)==1 and $t[0].to=="codex" and $t[0].ref=="hs1" and $t[0].status=="blocked"' .agents/bus.jsonl >/dev/null \
+            || fail "watchdog did not emit one timeout for the expired thread"
+        grep -q "send --surface s1 new timeout id=" "$cmux_log" || fail "watchdog did not signal the delegator"
+
+        # Idempotent: a second scan must not add another timeout (thread now closed).
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" "$repo_root/bin/agent-watchdog" scan >/dev/null
+        [ "$(jq -s 'map(select(.type=="timeout")) | length' .agents/bus.jsonl)" = "1" ] || fail "watchdog double-timed-out a thread"
+    )
+
+    pass "agent-watchdog times out an expired thread once and wakes the delegator"
+}
+
+test_agent_watchdog_detects_dead_worker() {
+    local fakebin workspace cmux_log now
+    fakebin="$tmp_root/fakebin-watchdog-dead"
+    workspace="$(new_workspace watchdog-dead)"
+    cmux_log="$tmp_root/cmux-watchdog-dead.log"
+    # Only s1 is live; claude (s2) is a dead pane.
+    make_fake_cmux_live_s1_only "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        now=$(date +%s)
+        # A fresh handoff well within its ttl, so only liveness can trip it.
+        jq -nc --argjson t "$now" '{id:"hd1",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],cwd:".",body:"task",created_at:$t,ttl:99999,ack_by:99999}' > .agents/bus.jsonl
+
+        PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" "$repo_root/bin/agent-watchdog" scan >/dev/null
+        jq -s -e 'map(select(.type=="timeout")) as $t | ($t|length)==1 and $t[0].to=="codex" and ($t[0].body | test("worker_dead"))' .agents/bus.jsonl >/dev/null \
+            || fail "watchdog did not flag the dead worker"
+    )
+
+    pass "agent-watchdog flags a dead worker even before the ttl expires"
+}
+
+test_agent_watchdog_releases_paths_on_worker_death() {
+    local fakebin workspace now
+    fakebin="$tmp_root/fakebin-watchdog-release"
+    workspace="$(new_workspace watchdog-release)"
+    make_fake_cmux_live_s1_only "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        now=$(date +%s)
+        jq -nc --argjson t "$now" '{id:"hr1",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["src/api.ts"],body:"task",created_at:$t,ttl:99999,ack_by:99999}' > .agents/bus.jsonl
+
+        # The claim is active while the thread is open.
+        if "$repo_root/bin/agent-guard" check --agent codex src/api.ts >/dev/null 2>&1; then
+            fail "path was not claimed while the handoff was open"
+        fi
+        # Worker pane is dead -> watchdog closes the thread, releasing the claim.
+        PATH="$fakebin:$PATH" "$repo_root/bin/agent-watchdog" scan >/dev/null
+        "$repo_root/bin/agent-guard" check --agent codex src/api.ts >/dev/null \
+            || fail "path still claimed after the worker died and the thread timed out"
+    )
+
+    pass "agent-watchdog releases path claims when a worker dies"
 }
 
 test_agent_inbox_empty_bus() {
@@ -1796,6 +2031,95 @@ test_agent_wait_timeout_and_unknown_id() {
     pass "agent-wait times out and rejects unknown ids"
 }
 
+test_agent_wait_treats_timeout_as_terminal() {
+    local workspace rc out
+    workspace="$(new_workspace wait-timeout-event)"
+
+    (
+        cd "$workspace"
+        write_agents
+        # An open handoff plus a watchdog timeout closing it. agent-wait must stop
+        # immediately with exit 3 even though the caller asked for 'done'.
+        jq -nc '{id:"hw1",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"task",created_at:1,ttl:1}' > .agents/bus.jsonl
+        jq -nc '{id:"to1",ts:"2026-05-05T00:01:00Z",from:"watchdog",to:"codex",type:"timeout",ref:"hw1",status:"blocked",paths_claimed:[],body:"stale"}' >> .agents/bus.jsonl
+
+        set +e
+        out="$("$repo_root/bin/agent-wait" --timeout 2 --status done hw1 2>/dev/null)"
+        rc=$?
+        set -e
+        [ "$rc" -eq 3 ] || fail "agent-wait did not exit 3 on a timeout event (got $rc)"
+        printf '%s' "$out" | jq -e '.type == "timeout"' >/dev/null || fail "agent-wait did not print the timeout event"
+    )
+
+    pass "agent-wait treats a watchdog timeout as terminal (exit 3)"
+}
+
+test_agent_recover_retry_and_escalate() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-recover"
+    workspace="$(new_workspace recover)"
+    make_fake_cmux "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        # A timed-out handoff from the lead (codex/s1) to a live worker (claude/s2).
+        jq -nc '{id:"hr",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["a.ts"],body:"do it",created_at:1,ttl:1}' > .agents/bus.jsonl
+        jq -nc '{id:"tor",ts:"2026-05-05T00:01:00Z",from:"watchdog",to:"codex",type:"timeout",ref:"hr",status:"blocked",paths_claimed:[],body:"stale"}' >> .agents/bus.jsonl
+
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-recover" hr)
+        printf '%s' "$out" | grep -q "retry -> claude" || fail "recover did not retry the live worker"
+        tail -n1 .agents/bus.jsonl | jq -e '.type=="handoff" and .to=="claude" and .ref=="hr" and (.body|test("^RETRY:")) and .paths_claimed==["a.ts"]' >/dev/null \
+            || fail "retry handoff not appended correctly"
+
+        # Escalation once the retry cap is reached (max-retries 0 forces it).
+        jq -nc '{id:"hr2",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:[],body:"do it",created_at:1,ttl:1}' > .agents/bus.jsonl
+        jq -nc '{id:"to2",ts:"2026-05-05T00:01:00Z",from:"watchdog",to:"codex",type:"timeout",ref:"hr2",status:"blocked",paths_claimed:[],body:"stale"}' >> .agents/bus.jsonl
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-recover" --max-retries 0 hr2)
+        printf '%s' "$out" | grep -q "escalate -> user" || fail "recover did not escalate at the cap"
+        tail -n1 .agents/bus.jsonl | jq -e '.type=="block" and .to=="user" and .ref=="hr2"' >/dev/null \
+            || fail "escalation block not appended"
+    )
+
+    pass "agent-recover retries a live worker and escalates at the cap"
+}
+
+test_agent_recover_reassigns_to_live_peer() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-recover-reassign"
+    workspace="$(new_workspace recover-reassign)"
+    mkdir -p "$fakebin"
+    # s1 (lead) and s3 (peer) are live; s2 (the assigned worker) is a dead pane.
+    cat > "$fakebin/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    printf 'surface:1 s1 type=terminal in_window=true\nsurface:3 s3 type=terminal in_window=true\n'
+    exit 0
+fi
+if [ "$1" = "send" ] || [ "$1" = "send-key" ]; then
+    [ -n "${CMUX_LOG:-}" ] && printf '%s\n' "$*" >> "$CMUX_LOG"
+    exit 0
+fi
+exit 0
+CMUX
+    chmod +x "$fakebin/cmux"
+
+    (
+        cd "$workspace"
+        write_agents
+        # Worker claude (s2) is dead; deepseek (s3) is a live peer to reassign to.
+        jq -nc '{id:"hr3",ts:"2026-05-05T00:00:00Z",from:"codex",to:"claude",type:"handoff",ref:null,status:"open",paths_claimed:["b.ts"],body:"do it",created_at:1,ttl:1}' > .agents/bus.jsonl
+        jq -nc '{id:"to3",ts:"2026-05-05T00:01:00Z",from:"watchdog",to:"codex",type:"timeout",ref:"hr3",status:"blocked",paths_claimed:[],body:"worker_dead"}' >> .agents/bus.jsonl
+
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-recover" hr3)
+        printf '%s' "$out" | grep -q "reassign -> deepseek" || fail "recover did not reassign to the live peer"
+        tail -n1 .agents/bus.jsonl | jq -e '.type=="handoff" and .to=="deepseek" and .ref=="hr3" and (.body|test("^REASSIGNED from claude:"))' >/dev/null \
+            || fail "reassign handoff not appended correctly"
+    )
+
+    pass "agent-recover reassigns a dead worker's task to a live peer"
+}
+
 test_agent_rpc_prints_response_body() {
     local fakebin workspace output
     fakebin="$tmp_root/fakebin-rpc-body"
@@ -2074,6 +2398,90 @@ test_agent_spawn_model_override_and_default() {
     )
 
     pass "agent-spawn honors --model override, the default sentinel, and --no-say"
+}
+
+test_agent_spawn_auto_accept_permission_modes() {
+    local fakebin workspace log
+    fakebin="$tmp_root/fakebin-spawn-perm"
+    workspace="$(new_workspace spawn-perm)"
+    log="$tmp_root/spawn-perm.log"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+
+        # Default: codex launches auto-accept (sandboxed, no human prompts) — NOT yolo.
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say worker-auto >/dev/null
+        grep -q 'codex --model gpt-5.4 --ask-for-approval never' "$log" \
+            || fail "codex did not launch in auto-accept by default"
+        ! grep -q 'dangerously-bypass' "$log" || fail "default codex should not be a full bypass"
+        # Filesystem writes and Unix-socket access are separate Codex
+        # permissions. The worker needs both to post events and signal peers.
+        grep -q 'permissions.cmux_bus_worker' "$log" || fail "auto codex did not get a scoped permission profile"
+        grep -q 'default_permissions' "$log" || fail "auto codex did not select its permission profile"
+        grep -q 'enabled.*true' "$log" || fail "auto codex did not enable the socket network profile"
+        grep -q 'unix_sockets' "$log" || fail "auto codex did not get cmux socket access"
+        grep -q 'cmux.sock' "$log" || fail "auto codex permission profile omitted the fallback cmux socket"
+        ! grep -q -- '--add-dir' "$log" || fail "auto codex still uses --add-dir instead of socket permissions"
+        ! grep -q -- '--sandbox' "$log" || fail "auto codex mixes legacy sandbox flags with permission profiles"
+
+        # --interactive keeps normal prompting (no auto flags appended).
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --interactive --no-say worker-int >/dev/null
+        grep -q 'codex --model gpt-5.4' "$log" || fail "interactive codex lost its model"
+        ! grep -q 'ask-for-approval' "$log" || fail "interactive codex should not auto-accept"
+
+        # --yolo opts into full bypass explicitly.
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --yolo --no-say worker-yolo >/dev/null
+        grep -q 'codex --model gpt-5.4 --dangerously-bypass-approvals-and-sandbox' "$log" \
+            || fail "--yolo did not pass the full-bypass flag"
+
+        # claude auto-accepts via acceptEdits.
+        : > "$log"
+        CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as claude --no-say worker-cl >/dev/null
+        grep -q 'permission-mode acceptEdits' "$log" || fail "claude did not launch in acceptEdits"
+    )
+
+    pass "agent-spawn launches workers in auto-accept by default, with opt-outs"
+}
+
+test_agent_spawn_autostarts_and_dismiss_stops_watchdog() {
+    local fakebin workspace pid
+    fakebin="$tmp_root/fakebin-wd-auto"
+    workspace="$(new_workspace wd-auto)"
+    make_fake_cmux_spawn "$fakebin"
+
+    (
+        cd "$workspace"
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-init" --lead claude >/dev/null
+
+        # Spawn with the watchdog auto-start ENABLED (the suite disables it globally).
+        env -u AGENT_BUS_NO_WATCHDOG CMUX_LOG=/dev/null AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say wd-worker >/dev/null
+        [ -f .agents/watchdog.pid ] || fail "spawn did not start a watchdog"
+        pid="$(cat .agents/watchdog.pid)"
+        kill -0 "$pid" 2>/dev/null || fail "watchdog pid is not alive after spawn"
+
+        # A second spawn must not start a second daemon (pid unchanged).
+        env -u AGENT_BUS_NO_WATCHDOG CMUX_LOG=/dev/null AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
+            "$repo_root/bin/agent-spawn" --as codex --no-say wd-worker2 >/dev/null
+        [ "$(cat .agents/watchdog.pid)" = "$pid" ] || { kill "$pid" 2>/dev/null; fail "a second watchdog was started"; }
+
+        # Dismissing the whole team stops the watchdog and cleans the pid file.
+        PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead "$repo_root/bin/agent-dismiss" --all-spawned >/dev/null
+        [ ! -f .agents/watchdog.pid ] || { kill "$pid" 2>/dev/null; fail "watchdog pid file not cleaned up on dismiss"; }
+        sleep 1
+        ! kill -0 "$pid" 2>/dev/null || { kill "$pid" 2>/dev/null; fail "watchdog still alive after dismiss"; }
+    )
+
+    pass "agent-spawn auto-starts a watchdog and agent-dismiss stops it"
 }
 
 test_agent_spawn_rejects_bad_input() {
@@ -2714,12 +3122,15 @@ test_agent_init_is_idempotent
 test_agent_init_enforces_one_name_per_surface
 test_agent_init_purges_only_absent_surfaces
 test_agent_roster_lists_peers_and_marks_self
+test_agent_roster_reports_sandboxed_cmux
 test_agent_lead_set_show_clear
 test_agent_init_lead_flag_and_maintenance
 test_agent_init_clears_purged_lead
 test_agent_roster_shows_lead
 test_agent_spawn_opens_split_and_registers
 test_agent_spawn_model_override_and_default
+test_agent_spawn_auto_accept_permission_modes
+test_agent_spawn_autostarts_and_dismiss_stops_watchdog
 test_agent_spawn_rejects_bad_input
 test_agent_spawn_refuses_live_name_collision
 test_agent_dismiss_closes_and_deregisters
@@ -2740,6 +3151,8 @@ test_agent_lead_guard_install_merges_settings
 test_install_links_all_commands
 test_agent_send_ref_validation
 test_agent_send_peer_paths_status_and_signal
+test_agent_send_stamps_handoff_deadlines
+test_agent_send_handoff_autostarts_watchdog
 test_agent_send_broadcast_fanout
 test_agent_send_broadcast_rejects_invalid_batch
 test_agent_send_broadcast_normalizes_recipients
@@ -2755,6 +3168,11 @@ test_agent_done_smoke
 test_agent_done_routes_to_delegator_after_own_ack
 test_agent_done_rejects_unknown_id
 test_concurrent_writes_stay_valid
+test_bus_mtime_handles_stat_variants
+test_bus_lock_breaks_stale_holder
+test_agent_watchdog_times_out_expired_and_dead
+test_agent_watchdog_detects_dead_worker
+test_agent_watchdog_releases_paths_on_worker_death
 test_agent_inbox_empty_bus
 test_agent_cancel_and_resume_smoke
 test_agent_cancel_and_resume_negative_cases
@@ -2786,6 +3204,9 @@ test_agent_notify_persistent_lifecycle
 test_agent_init_enables_notifications_by_default
 test_agent_wait_returns_final_event
 test_agent_wait_timeout_and_unknown_id
+test_agent_wait_treats_timeout_as_terminal
+test_agent_recover_retry_and_escalate
+test_agent_recover_reassigns_to_live_peer
 test_agent_rpc_prints_response_body
 test_agent_rpc_json_and_blocked_status
 test_agent_rpc_rejects_invalid_recipients

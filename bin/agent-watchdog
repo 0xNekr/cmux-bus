@@ -1,0 +1,220 @@
+#!/usr/bin/env bash
+# agent-watchdog [--scope repo|workspace] [--bus-dir DIR] scan
+# agent-watchdog [--scope repo|workspace] [--bus-dir DIR] daemon [--interval SEC]
+#
+# Guarantee that a lead is never blocked forever waiting on a worker. The watchdog
+# is the INDEPENDENT timer the whole design hinges on: the lead's wake-up must not
+# depend on the worker (which may be dead). Each pass reconstructs open handoff
+# threads and, for any thread whose worker pane has died or whose lease deadline
+# (ack_by / ttl) has passed, appends a `timeout` event addressed to the delegator
+# and signals its pane. The timeout event is status=blocked, so it also closes the
+# thread (releasing its path claims) and unblocks any agent-wait on it.
+#
+# Idempotent: a thread that is already timed out is skipped. Batched: at most one
+# wake-up signal per delegator per pass, to avoid flooding when many expire at
+# once.
+
+set -euo pipefail
+
+AGENT_CMD="agent-watchdog"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-watchdog [--scope repo|workspace] [--bus-dir DIR] scan
+       agent-watchdog [--scope repo|workspace] [--bus-dir DIR] daemon [--interval SEC]
+
+  scan    run one pass: time out expired/dead handoff threads and wake delegators.
+  daemon  run scan in a loop every --interval seconds (default 30).
+
+  A timed-out thread gets a 'timeout' event (status blocked) addressed to its
+  delegator; the delegator's pane is signalled so the lead reacts instead of
+  waiting forever. Re-running scan never double-times-out the same thread.
+
+WATCHDOG LIVENESS: the daemon is intentionally trivial so it rarely dies, but it
+is still a single point of failure. Run it from a stable pane (or re-launch it
+from the lead). If it stops, no timeouts surface — so the lead should also bound
+its explicit waits (agent-wait --timeout) rather than rely on the watchdog alone.
+EOF
+    agent_bus_common_usage >&2
+    exit 2
+}
+
+interval=30
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
+[ $# -ge 1 ] || usage
+mode="$1"; shift
+case "$mode" in
+    scan) ;;
+    daemon)
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --interval) [ $# -ge 2 ] || usage; interval="$2"; shift 2;;
+                --interval=*) interval="${1#--interval=}"; shift;;
+                *) usage;;
+            esac
+        done
+        case "$interval" in ''|*[!0-9]*) echo "$AGENT_CMD: --interval must be a positive integer" >&2; exit 2;; esac
+        [ "$interval" -gt 0 ] || { echo "$AGENT_CMD: --interval must be > 0" >&2; exit 2; }
+        ;;
+    *) usage;;
+esac
+
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+
+# Emit one TSV row per ACTIVE open handoff thread, with the timing verdict and
+# the delegator/worker surfaces resolved here (agents.json is a second jq input)
+# so the bash loop below forks no jq per candidate. Liveness (pane death) is still
+# decided in bash, since it needs cmux. Columns:
+#   root  delegator  delegator_surface  worker  worker_surface  reason
+scan_candidates() {
+    local now
+    now="$(date +%s)"
+    jq -Rsr --slurpfile agents "$AGENT_BUS_AGENTS_FILE" --argjson now "$now" '
+        def root($m;$e): if ($e.ref==null or ($m[$e.ref]==null)) then $e.id else root($m;$m[$e.ref]) end;
+        ($agents[0].agents // {}) as $surf
+        | split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events
+        | ($events | map({key:.id,value:.}) | from_entries) as $m
+        | ($events | map(. + {__root: root($m;.)}))
+        | group_by(.__root)[]
+        | .[0] as $rootev
+        | .[-1] as $last
+        | select($rootev.type == "handoff")
+        | select($last.status == "open" or $last.status == "in_progress")
+        | (map(select(.type == "handoff")) | last) as $attempt
+        | select($attempt.ttl != null and $attempt.created_at != null)
+        | (map(.id) | index($attempt.id)) as $attempt_index
+        | (any(.[$attempt_index:][]; .type == "ack")) as $acked
+        | ($attempt.created_at + $attempt.ttl) as $ttl_deadline
+        | (if $attempt.ack_by != null then ($attempt.created_at + $attempt.ack_by) else null end) as $ack_deadline
+        | (if ($acked | not) and $ack_deadline != null and $now >= $ack_deadline then "no_ack"
+           elif $now >= $ttl_deadline then (if $acked then "stale_ack" else "stale" end)
+           else "none" end) as $reason
+        | [$rootev.id, $rootev.from, ($surf[$rootev.from] // ""), $attempt.to, ($surf[$attempt.to] // ""), $reason]
+        | @tsv
+    ' "$AGENT_BUS_FILE"
+}
+
+emit_timeout() {
+    # emit_timeout <root> <delegator> <worker> <reason>
+    local root="$1" delegator="$2" worker="$3" reason="$4"
+    local id ts body
+    id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    case "$reason" in
+        worker_dead) body="worker '$worker' pane is gone — task abandoned (worker_dead)";;
+        no_ack)      body="worker '$worker' did not ack within the ack window (no_ack)";;
+        stale_ack)   body="worker '$worker' acked but did not finish before the ttl (stale_ack)";;
+        stale)       body="worker '$worker' did not finish before the ttl (stale)";;
+        *)           body="worker '$worker' timed out ($reason)";;
+    esac
+    local event
+    event=$(jq -nc --arg id "$id" --arg ts "$ts" --arg from "watchdog" --arg to "$delegator" \
+        --arg ref "$root" --arg cwd "$PWD" --arg body "$body" \
+        '{id:$id, ts:$ts, from:$from, to:$to, type:"timeout", ref:$ref, status:"blocked", paths_claimed:[], cwd:$cwd, body:$body}')
+    agent_bus_append_event "$event"
+    printf '%s\n' "$id"
+}
+
+run_scan() {
+    local live signal_log emitted
+    signal_log="$(mktemp)"
+    emitted=0
+
+    # Snapshot live surfaces once per pass (closed panes disappear from health).
+    live=$(agent_bus_live_surfaces)
+
+    # scan_candidates emits TSV with surfaces already resolved, so this loop forks
+    # no jq per candidate.
+    while IFS=$'\t' read -r root delegator deleg_surface worker worker_surface reason; do
+        [ -n "$root" ] || continue
+        local action id
+
+        # Decide the action: a dead worker pane trumps a time-based verdict, since
+        # a gone worker will never finish regardless of how much ttl is left.
+        action=""
+        if [ -n "$worker_surface" ] && [ -n "$live" ] && ! printf '%s\n' "$live" | grep -qxF "$worker_surface"; then
+            action="worker_dead"
+        elif [ "$reason" != "none" ]; then
+            action="$reason"
+        fi
+        [ -n "$action" ] || continue
+
+        id=$(emit_timeout "$root" "$delegator" "$worker" "$action")
+        printf '%s\t%s\t%s\n' "$delegator" "$deleg_surface" "$id" >> "$signal_log"
+        emitted=$((emitted + 1))
+        echo "$AGENT_CMD: timed out thread $root ($action), notified $delegator [$id]"
+    done <<EOF
+$(scan_candidates)
+EOF
+
+    # Batch the wake-ups: one signal per delegator, even if several of its threads
+    # expired this pass, so a delegator is never flooded. The delegator surface is
+    # already in the signal log, so no jq here either.
+    if [ "$emitted" -gt 0 ]; then
+        local d count first surface extra
+        for d in $(cut -f1 "$signal_log" | sort -u); do
+            [ "$d" = "user" ] && continue
+            count=$(awk -F'\t' -v d="$d" '$1==d {n++} END{print n+0}' "$signal_log")
+            first=$(awk -F'\t' -v d="$d" '$1==d {print $3; exit}' "$signal_log")
+            surface=$(awk -F'\t' -v d="$d" '$1==d {print $2; exit}' "$signal_log")
+            extra=""
+            [ "$count" -gt 1 ] && extra=" (+$((count - 1)) more)"
+            if [ -n "$surface" ]; then
+                cmux send --surface "$surface" "new timeout id=$first from=watchdog$extra" >/dev/null 2>&1 || true
+                cmux send-key --surface "$surface" Enter >/dev/null 2>&1 || true
+            fi
+        done
+    fi
+
+    rm -f "$signal_log"
+    return 0
+}
+
+if [ "$mode" = "scan" ]; then
+    run_scan
+else
+    # Self-guard: never run two daemons on one bus (they would double-emit). If a
+    # live one already owns the pid file, step aside; otherwise claim it and clean
+    # up on exit so the slot frees when we stop.
+    pidfile="$AGENT_BUS_DIR_EFFECTIVE/watchdog.pid"
+    if [ -f "$pidfile" ]; then
+        other="$(cat "$pidfile" 2>/dev/null)"
+        if [ -n "$other" ] && [ "$other" != "$$" ] && kill -0 "$other" 2>/dev/null; then
+            echo "$AGENT_CMD: another watchdog (pid $other) already runs for this bus; exiting" >&2
+            exit 0
+        fi
+    fi
+    printf '%s\n' "$$" > "$pidfile"
+    # EXIT cleans the pid file; INT/TERM must explicitly exit (a signal trap
+    # otherwise runs the handler and RESUMES the loop), which then fires EXIT.
+    trap 'rm -f "$pidfile" 2>/dev/null || true' EXIT
+    trap 'exit 0' INT TERM
+    echo "$AGENT_CMD: daemon scanning every ${interval}s (Ctrl-C to stop)"
+    while :; do
+        run_scan || echo "$AGENT_CMD: scan pass failed, continuing" >&2
+        # Sleep in the background and wait on it so a SIGTERM/INT fires the trap
+        # immediately instead of being deferred until a foreground sleep returns
+        # (otherwise stopping the daemon would hang for up to one interval).
+        sleep "$interval" &
+        wait "$!"
+    done
+fi

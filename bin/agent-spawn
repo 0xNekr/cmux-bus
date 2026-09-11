@@ -50,9 +50,17 @@ usage: agent-spawn [--scope repo|workspace] [--bus-dir DIR] \\
   --focus           focus the new pane (default: keep focus on the caller)
   --task TEXT       hand <name> a first task as a handoff once it registers
   --paths "a,b"     paths_claimed for --task (passed through to agent-send)
+  --worktree        create/reuse a dedicated Git worktree and branch for <name>
+  --base REF        starting commit for a new --worktree (default: HEAD)
   --say TEXT        custom onboarding message (default: a generic orientation)
   --no-say          do not send any onboarding message (spawn bare)
+  --interactive     keep the CLI's normal permission prompting (disable auto-accept)
+  --no-auto         alias for --interactive
+  --yolo            full permission bypass (DANGEROUS; opt-in, not the default)
   --ready-timeout N seconds to wait for registration / pane readiness [default: 25]
+
+  By default a worker launches in AUTO-ACCEPT: it acts within its workspace
+  without prompting a human for basic edits/commands, but it is not a full bypass.
 
   Models default per provider via the registry; override the registry with a
   config file (see 'agent-providers init').
@@ -83,10 +91,19 @@ tab_title=""
 title_set=0
 no_rename=0
 ready_timeout=25
+perm_mode="auto"
+worktree_mode=0
+worktree_base=""
 args=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --as)            [ $# -ge 2 ] || usage; provider="$2"; shift;;
+        --worktree)      worktree_mode=1;;
+        --base)          [ $# -ge 2 ] || usage; worktree_base="$2"; shift;;
+        --base=*)        worktree_base="${1#--base=}";;
+        --interactive)   perm_mode="interactive";;
+        --no-auto)       perm_mode="interactive";;
+        --yolo)          perm_mode="yolo";;
         --as=*)          provider="${1#--as=}";;
         --model)         [ $# -ge 2 ] || usage; model="$2"; shift;;
         --model=*)       model="${1#--model=}";;
@@ -114,6 +131,9 @@ done
 
 [ "${#args[@]}" -eq 1 ] || usage
 name="${args[0]}"
+[ -z "$worktree_base" ] || [ "$worktree_mode" -eq 1 ] || {
+    echo "agent-spawn: --base requires --worktree" >&2; exit 2;
+}
 
 [[ "$name" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || {
     echo "agent-spawn: name must be lowercase, start with a letter, [a-z0-9_-], 1..32 chars" >&2
@@ -173,14 +193,35 @@ fi
 # Refuse to clobber a *live* agent that already owns this name. agent-init in the
 # child would otherwise reassign the name to the new surface, orphaning the
 # existing one. A stale entry (dead surface) is fine — it will be cleaned up.
+if [ "$worktree_mode" -eq 1 ]; then
+    mkdir -p "$AGENT_BUS_DIR_EFFECTIVE/worktrees/locks"
+    agent_operation_lock "$AGENT_BUS_DIR_EFFECTIVE/worktrees/locks/$name.spawn.lock"
+fi
 if jq -e --arg n "$name" '.agents | has($n)' "$AGENT_BUS_AGENTS_FILE" >/dev/null; then
     existing_surface="$(jq -r --arg n "$name" '.agents[$n]' "$AGENT_BUS_AGENTS_FILE")"
-    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
+    live=$(agent_bus_live_surfaces)
     if printf '%s\n' "$live" | grep -qxF "$existing_surface"; then
         echo "agent-spawn: '$name' is already a live agent on this bus (surface $existing_surface)" >&2
         echo "agent-spawn: pick another name, or 'agent-dismiss $name' first" >&2
         exit 1
     fi
+fi
+
+# A retained checkout cannot silently be replaced by a shared-directory worker.
+worktree_json="$(agent_worktree_json "$name")"
+if [ "$worktree_json" != null ] && [ "$worktree_mode" -eq 0 ]; then
+    echo "agent-spawn: '$name' has a retained worktree; use --worktree to resume it" >&2
+    exit 1
+fi
+worktree_path=""
+if [ "$worktree_mode" -eq 1 ]; then
+    worktree_args=()
+    [ -z "$worktree_base" ] || worktree_args=(--base "$worktree_base")
+    worktree_path="$("$AGENT_BIN_DIR/agent-worktree" --bus-dir "$AGENT_BUS_DIR_EFFECTIVE" create "$name" ${worktree_args[@]+"${worktree_args[@]}"})"
+    worktree_json="$(agent_worktree_json "$name")"
+    # Pin an absolute bus even in repo scope: the child's Git root is different.
+    AGENT_BUS_CLI_DIR="$(cd "$AGENT_BUS_DIR_EFFECTIVE" && pwd -P)"
+    agent_bus_set_paths
 fi
 
 # Build the launch command from the registry, honoring the provider's model
@@ -204,6 +245,73 @@ elif [ "$model_style" = "opencode" ]; then
 else
     launch_cmd="$launch ${model_flag:+$model_flag }$(printf '%q' "$model")"
 fi
+
+# Permission posture. By default a spawned worker runs in AUTO-ACCEPT: it may
+# read/edit/run within its workspace without prompting a human for every basic
+# action, but it is NOT a full bypass ("yolo"). --interactive/--no-auto keeps the
+# CLI's normal prompting; --yolo opts into full bypass explicitly. The flags are
+# appended after the model so they never disturb the "<launch> <model>" prefix
+# that the rest of the tooling (and tests) match on.
+#
+# Codex permission profiles distinguish filesystem access from Unix-socket
+# access. The bus needs a writable directory, while cmux signalling needs an
+# explicit allow entry for its socket; --add-dir alone does not grant the latter
+# and makes cmux fail with EPERM from inside the sandbox.
+state_home="$(agent_bus_state_home 2>/dev/null || printf '%s' "$HOME/.local/state")"
+perm_suffix=""
+case "$base_cmd" in
+    claude)
+        case "$perm_mode" in
+            auto)        perm_suffix="--permission-mode acceptEdits";;
+            yolo)        perm_suffix="--permission-mode bypassPermissions";;
+            interactive) perm_suffix="";;
+        esac
+        ;;
+    codex)
+        case "$perm_mode" in
+            auto)
+                # Build one self-contained permission profile on the command
+                # line so no global Codex config needs to be installed. JSON
+                # strings are valid TOML strings and safely preserve paths.
+                bus_toml="$(jq -Rn --arg value "$AGENT_BUS_DIR_EFFECTIVE" '$value')"
+                git_access=""
+                if [ "$worktree_mode" -eq 1 ]; then
+                    common_toml="$(printf '%s' "$worktree_json" | jq '.git_common_dir')"
+                    git_access=", $common_toml = \"write\""
+                fi
+                socket_entries=""
+                socket_candidates="${CMUX_SOCKET_PATH:-}
+$state_home/cmux/cmux.sock"
+                if [ -r "$state_home/cmux/last-socket-path" ]; then
+                    socket_candidates="$socket_candidates
+$(head -n1 "$state_home/cmux/last-socket-path")"
+                fi
+                socket_candidates="$(printf '%s\n' "$socket_candidates" | awk 'NF && !seen[$0]++')"
+                while IFS= read -r socket_path; do
+                    [ -n "$socket_path" ] || continue
+                    socket_toml="$(jq -Rn --arg value "$socket_path" '$value')"
+                    [ -z "$socket_entries" ] || socket_entries="$socket_entries, "
+                    socket_entries="$socket_entries$socket_toml = \"allow\""
+                done <<EOF
+$socket_candidates
+EOF
+                # Unix-socket allowlists are enforced only when the profile's
+                # network sandbox is enabled. With no domain allow entries,
+                # outbound Internet access remains blocked.
+                profile="{ extends = \":workspace\", filesystem = { $bus_toml = \"write\"$git_access }, network = { enabled = true, unix_sockets = { $socket_entries } } }"
+                perm_suffix="--ask-for-approval never -c $(printf '%q' "permissions.cmux_bus_worker=$profile") -c $(printf '%q' 'default_permissions="cmux_bus_worker"')"
+                ;;
+            yolo)        perm_suffix="--dangerously-bypass-approvals-and-sandbox";;
+            interactive) perm_suffix="";;
+        esac
+        ;;
+    *)
+        # opencode and any other provider: no known non-interactive flag, so leave
+        # the launch untouched regardless of mode.
+        perm_suffix=""
+        ;;
+esac
+[ -n "$perm_suffix" ] && launch_cmd="$launch_cmd $perm_suffix"
 
 # Bus scope flags to forward — to the child's agent-init (so it lands on THIS
 # bus) and to our own agent-send for --task. Workspace scope needs nothing (same
@@ -255,6 +363,11 @@ fi
 # Bootstrap line: register first (deterministic), then launch the CLI only if
 # registration succeeded. Sent as one shell line, executed by the trailing Enter.
 boot_line="agent-init ${child_scope_args:+$child_scope_args }$(printf '%q' "$name") && $launch_cmd"
+if [ "$worktree_mode" -eq 1 ]; then
+    # Export once for the whole child shell, including subsequent agent-* calls.
+    # --no-files avoids injecting runtime AGENTS/.gitignore edits into deliveries.
+    boot_line="cd $(printf '%q' "$worktree_path") && export AGENT_BUS_DIR=$(printf '%q' "$AGENT_BUS_DIR_EFFECTIVE") PATH=$(printf '%q' "$AGENT_BIN_DIR"):\$PATH && $(printf '%q' "$AGENT_BIN_DIR/agent-init") --no-files $(printf '%q' "$name") && $launch_cmd"
+fi
 cmux send --surface "$new_surface" "$boot_line" >/dev/null
 cmux send-key --surface "$new_surface" Enter >/dev/null
 
@@ -282,10 +395,17 @@ echo "agent-spawn: '$name' registered on bus $AGENT_BUS_DIR_EFFECTIVE"
 # show provenance and agent-dismiss act on the team the lead built.
 spawned_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 meta_model="${model:-default}"
-tmp=$(mktemp)
-jq --arg n "$name" --arg p "$provider" --arg m "$meta_model" --arg by "$me" --arg at "$spawned_at" \
-    '.meta = ((.meta // {}) + {($n): {provider:$p, model:$m, spawned_by:$by, spawned_at:$at}})' \
-    "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+agent_registry_update --arg n "$name" --arg p "$provider" --arg m "$meta_model" --arg by "$me" --arg at "$spawned_at" --argjson wt "$worktree_json" \
+    '.meta = ((.meta // {}) + {($n): ((.meta[$n] // {}) + {provider:$p, model:$m, spawned_by:$by, spawned_at:$at} +
+      (if $wt == null then {} else {worktree:$wt.path,branch:$wt.branch,base:$wt.base} end))})'
+
+# Now that this bus has delegated work, make sure a watchdog is running so a
+# stalled or dead worker can never leave the lead blocked forever. Idempotent —
+# starts one only if none is alive for this bus.
+if agent_bus_ensure_watchdog "$AGENT_BUS_DIR_EFFECTIVE" "$AGENT_BIN_DIR"; then
+    agent_bus_watchdog_running "$AGENT_BUS_DIR_EFFECTIVE" \
+        && echo "agent-spawn: watchdog active for this bus (timeouts will wake the lead)"
+fi
 
 # Wait for the CLI's TUI to finish drawing before we type into it: poll the
 # rendered screen until it is non-empty and stable across two reads. Set
@@ -317,6 +437,9 @@ fi
 # send a generic orientation nudge. Either way the agent ends up reading its
 # inbox; with --task it finds real work waiting there.
 if [ "$task_set" -eq 1 ]; then
+    if [ "$worktree_mode" -eq 1 ]; then
+        task="$(printf '%s\n\n%s\n' "$task" "Work only in $worktree_path on branch $(printf '%s' "$worktree_json" | jq -r '.branch'). Commit your changes before agent-done; do not merge other branches. Read $AGENT_BUS_PROTOCOL_FILE for the coordination protocol.")"
+    fi
     send_paths_args=()
     [ -n "$paths" ] && send_paths_args=(--paths "$paths")
     # agent-send takes <to> <type> first, then flags, then the body. Guard the
@@ -332,6 +455,7 @@ elif [ "$no_say" -eq 0 ]; then
         say="You are '$name' on the cmux multi-agent bus."
         [ -n "$lead" ] && say="$say The lead is '$lead'."
         say="$say Run 'agent-roster' then 'agent-inbox' to see who is here and any work addressed to you, then wait for handoffs."
+        [ "$worktree_mode" -eq 0 ] || say="$say Work only in $worktree_path on branch $(printf '%s' "$worktree_json" | jq -r '.branch'). Commit your changes before agent-done; never merge into other agents' branches. Read $AGENT_BUS_PROTOCOL_FILE for the coordination protocol."
     fi
     cmux send --surface "$new_surface" "$say" >/dev/null
     cmux send-key --surface "$new_surface" Enter >/dev/null

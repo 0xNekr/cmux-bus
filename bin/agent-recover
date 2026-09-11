@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# agent-recover [--scope repo|workspace] [--bus-dir DIR] [--max-retries N] [--dry-run] <thread-id>
+#
+# Drive the bounded recovery cascade after a handoff times out, so the lead is
+# never stuck choosing what to do by hand and never loops forever:
+#
+#   RETRY    re-hand the task to the same worker (only on the first attempt and
+#            only if its pane is still alive)
+#   REASSIGN hand it to another live peer
+#   ESCALATE block to the user once the retry cap is hit or no peer is available
+#
+# The next action is derived from how many handoffs the thread already carries, so
+# re-running agent-recover keeps advancing the cascade instead of repeating a step.
+# Run it as the delegating agent (the lead) when you receive a `timeout`.
+
+set -euo pipefail
+
+AGENT_CMD="agent-recover"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *)  script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat >&2 <<EOF
+usage: agent-recover [--scope repo|workspace] [--bus-dir DIR] [--max-retries N] [--dry-run] <thread-id>
+
+  Advance the recovery cascade for a timed-out handoff thread:
+  retry (same worker) -> reassign (another live peer) -> escalate (block to user).
+  --max-retries N  attempts before escalating (default 2)
+  --dry-run        print the chosen action without appending anything
+EOF
+    agent_bus_common_usage >&2
+    exit 2
+}
+
+max_retries=2
+dry_run=0
+
+agent_bus_parse_common "$@"
+if [ "${#AGENT_BUS_REMAINING_ARGS[@]}" -gt 0 ]; then
+    set -- "${AGENT_BUS_REMAINING_ARGS[@]}"
+else
+    set --
+fi
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --max-retries) [ $# -ge 2 ] || usage; max_retries="$2"; shift 2;;
+        --max-retries=*) max_retries="${1#--max-retries=}"; shift;;
+        --dry-run) dry_run=1; shift;;
+        --*) echo "$AGENT_CMD: unknown flag '$1'" >&2; usage;;
+        *) break;;
+    esac
+done
+
+[ $# -eq 1 ] || usage
+ref="$1"
+case "$max_retries" in ''|*[!0-9]*) echo "$AGENT_CMD: --max-retries must be a non-negative integer" >&2; exit 2;; esac
+
+agent_bus_set_paths
+agent_bus_need_existing
+agent_bus_need_agents
+agent_bus_export_env
+
+# Reconstruct the thread and pull the root handoff plus the attempt count.
+thread=$(jq -Rsc --arg ref "$ref" '
+    def root($m;$e): if ($e.ref==null or ($m[$e.ref]==null)) then $e.id else root($m;$m[$e.ref]) end;
+    split("\n") | map(fromjson?) | map(select(type=="object" and .id)) as $events
+    | ($events | map({key:.id,value:.}) | from_entries) as $m
+    | if $m[$ref] == null then null
+      else root($m;$m[$ref]) as $r
+        | ($events | map(. + {__root: root($m;.)}) | map(select(.__root == $r))) as $evs
+        | ($evs[0]) as $rootev
+        | {root: $rootev.id, delegator: $rootev.from, worker: $rootev.to,
+           body: $rootev.body, paths: ($rootev.paths_claimed // []),
+           attempts: (($evs | map(select(.type=="handoff")) | length) - 1),
+           last_type: ($evs[-1].type), last_status: ($evs[-1].status)}
+      end
+' "$AGENT_BUS_FILE")
+
+[ "$thread" != null ] && [ -n "$thread" ] || { echo "$AGENT_CMD: unknown thread '$ref'" >&2; exit 1; }
+
+# Destructure the tab-free scalar fields in one jq pass; body may contain tabs or
+# newlines, so pull it on its own.
+IFS=$'\t' read -r root delegator worker attempts last_type < <(printf '%s' "$thread" | jq -r '[.root,.delegator,.worker,.attempts,.last_type]|@tsv')
+body=$(printf '%s' "$thread" | jq -r '.body')
+paths_csv=$(printf '%s' "$thread" | jq -r '.paths | join(",")')
+
+if [ "$last_type" != "timeout" ]; then
+    echo "$AGENT_CMD: warning: thread $root is not currently timed out (last event: $last_type)" >&2
+fi
+
+# Live peers (alive panes), excluding the delegator and the failed worker.
+live=$(agent_bus_live_surfaces)
+is_live() {
+    local name="$1" surface
+    surface=$(jq -r --arg n "$name" '.agents[$n] // empty' "$AGENT_BUS_AGENTS_FILE")
+    [ -n "$surface" ] || return 1
+    [ -z "$live" ] && return 0
+    printf '%s\n' "$live" | grep -qxF "$surface"
+}
+first_live_peer() {
+    local n
+    while IFS= read -r n; do
+        [ -n "$n" ] || continue
+        [ "$n" = "$delegator" ] && continue
+        [ "$n" = "$worker" ] && continue
+        is_live "$n" && { printf '%s' "$n"; return 0; }
+    done < <(jq -r '.agents | keys[]' "$AGENT_BUS_AGENTS_FILE")
+    return 0
+}
+
+# Decide the next step. Every branch assigns action (and target where it is used),
+# so no initialization is needed.
+managed_worktree="$(agent_worktree_json "$worker")"
+recovery_note=""
+if [ "$managed_worktree" != null ]; then
+    # Reassigning to a different agent's checkout silently drops uncommitted
+    # work and starts a divergent branch. Keep the original checkout instead.
+    recovery_note=" Retained worktree: $(printf '%s' "$managed_worktree" | jq -r '.path'). Respawn '$worker' with --worktree on this bus, then agent-resume --force $root."
+fi
+if [ "$attempts" -ge "$max_retries" ]; then
+    action="escalate"
+elif [ "$attempts" -eq 0 ] && is_live "$worker"; then
+    action="retry"; target="$worker"
+elif [ "$managed_worktree" != null ]; then
+    action="escalate"
+else
+    target="$(first_live_peer)"
+    if [ -n "$target" ]; then action="reassign"; else action="escalate"; fi
+fi
+
+paths_args=()
+[ -n "$paths_csv" ] && paths_args=(--paths "$paths_csv")
+
+case "$action" in
+    retry)
+        echo "$AGENT_CMD: retry -> $target (attempt $((attempts + 1))/$max_retries) thread $root"
+        [ "$dry_run" -eq 1 ] && exit 0
+        "$AGENT_BIN_DIR/agent-send" "$target" handoff --ref "$root" ${paths_args[@]+"${paths_args[@]}"} "RETRY: $body" >/dev/null
+        ;;
+    reassign)
+        echo "$AGENT_CMD: reassign -> $target (was $worker) thread $root"
+        [ "$dry_run" -eq 1 ] && exit 0
+        "$AGENT_BIN_DIR/agent-send" "$target" handoff --ref "$root" ${paths_args[@]+"${paths_args[@]}"} "REASSIGNED from $worker: $body" >/dev/null
+        ;;
+    escalate)
+        echo "$AGENT_CMD: escalate -> user (after $attempts attempt(s)) thread $root"
+        [ "$dry_run" -eq 1 ] && exit 0
+        "$AGENT_BIN_DIR/agent-send" user block --ref "$root" \
+            "ESCALATION: thread $root (\"$body\") timed out after $attempts recovery attempt(s); no automated path left — needs your decision.$recovery_note" >/dev/null
+        ;;
+esac

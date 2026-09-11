@@ -30,6 +30,15 @@ optionally hands it a first task; `agent-fleet a=codex b=claude ...` spawns a
 whole squad; `agent-dismiss <name>` (or `--done` / `--all-spawned`) tears them
 down. Provider defaults live in `agent-providers`.
 
+**Isolated coding workers:** add `--worktree` to `agent-spawn` or `agent-fleet`
+(`--base REF` optionally selects the starting commit). Each worker gets its own
+branch/directory on the same bus. Work in that checkout and commit before
+`agent-done`. `agent-dismiss` retains the checkout; the same name with
+`--worktree` resumes it. The lead reviews with `agent-worktree diff`, then uses
+`agent-worktree integrate <name> --check '<command>'` after dismissing the worker.
+Integration uses a separate checkout; conflicts stay there for review. Cleanup
+is explicit via `agent-worktree remove`; branches and unfinished work are kept.
+
 **To send or hand off:** `agent-send <to> <type> [--ref ID] [--paths "p1,p2"]
 <body>`. Types: `ask`, `handoff`, `done`, `block`, `ack`.
 **To close a thread:** `agent-done <id> [body]`.

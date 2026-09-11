@@ -96,6 +96,7 @@ while IFS= read -r line || [ -n "$line" ]; do
         and (.status | IN("open","in_progress","done","blocked"))
         and (.paths_claimed | type == "array" and all(.[]; type == "string"))
         and ((.cwd == null) or (.cwd | type == "string"))
+        and ((.claims_cwd == null) or (.claims_cwd | type == "string"))
         and (.body | type == "string")
     ' >/dev/null 2>&1; then
         problem "line $line_no: invalid event JSON/schema"

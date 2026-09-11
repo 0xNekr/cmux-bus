@@ -183,9 +183,114 @@ agent_bus_need_agents() {
     }
 }
 
+# Snapshot the set of live terminal surfaces, one per line. Closed panes drop out
+# of surface-health; a backgrounded-but-alive pane stays — do NOT filter on
+# in_window=true, which only marks the focused workspace and would make alive
+# peers in other workspaces look dead. Shared by every command that probes peer
+# liveness (agent-send, agent-spawn, agent-watchdog, agent-recover, ...).
+agent_bus_live_surfaces() {
+    local output
+    if ! output="$(cmux --id-format both surface-health 2>&1)"; then
+        if printf '%s' "$output" | grep -qiE 'operation not permitted|permission denied|sandbox'; then
+            echo "${AGENT_CMD}: cmux access denied by the sandbox (Unix socket)" >&2
+            echo "${AGENT_CMD}: launch Codex through 'agent-spawn' auto mode, upgrade cmux-bus, or use --yolo explicitly" >&2
+        else
+            echo "${AGENT_CMD}: cmux surface-health failed: $output" >&2
+        fi
+        return 0
+    fi
+    printf '%s\n' "$output" | awk '/type=terminal/ {print $2}'
+}
+
+# ---- Watchdog auto-activation ----
+# The watchdog only protects a lead if it is actually running. Rather than rely on
+# someone launching it by hand, a lead that delegates (agent-spawn) starts a
+# detached daemon for the bus, tracked by <bus-dir>/watchdog.pid so we never run
+# two. agent-dismiss stops it when the team is gone. Opt out with
+# AGENT_BUS_NO_WATCHDOG (used by the test suite so it doesn't fork daemons).
+
+agent_bus_watchdog_running() {
+    local pidfile="$1/watchdog.pid" pid
+    [ -f "$pidfile" ] || return 1
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+agent_bus_ensure_watchdog() {
+    local bus_dir="$1" bin_dir="$2" interval="${3:-30}"
+    [ -n "${AGENT_BUS_NO_WATCHDOG:-}" ] && return 0
+    agent_bus_watchdog_running "$bus_dir" && return 0
+    [ -x "$bin_dir/agent-watchdog" ] || return 0
+    nohup "$bin_dir/agent-watchdog" --bus-dir "$bus_dir" daemon --interval "$interval" >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$bus_dir/watchdog.pid"
+    disown 2>/dev/null || true
+    return 0
+}
+
+agent_bus_stop_watchdog() {
+    local pidfile="$1/watchdog.pid" pid
+    [ -f "$pidfile" ] || return 0
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    [ -n "$pid" ] && kill "$pid" 2>/dev/null
+    rm -f "$pidfile" 2>/dev/null || true
+    return 0
+}
+
+# ---- Bus lock (used by agent_bus_append_event) ----
+# The bus lock is a directory (atomic mkdir). We stamp it with the holder's
+# host+PID+epoch in an `owner` file so a *stale* lock — one left behind by a
+# holder that was SIGKILLed (no EXIT trap fires) or by a crashed pane — can be
+# detected and broken instead of deadlocking every future writer forever. This
+# is the root-cause fix for the observed "agent-done: timed out waiting for bus
+# lock" under contention.
+
+# Portable mtime (epoch seconds) of a path; empty if it can't be read.
+agent_bus_mtime() {
+    local stamp
+    # GNU stat may print filesystem data before rejecting BSD's -f %m form.
+    # Capture each attempt separately so failed output cannot enter arithmetic.
+    if stamp="$(stat -f %m "$1" 2>/dev/null)" || stamp="$(stat -c %Y "$1" 2>/dev/null)"; then
+        case "$stamp" in ''|*[!0-9]*) return 0;; esac
+        printf '%s\n' "$stamp"
+    fi
+    return 0
+}
+
+# Stable-ish host id so we only trust `kill -0` for a holder on the same host.
+agent_bus_hostid() {
+    printf '%s' "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+}
+
+# Decide whether the currently-held lock is stale. True (0) when the owning PID
+# is on this host and no longer alive, or when the lock dir is older than
+# $stale_after seconds (covers a missing/unreadable owner file and cross-host
+# holders we cannot probe).
+agent_bus_lock_is_stale() {
+    local owner_file="$1" stale_after="$2"
+    local host pid ts now lock_mtime
+    now="$(date +%s)"
+    if [ -r "$owner_file" ]; then
+        read -r host pid ts < "$owner_file" 2>/dev/null || true
+        if [ -n "${pid:-}" ] && [ "${host:-}" = "$(agent_bus_hostid)" ]; then
+            kill -0 "$pid" 2>/dev/null && return 1   # holder alive -> not stale
+            return 0                                  # holder gone  -> stale
+        fi
+    fi
+    lock_mtime="$(agent_bus_mtime "$AGENT_BUS_LOCK")"
+    [ -n "$lock_mtime" ] || return 1
+    [ $(( now - lock_mtime )) -ge "$stale_after" ]
+}
+
+agent_bus_lock_holder_note() {
+    local owner_file="$1" host pid ts
+    [ -r "$owner_file" ] || return 0
+    read -r host pid ts < "$owner_file" 2>/dev/null || true
+    [ -n "${pid:-}" ] && printf ' (held by pid %s on %s)' "$pid" "${host:-?}"
+    return 0
+}
+
 agent_bus_append_event() {
     local event="$1"
-    local tries=0
 
     case "$event" in
         *$'\n'*|*$'\r'*)
@@ -200,29 +305,49 @@ agent_bus_append_event() {
         and (.ts | type == "string")
         and (.from | type == "string")
         and (.to | type == "string")
-        and (.type | IN("ask","handoff","done","block","ack"))
+        and (.type | IN("ask","handoff","done","block","ack","timeout","reassigned"))
         and ((.ref == null) or (.ref | type == "string"))
         and (.status | IN("open","in_progress","done","blocked"))
         and (.paths_claimed | type == "array")
         and ((.cwd == null) or (.cwd | type == "string"))
+        and ((.claims_cwd == null) or (.claims_cwd | type == "string"))
         and (.body | type == "string")
+        and ((.ttl == null) or (.ttl | type == "number"))
+        and ((.ack_by == null) or (.ack_by | type == "number"))
+        and ((.created_at == null) or (.created_at | type == "number"))
+        and ((.stale_after == null) or (.stale_after | type == "number"))
+        and ((.hard_deadline == null) or (.hard_deadline | type == "number"))
     ' >/dev/null || {
         echo "${AGENT_CMD}: generated event does not match the bus schema" >&2
         exit 1
     }
 
-    trap 'rmdir "$AGENT_BUS_LOCK" 2>/dev/null || true' EXIT INT TERM
+    local owner_file="$AGENT_BUS_LOCK/owner"
+    local stale_after="${AGENT_BUS_LOCK_STALE_SECS:-30}"
+    local max_wait="${AGENT_BUS_LOCK_TIMEOUT_SECS:-30}"
+    local deadline=$(( $(date +%s) + max_wait ))
+
+    trap 'rm -rf "$AGENT_BUS_LOCK" 2>/dev/null || true' EXIT INT TERM
     while ! mkdir "$AGENT_BUS_LOCK" 2>/dev/null; do
-        tries=$((tries + 1))
-        if [ "$tries" -ge 100 ]; then
-            echo "${AGENT_CMD}: timed out waiting for bus lock ($AGENT_BUS_LOCK)" >&2
+        # Contended. Break the lock if its holder is dead or it has gone stale,
+        # then retry; otherwise back off (with jitter to avoid lockstep) until the
+        # deadline. mkdir stays the single atomic arbiter, so even if two writers
+        # break-and-retry at once, only one wins the next mkdir.
+        if agent_bus_lock_is_stale "$owner_file" "$stale_after"; then
+            rm -rf "$AGENT_BUS_LOCK" 2>/dev/null || true
+            continue
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "${AGENT_CMD}: timed out waiting for bus lock ($AGENT_BUS_LOCK)$(agent_bus_lock_holder_note "$owner_file")" >&2
+            trap - EXIT INT TERM
             exit 1
         fi
-        sleep 0.1
+        sleep "0.$(( (RANDOM % 3) + 1 ))"
     done
 
+    printf '%s %s %s\n' "$(agent_bus_hostid)" "$$" "$(date +%s)" > "$owner_file" 2>/dev/null || true
     printf '%s\n' "$event" >> "$AGENT_BUS_FILE"
-    rmdir "$AGENT_BUS_LOCK"
+    rm -rf "$AGENT_BUS_LOCK"
     trap - EXIT INT TERM
 }
 
@@ -310,6 +435,88 @@ agent_meta_get() {
     local name="$1" field="$2"
     [ -f "$AGENT_BUS_AGENTS_FILE" ] || return 0
     jq -r --arg n "$name" --arg f "$field" '.meta[$n][$f] // empty' "$AGENT_BUS_AGENTS_FILE"
+}
+
+# Durable worktree records deliberately outlive the surface registry.
+agent_worktree_record() {
+    [[ "$1" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+    printf '%s/worktrees/records/%s.json\n' "$AGENT_BUS_DIR_EFFECTIVE" "$1"
+}
+
+agent_worktree_json() {
+    local record
+    record="$(agent_worktree_record "$1")" || { printf 'null\n'; return 0; }
+    if [ -f "$record" ]; then
+        jq -c 'if .status == "removed" then null else . end' "$record"
+    else
+        printf 'null\n'
+    fi
+}
+
+# These locks protect registry updates and Git lifecycle operations, independently
+# of bus appends. Never steal a live local process's lock during a long check.
+agent_operation_unlock() {
+    local lock
+    for lock in ${AGENT_OPERATION_LOCKS[@]+"${AGENT_OPERATION_LOCKS[@]}"}; do
+        if [ "$(cat "$lock/owner" 2>/dev/null)" = "${AGENT_OPERATION_OWNER:-}" ]; then
+            rm -f "$lock/owner"
+            rmdir "$lock" 2>/dev/null || true
+        fi
+    done
+    AGENT_OPERATION_LOCKS=()
+}
+
+agent_operation_lock() {
+    local lock="$1" deadline host pid token stamp observed
+    deadline=$(( $(date +%s) + ${AGENT_BUS_LOCK_TIMEOUT_SECS:-30} ))
+    while ! mkdir "$lock" 2>/dev/null; do
+        host=""; pid=""
+        if [ -r "$lock/owner" ]; then
+            observed="$(cat "$lock/owner" 2>/dev/null || true)"
+            read -r host pid token < "$lock/owner" || true
+            if [ "$host" = "$(agent_bus_hostid)" ] && [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+                # Only one contender may reap a dead owner; recheck after
+                # acquiring the reaper so a new owner is never removed.
+                if mkdir "$lock/reap" 2>/dev/null; then
+                    if [ "$(cat "$lock/owner" 2>/dev/null)" = "$observed" ]; then rm -f "$lock/owner"; fi
+                    rmdir "$lock/reap" 2>/dev/null || true
+                    rmdir "$lock" 2>/dev/null || true
+                fi
+            fi
+        else
+            stamp="$(agent_bus_mtime "$lock")"
+            if [[ "$stamp" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - stamp )) -ge 30 ]; then
+                rmdir "$lock" 2>/dev/null || true
+            fi
+        fi
+        [ "$(date +%s)" -lt "$deadline" ] || {
+            echo "${AGENT_CMD}: timed out waiting for $lock" >&2; return 1;
+        }
+        sleep 0.1
+    done
+    AGENT_OPERATION_LOCKS+=("$lock")
+    [ -n "${AGENT_OPERATION_OWNER:-}" ] || AGENT_OPERATION_OWNER="$(agent_bus_hostid) $$ $RANDOM"
+    printf '%s\n' "$AGENT_OPERATION_OWNER" > "$lock/owner"
+    trap 'agent_operation_unlock' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+agent_registry_update() (
+    # The subshell must not release locks held by its parent (e.g. spawn).
+    AGENT_OPERATION_LOCKS=()
+    AGENT_OPERATION_OWNER=""
+    agent_operation_lock "$AGENT_BUS_DIR_EFFECTIVE/registry.lock" || exit 1
+    local tmp
+    tmp="$(mktemp "$AGENT_BUS_AGENTS_FILE.tmp.XXXXXX")"
+    jq "$@" "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+)
+
+agent_worktree_common_dir() {
+    local dir
+    dir="$(git -C "$1" rev-parse --git-common-dir)" || return 1
+    case "$dir" in /*) ;; *) dir="$1/$dir";; esac
+    (cd "$dir" && pwd -P)
 }
 
 # ---- Lead execution policy ----

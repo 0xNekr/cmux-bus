@@ -96,7 +96,24 @@ case "$id" in
         ;;
 esac
 
-final="$(agent-wait --timeout "$timeout" --interval "$interval" --status "$status" "$id")" || exit 1
+set +e
+final="$(agent-wait --timeout "$timeout" --interval "$interval" --status "$status" "$id")"
+wait_rc=$?
+set -e
+
+# Exit 3 means the thread timed out (watchdog gave up, or our own deadline
+# elapsed). Surface whatever final event we got, then propagate 3 so the caller
+# can tell a real reply from a timeout.
+if [ "$wait_rc" -eq 3 ]; then
+    if [ -n "$final" ]; then
+        if [ "$json" -eq 1 ]; then printf '%s\n' "$final"; else printf '%s\n' "$final" | jq -r '.body'; fi
+    else
+        echo "agent-rpc: timed out waiting for '$to' to reply" >&2
+    fi
+    exit 3
+elif [ "$wait_rc" -ne 0 ]; then
+    exit 1
+fi
 
 if [ "$json" -eq 1 ]; then
     printf '%s\n' "$final"
