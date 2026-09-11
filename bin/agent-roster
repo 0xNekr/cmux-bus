@@ -47,7 +47,7 @@ me=""
 # only marks the currently *selected* workspace, so filtering on it would report
 # every peer as stale whenever you are looking at another workspace.
 # surface-health defaults to $CMUX_WORKSPACE_ID, which is this bus's workspace.
-live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
+live=$(agent_bus_live_surfaces)
 live_json=$(printf '%s\n' "$live" | jq -R . | jq -s 'map(select(length > 0))')
 
 lead="$(agent_bus_lead)"

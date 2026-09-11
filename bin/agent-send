@@ -155,7 +155,7 @@ if ! { [ "$recipients" = "user" ]; }; then
     # currently selected workspace, so an alive peer in a backgrounded
     # workspace would look stale and weaken this check whenever the user is
     # looking elsewhere. surface-health defaults to $CMUX_WORKSPACE_ID.
-    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
+    live=$(agent_bus_live_surfaces)
 fi
 
 while IFS= read -r recipient; do

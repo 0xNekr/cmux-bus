@@ -185,7 +185,7 @@ fi
 # existing one. A stale entry (dead surface) is fine — it will be cleaned up.
 if jq -e --arg n "$name" '.agents | has($n)' "$AGENT_BUS_AGENTS_FILE" >/dev/null; then
     existing_surface="$(jq -r --arg n "$name" '.agents[$n]' "$AGENT_BUS_AGENTS_FILE")"
-    live=$(cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}')
+    live=$(agent_bus_live_surfaces)
     if printf '%s\n' "$live" | grep -qxF "$existing_surface"; then
         echo "agent-spawn: '$name' is already a live agent on this bus (surface $existing_surface)" >&2
         echo "agent-spawn: pick another name, or 'agent-dismiss $name' first" >&2
@@ -222,13 +222,10 @@ fi
 # appended after the model so they never disturb the "<launch> <model>" prefix
 # that the rest of the tooling (and tests) match on.
 #
-# codex's workspace-write sandbox confines writes to the workspace cwd — but the
-# bus (and the cmux socket used to signal peers) live under the state home,
-# OUTSIDE the workspace. Without granting that, a sandboxed worker silently can't
-# post ack/done (agent-* fails) and the lead waits forever. So in auto mode we add
-# the cmux state home (covers the workspace-scope bus + the cmux socket) and the
-# resolved bus dir as writable roots. Network stays sandboxed — that is not
-# "basic" access; use --yolo for tasks that need it (git push, npm install).
+# Codex permission profiles distinguish filesystem access from Unix-socket
+# access. The bus needs a writable directory, while cmux signalling needs an
+# explicit allow entry for its socket; --add-dir alone does not grant the latter
+# and makes cmux fail with EPERM from inside the sandbox.
 state_home="$(agent_bus_state_home 2>/dev/null || printf '%s' "$HOME/.local/state")"
 perm_suffix=""
 case "$base_cmd" in
@@ -241,7 +238,33 @@ case "$base_cmd" in
         ;;
     codex)
         case "$perm_mode" in
-            auto)        perm_suffix="--sandbox workspace-write --ask-for-approval never --add-dir $(printf '%q' "$state_home") --add-dir $(printf '%q' "$AGENT_BUS_DIR_EFFECTIVE")";;
+            auto)
+                # Build one self-contained permission profile on the command
+                # line so no global Codex config needs to be installed. JSON
+                # strings are valid TOML strings and safely preserve paths.
+                bus_toml="$(jq -Rn --arg value "$AGENT_BUS_DIR_EFFECTIVE" '$value')"
+                socket_entries=""
+                socket_candidates="${CMUX_SOCKET_PATH:-}
+$state_home/cmux/cmux.sock"
+                if [ -r "$state_home/cmux/last-socket-path" ]; then
+                    socket_candidates="$socket_candidates
+$(head -n1 "$state_home/cmux/last-socket-path")"
+                fi
+                socket_candidates="$(printf '%s\n' "$socket_candidates" | awk 'NF && !seen[$0]++')"
+                while IFS= read -r socket_path; do
+                    [ -n "$socket_path" ] || continue
+                    socket_toml="$(jq -Rn --arg value "$socket_path" '$value')"
+                    [ -z "$socket_entries" ] || socket_entries="$socket_entries, "
+                    socket_entries="$socket_entries$socket_toml = \"allow\""
+                done <<EOF
+$socket_candidates
+EOF
+                # Unix-socket allowlists are enforced only when the profile's
+                # network sandbox is enabled. With no domain allow entries,
+                # outbound Internet access remains blocked.
+                profile="{ extends = \":workspace\", filesystem = { $bus_toml = \"write\" }, network = { enabled = true, unix_sockets = { $socket_entries } } }"
+                perm_suffix="--ask-for-approval never -c $(printf '%q' "permissions.cmux_bus_worker=$profile") -c $(printf '%q' 'default_permissions="cmux_bus_worker"')"
+                ;;
             yolo)        perm_suffix="--dangerously-bypass-approvals-and-sandbox";;
             interactive) perm_suffix="";;
         esac

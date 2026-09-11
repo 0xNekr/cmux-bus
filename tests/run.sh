@@ -675,6 +675,36 @@ CMUX
     pass "agent-roster lists peers and tells the caller who they are"
 }
 
+test_agent_roster_reports_sandboxed_cmux() {
+    local fakebin workspace out
+    fakebin="$tmp_root/fakebin-roster-sandbox"
+    workspace="$(new_workspace roster-sandbox)"
+    mkdir -p "$fakebin"
+    cat > "$fakebin/cmux" <<'CMUX'
+#!/usr/bin/env bash
+if [ "$1" = "--id-format" ] && [ "${2:-}" = "both" ] && [ "${3:-}" = "surface-health" ]; then
+    echo "Error: Failed to connect to socket (Operation not permitted)" >&2
+    exit 1
+fi
+exit 0
+CMUX
+    chmod +x "$fakebin/cmux"
+
+    (
+        cd "$workspace"
+        write_agents
+        out=$(PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-roster" 2>&1)
+        printf '%s\n' "$out" | grep -q "cmux access denied by the sandbox" \
+            || fail "roster hid the cmux sandbox denial"
+        printf '%s\n' "$out" | grep -q "agent-spawn" \
+            || fail "roster sandbox denial omitted the remediation"
+        printf '%s\n' "$out" | grep -q "agent-roster: bus" \
+            || fail "roster aborted instead of returning best-effort state"
+    )
+
+    pass "agent-roster explains sandboxed cmux access instead of failing silently"
+}
+
 test_agent_lead_set_show_clear() {
     local workspace out
     workspace="$(new_workspace lead-cmd)"
@@ -2328,12 +2358,18 @@ test_agent_spawn_auto_accept_permission_modes() {
         : > "$log"
         CMUX_LOG="$log" AGENT_SPAWN_SETTLE=0 PATH="$fakebin:$PATH" CMUX_SURFACE_ID=s-lead \
             "$repo_root/bin/agent-spawn" --as codex --no-say worker-auto >/dev/null
-        grep -q 'codex --model gpt-5.4 --sandbox workspace-write --ask-for-approval never' "$log" \
+        grep -q 'codex --model gpt-5.4 --ask-for-approval never' "$log" \
             || fail "codex did not launch in auto-accept by default"
         ! grep -q 'dangerously-bypass' "$log" || fail "default codex should not be a full bypass"
-        # Auto-accept codex must be granted the bus/socket state home so it can
-        # post ack/done — otherwise the workspace-write sandbox blocks the bus.
-        grep -q -- '--add-dir' "$log" || fail "auto codex did not get the bus dir as a writable root"
+        # Filesystem writes and Unix-socket access are separate Codex
+        # permissions. The worker needs both to post events and signal peers.
+        grep -q 'permissions.cmux_bus_worker' "$log" || fail "auto codex did not get a scoped permission profile"
+        grep -q 'default_permissions' "$log" || fail "auto codex did not select its permission profile"
+        grep -q 'enabled.*true' "$log" || fail "auto codex did not enable the socket network profile"
+        grep -q 'unix_sockets' "$log" || fail "auto codex did not get cmux socket access"
+        grep -q 'cmux.sock' "$log" || fail "auto codex permission profile omitted the fallback cmux socket"
+        ! grep -q -- '--add-dir' "$log" || fail "auto codex still uses --add-dir instead of socket permissions"
+        ! grep -q -- '--sandbox' "$log" || fail "auto codex mixes legacy sandbox flags with permission profiles"
 
         # --interactive keeps normal prompting (no auto flags appended).
         : > "$log"
@@ -2886,6 +2922,7 @@ test_agent_init_is_idempotent
 test_agent_init_enforces_one_name_per_surface
 test_agent_init_purges_only_absent_surfaces
 test_agent_roster_lists_peers_and_marks_self
+test_agent_roster_reports_sandboxed_cmux
 test_agent_lead_set_show_clear
 test_agent_init_lead_flag_and_maintenance
 test_agent_init_clears_purged_lead

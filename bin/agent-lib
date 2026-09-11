@@ -189,7 +189,17 @@ agent_bus_need_agents() {
 # peers in other workspaces look dead. Shared by every command that probes peer
 # liveness (agent-send, agent-spawn, agent-watchdog, agent-recover, ...).
 agent_bus_live_surfaces() {
-    cmux --id-format both surface-health 2>/dev/null | awk '/type=terminal/ {print $2}' || true
+    local output
+    if ! output="$(cmux --id-format both surface-health 2>&1)"; then
+        if printf '%s' "$output" | grep -qiE 'operation not permitted|permission denied|sandbox'; then
+            echo "${AGENT_CMD}: cmux access denied by the sandbox (Unix socket)" >&2
+            echo "${AGENT_CMD}: launch Codex through 'agent-spawn' auto mode, upgrade cmux-bus, or use --yolo explicitly" >&2
+        else
+            echo "${AGENT_CMD}: cmux surface-health failed: $output" >&2
+        fi
+        return 0
+    fi
+    printf '%s\n' "$output" | awk '/type=terminal/ {print $2}'
 }
 
 # ---- Watchdog auto-activation ----
