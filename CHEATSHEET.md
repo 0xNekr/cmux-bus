@@ -48,6 +48,20 @@ agent-done <id> [body]          # clôt un thread
 ## 👑 Lead & équipe
 
 ```sh
+agent-spawn --as codex --worktree --task "Implémenter l’API" api
+agent-fleet --worktree --base HEAD api=codex ui=claude
+agent-worktree list                   # inclut les worktrees conservés
+agent-worktree diff api               # contribution depuis le commit de départ
+agent-dismiss api                    # conserve branche et fichiers
+agent-worktree integrate api --check './tests/run.sh'
+agent-worktree remove api             # propre, intégré ; branche conservée
+```
+
+Relancer le même nom avec `--worktree` reprend son répertoire, puis utiliser
+`agent-resume --force <id>` pour relancer le handoff. La fusion se fait dans un
+worktree d’intégration dédié ; en cas d’échec, y résoudre ou annuler la fusion.
+
+```sh
 agent-lead                      # affiche le lead + sa policy d'exécution
 agent-lead set claude           # désigne le lead (STRICT par défaut)
 agent-lead relaxed | strict     # bascule la policy d'exécution

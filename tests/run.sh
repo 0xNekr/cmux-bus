@@ -23,6 +23,8 @@ export AGENT_BUS_PROVIDERS_FILE="$tmp_root/.no-such-providers.json"
 # Don't let the ordinary spawn tests fork real watchdog daemons. The dedicated
 # auto-start test re-enables it with `env -u AGENT_BUS_NO_WATCHDOG`.
 export AGENT_BUS_NO_WATCHDOG=1
+# Runtime notification startup must never touch the real user's launchd state.
+export AGENT_BUS_NOTIFY_AUTO=0
 
 fail() {
     echo "not ok - $1" >&2

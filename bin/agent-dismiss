@@ -90,14 +90,19 @@ dismiss_one() {
         closed_note="left pane $surface open"
     fi
 
-    tmp=$(mktemp)
-    jq --arg n "$name" '
+    agent_registry_update --arg n "$name" '
         .agents |= (with_entries(select(.key != $n)))
         | (if (.meta) then .meta |= (with_entries(select(.key != $n))) else . end)
         | (if (.lead == $n) then del(.lead) else . end)
-    ' "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+    '
 
     echo "agent-dismiss: dismissed '$name' — $closed_note"
+    local worktree
+    worktree="$(agent_worktree_json "$name")"
+    if [ "$worktree" != null ]; then
+        echo "agent-dismiss: retained worktree $(printf '%s' "$worktree" | jq -r '.path')"
+        echo "agent-dismiss: resume with agent-spawn --worktree, or review with agent-worktree show $name"
+    fi
     if [ "$name" = "$lead" ]; then
         echo "agent-dismiss: cleared lead pointer (was '$name') — peer-to-peer mode"
     fi

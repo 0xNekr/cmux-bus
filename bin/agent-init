@@ -24,6 +24,7 @@ usage() {
     echo "  registers this pane as <agent_name> in the resolved bus agents.json" >&2
     echo "  --lead declares <agent_name> as the bus lead (see PROTOCOL.md, Lead mode)" >&2
     echo "  --as PROVIDER records your provider (claude|codex|...) for the spawn policy" >&2
+    echo "  --no-files skips local AGENTS.md/.agents stub/.gitignore edits (automatic for managed worktrees)" >&2
     agent_bus_common_usage >&2
     exit 2
 }
@@ -37,10 +38,12 @@ fi
 
 lead_flag=0
 as_provider=""
+no_files=0
 args=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --lead)   lead_flag=1;;
+        --no-files) no_files=1;;
         --as)     [ $# -ge 2 ] || usage; as_provider="$2"; shift;;
         --as=*)   as_provider="${1#--as=}";;
         *)        args+=("$1");;
@@ -131,12 +134,22 @@ EOF
 }
 
 agent_bus_set_paths
-handle_workspace_stub
+managed_worktree="$(agent_worktree_json "$name")"
+if [ "$managed_worktree" != null ]; then
+    expected_path="$(printf '%s' "$managed_worktree" | jq -r '.path')"
+    actual_path="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+    [ -n "$actual_path" ] && [ "$(cd "$actual_path" && pwd -P)" = "$expected_path" ] || {
+        echo "agent-init: '$name' belongs to $expected_path; register from that worktree" >&2; exit 1;
+    }
+    no_files=1
+fi
+[ "$no_files" -eq 1 ] || handle_workspace_stub
 dir="$AGENT_BUS_DIR_EFFECTIVE"
 mkdir -p "$dir"
 touch "$dir/bus.jsonl"
 
 agents_file="$dir/agents.json"
+agent_operation_lock "$dir/registry.lock"
 [ -s "$agents_file" ] || echo '{"agents":{}}' > "$agents_file"
 
 # Presence in surface-health means alive; closed panes disappear. Do NOT
@@ -147,12 +160,12 @@ purged=""
 if [ -n "$live" ]; then
     live_json=$(printf '%s\n' "$live" | jq -R . | jq -s .)
     purged=$(jq -r --argjson live "$live_json" '.agents | to_entries | map(select(.value as $u | $live | index($u) | not)) | map(.key) | join(",")' "$agents_file")
-    tmp=$(mktemp)
+    tmp=$(mktemp "${agents_file}.tmp.XXXXXX")
     jq --argjson live "$live_json" '.agents = (.agents | with_entries(select(.value as $u | $live | index($u))))' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
 fi
 
 renamed=""
-tmp=$(mktemp)
+tmp=$(mktemp "${agents_file}.tmp.XXXXXX")
 # A surface is one pane is one agent: enforce a 1:1 surface->name mapping. Drop
 # any other name already attached to this surface before registering, so
 # re-running agent-init with a new name in the same pane renames the agent
@@ -173,17 +186,17 @@ if [ "$lead_flag" -eq 1 ]; then
     else
         lead_note="lead is '$name'"
     fi
-    tmp=$(mktemp)
+    tmp=$(mktemp "${agents_file}.tmp.XXXXXX")
     jq --arg n "$name" '.lead = $n' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
     current_lead="$name"
 elif [ -n "$prev_lead" ]; then
     if [ -n "$renamed" ] && printf ',%s,' "$renamed" | grep -qF ",$prev_lead,"; then
-        tmp=$(mktemp)
+        tmp=$(mktemp "${agents_file}.tmp.XXXXXX")
         jq --arg n "$name" '.lead = $n' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
         lead_note="lead followed rename: '$prev_lead' -> '$name'"
         current_lead="$name"
     elif ! jq -e --arg l "$prev_lead" '.agents | has($l)' "$agents_file" >/dev/null; then
-        tmp=$(mktemp)
+        tmp=$(mktemp "${agents_file}.tmp.XXXXXX")
         jq 'del(.lead)' "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
         lead_note="cleared stale lead '$prev_lead'"
         current_lead=""
@@ -194,7 +207,7 @@ fi
 # agent (a hand-started agent has no spawned provenance otherwise). Merge so a
 # later agent-init never erases spawn metadata already on this name.
 if [ -n "$as_provider" ]; then
-    tmp=$(mktemp)
+    tmp=$(mktemp "${agents_file}.tmp.XXXXXX")
     jq --arg n "$name" --arg p "$as_provider" \
         '.meta = ((.meta // {}) + {($n): ((.meta[$n] // {}) + {provider:$p, self:true})})' \
         "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
@@ -204,12 +217,21 @@ fi
 # registry: drop metadata for any name no longer present in .agents (purged dead
 # surfaces or renamed-away names), so the roster never shows ghost provenance.
 if jq -e 'has("meta")' "$agents_file" >/dev/null 2>&1; then
-    tmp=$(mktemp)
+    tmp=$(mktemp "${agents_file}.tmp.XXXXXX")
     jq '.agents as $a | .meta |= with_entries(select(.key as $k | $a | has($k)))' \
         "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
 fi
 
-if [ "$AGENT_BUS_REPO_RUNTIME" -eq 1 ]; then
+if [ "$managed_worktree" != null ]; then
+    tmp="$(mktemp "$agents_file.tmp.XXXXXX")"
+    jq --arg n "$name" --argjson wt "$managed_worktree" \
+        '.meta[$n] = ((.meta[$n] // {}) + {worktree:$wt.path,branch:$wt.branch,base:$wt.base})' \
+        "$agents_file" > "$tmp" && mv "$tmp" "$agents_file"
+fi
+agent_operation_unlock
+trap - EXIT INT TERM
+
+if [ "$AGENT_BUS_REPO_RUNTIME" -eq 1 ] && [ "$no_files" -eq 0 ]; then
     ensure_agents_gitignore
 fi
 
@@ -361,7 +383,9 @@ BLOCK
 )
 fi
 
-if [ ! -f "$agents_md" ]; then
+if [ "$no_files" -eq 1 ]; then
+    agents_md_action="preserved (--no-files)"
+elif [ ! -f "$agents_md" ]; then
     printf '%s\n' "$block" > "$agents_md"
     agents_md_action="created"
 elif grep -qF "$mark_start" "$agents_md"; then

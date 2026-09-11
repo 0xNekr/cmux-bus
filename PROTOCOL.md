@@ -275,6 +275,12 @@ in their current pane, or you must intentionally rerun the command with
 
 ## Path ownership
 
+For managed Git worktrees, a handoff also carries `claims_cwd` (the recipient's
+checkout directory) and a `worktree` object (`name`, `path`, `branch`, `base`,
+`repo`). Resolve claims against `claims_cwd` when present, otherwise against
+`cwd`. The latter remains the sender's directory. The same relative file in two
+different worktrees is not a conflicting reservation.
+
 When sending a `handoff`, declare `paths_claimed` (array of file paths or
 globs). Claims are interpreted relative to the event `cwd` when present,
 which keeps claims unambiguous when one cmux workspace contains multiple
@@ -309,6 +315,40 @@ The recipient is expected to read the bus on signal. The signal is a
 wake-up; the bus is the source of truth.
 
 ## Surface lifecycle
+
+### Managed worktrees
+
+`agent-spawn --worktree` / `agent-fleet --worktree` create an isolated branch and
+checkout per worker, starting at committed HEAD or `--base REF`. All workers
+retain the same absolute bus directory. Their shell starts in the checkout and
+uses `agent-init --no-files`, preserving tracked project instructions and files.
+Read this protocol from the bus path supplied in the initial handoff/onboarding.
+
+- Work only in your assigned checkout. Prepare its dependencies/configuration
+  explicitly; ignored files and local edits are not copied from the caller.
+- Commit your delivery and include verification evidence in `agent-done`.
+  Managed-worker `done` events additionally carry a worktree snapshot with
+  `head` and `dirty`. A finished thread is not an integrated branch.
+- `agent-dismiss` closes the surface and drops registration, but retains the
+  worktree record, branch and files. Restart with the same name and `--worktree`
+  to reuse them; then `agent-resume --force <id>` if needed.
+- Recovery must not silently move a managed task to a different checkout.
+  `agent-recover` retries the original live worker or escalates with the retained
+  location. Resumed handoffs use their new lease, not the first attempt's lease.
+- The lead reviews `agent-worktree diff <name>`, dismisses the finished worker,
+  then calls `agent-worktree integrate <name> --check '<command>'`. Integration
+  requires a clean worker checkout and no open handoffs. Contributions merge
+  sequentially into a dedicated integration checkout. Checks run before the
+  merge commit; conflicts/failed checks remain there for explicit resolution or
+  `git merge --abort`. The original checkout is untouched.
+- `agent-worktree remove <name>` removes only clean, integrated checkouts with
+  no registered worker/open handoff. `--keep-branch` allows removing a clean
+  unmerged checkout. Branches are always kept; ignored files block removal too.
+
+Records under `<bus-dir>/worktrees/records/` outlive registration. Inspect them
+through `agent-worktree list/show/path`; do not infer missing work from an empty
+roster. Worktrees share repository metadata and do not isolate ports, databases
+or other external resources.
 
 `agent-init` purges entries in `agents.json` whose `cmux_surface_id` no
 longer corresponds to a live terminal surface in the current workspace

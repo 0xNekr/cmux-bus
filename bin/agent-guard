@@ -69,7 +69,7 @@ open_claims() {
             $thread.root,
             $event.id,
             (if $event.to == "user" then $event.from else $event.to end),
-            ($event.cwd // "__AGENT_BUS_NO_CWD__"),
+            ($event.claims_cwd // $event.cwd // "__AGENT_BUS_NO_CWD__"),
             .
           ]
         | @tsv

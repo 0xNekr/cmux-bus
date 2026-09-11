@@ -9,8 +9,8 @@ coding agents working side by side in adjacent panes. It gives them a
 shared message bus, structured handoffs, file-ownership claims, and a
 clean escalation path back to the human.
 
-No daemon. No HTTP server. No MCP layer. No Node or Python. Just
-~4 bash scripts, `jq`, and the `cmux` CLI you already have.
+Bash scripts, `jq`, and the `cmux` CLI, with optional Git worktrees for isolated
+workers. No HTTP server, MCP layer, Node or Python runtime.
 
 ## Why
 
@@ -142,6 +142,7 @@ Claude's pane receives a wake-up; `agent-inbox` is now clean.
 
 | Command | What it does |
 |---|---|
+| `agent-worktree [--scope repo\|workspace] [--bus-dir DIR] create\|list\|show\|path\|diff\|integrate\|remove ...` | Manage persistent worker checkouts, inspect their deliveries, merge into a dedicated integration checkout, and remove clean checkouts explicitly. See [Isolated workers](#isolated-workers-with-git-worktrees). |
 | `agent-init [--scope repo\|workspace] [--bus-dir DIR] [--lead] [--as PROVIDER] <name>` | Bootstrap or refresh this bus for `<name>`. Creates the resolved bus dir, registers your `CMUX_SURFACE_ID`, writes `PROTOCOL.md` and `AGENTS.md`, and purges stale entries from previous sessions. `--lead` declares `<name>` as the bus lead (strict by default — see Lead mode). `--as PROVIDER` records your provider in `.meta` so the spawn policy can classify you. |
 | `agent-spawn [--scope repo\|workspace] [--bus-dir DIR] --as <claude\|codex\|opencode> [--model M] [--task TEXT [--paths "a,b"]] [--split [--dir left\|right\|up\|down]] [--title TEXT\|--no-rename] [--focus] [--say TEXT\|--no-say] <name>` | Open the worker as a **background tab** in your pane (one click away, unfocused), register `<name>` on **this** bus, and launch the chosen agent CLI in it. `--split` lays it out as a pane split instead. The new surface runs `agent-init` in its shell *before* the CLI starts (deterministic registration) and inherits your `CMUX_WORKSPACE_ID` so it lands on the same bus. The tab is renamed `"<model> - <provider>"` (`--title` / `--no-rename`). `--task` seeds a first handoff; default models come from the registry (`agent-providers`); `--model default` uses the CLI's own default. opencode's model is applied via `OPENCODE_CONFIG_CONTENT` (its TUI has no `--model` flag). Workers launch in **auto-accept** by default (claude `--permission-mode acceptEdits`; codex `--ask-for-approval never` plus a scoped profile for the bus directory and cmux Unix socket) so a delegated worker can act within its workspace without prompting a human — sandboxed, not a full bypass; `--interactive`/`--no-auto` keeps normal prompting and `--yolo` opts into full bypass. Enforced by the spawn policy. |
 | `agent-dismiss [--scope repo\|workspace] [--bus-dir DIR] [--keep-pane] [--force] (<name>\|--all-spawned\|--done)` | The inverse of `agent-spawn`: close a worker's cmux pane and remove it from the registry (and its `.meta`). `--all-spawned` dismisses every lead-spawned worker; `--done` dismisses spawned workers with no open inbound thread. `--keep-pane` deregisters only; `--force` is required to dismiss yourself or the lead (dismissing the lead clears the lead pointer). |
@@ -206,6 +207,102 @@ of several raw replies:
 ids=$(agent-send claude,deepseek ask "Pick the next feature")
 agent-synthesize $ids
 ```
+
+## Isolated workers with Git worktrees
+
+Use `--worktree` to give each coding worker a **separate directory, branch and
+Git index**, while keeping the same cmux message bus. Git is required for this
+mode, and the source repository must have at least one commit.
+
+```sh
+agent-spawn --as codex --worktree --task "Implement the API" --paths "src/api/*" api
+agent-spawn --as claude --worktree --task "Implement the UI" --paths "src/ui/*" ui
+
+# Or prepare a whole team at one immutable starting commit:
+agent-fleet --worktree --base HEAD api=codex ui=claude reviewer=codex
+```
+
+`--base REF` defaults to committed `HEAD`. Local edits, untracked files, `.env`,
+installed dependencies and ignored artifacts are **not copied**. Prepare each
+checkout's environment as needed; assign separate ports/databases when the
+project uses shared services. Worktrees isolate working files, not OS processes
+or external services. They still share Git objects, refs and repository config.
+
+The bootstrap changes directory before launching the provider, exports the
+absolute bus path (including in repo scope), and uses `agent-init --no-files` so
+runtime setup does not modify tracked `AGENTS.md` or `.gitignore` files. Existing
+project instructions remain present; the onboarding/handoff points to the bus
+protocol. Auto-accept Codex workers also get access to the shared Git metadata
+needed for commits. `--worktree` remains opt-in; ordinary spawns are unchanged.
+
+Records live in `<bus-dir>/worktrees/records/<name>.json`, independently of the
+surface registry, and checkouts in `<bus-dir>/worktrees/checkouts/<name>`.
+Each record stores the repository, branch, base commit and checkout path.
+`agent-roster` shows the active workers' branches and paths; `agent-worktree list`
+also shows retained worktrees after their agents disappear.
+
+```sh
+agent-worktree list --json
+agent-worktree show api
+agent-worktree diff api              # tracked changes since the starting commit
+cd "$(agent-worktree path api)"
+```
+
+Relative `--paths` on a handoff to a managed worker are resolved against **that
+worker's checkout**, using the additive `claims_cwd` event field. `cwd` keeps its
+original meaning (sender directory). Thus two workers can both claim `src/api.ts`
+in their own worktrees; reservations still protect agents sharing a checkout.
+Managed handoffs reject absolute paths and `..` components in claims.
+
+### Deliver, integrate, and clean up
+
+Workers commit their contribution on their own branch, run the relevant checks,
+then call `agent-done`. Its event includes the worktree, commit and dirty state;
+`done` means the worker has delivered, **not** that the code has been merged.
+
+```sh
+# Once the worker has finished its handoff:
+agent-dismiss api                   # closes the pane; retains all work
+agent-worktree integrate api --check './tests/run.sh'
+agent-dismiss ui
+agent-worktree integrate ui --check './tests/run.sh'
+agent-worktree show ui --json        # .integration.path / branch / commit
+agent-worktree remove api
+```
+
+Integration requires a dismissed worker, no open handoff and a clean worker
+checkout. It serializes integrations per Git repository and merges committed
+changes into a **dedicated integration worktree/branch per repository and bus**.
+The original checkout and branch are untouched. `--check` runs in that combined
+checkout **before** the merge commit; omitting it performs no automatic tests.
+Check commands must not modify tracked files or the index.
+
+A conflict or failed check exits non-zero and leaves the pending merge in the
+integration checkout for inspection. Resolve and commit there, or run
+`git -C <integration-path> merge --abort`, then retry. After a manual resolution,
+rerunning `integrate` records the integration and can rerun checks. Review and
+promote the resulting integration branch with your normal Git/PR workflow;
+there is no automatic merge into `main`, push or PR creation.
+
+`remove` refuses registered workers, open handoffs, dirty/ignored files and
+commits absent from the integration checkout. `remove --keep-branch` permits
+removing a clean, unmerged checkout while retaining its commits on the branch.
+**Branches are always retained**, and there is no forced deletion. Recreating a
+removed name archives its old record under `worktrees/history/`.
+
+### Resume an interrupted worker
+
+```sh
+agent-spawn --as codex --worktree --no-say api
+agent-resume --force <thread-id>
+```
+
+Reusing the same name on the same bus reuses its branch and checkout, including
+uncommitted work. A live name, another repository or a conflicting explicit base
+is rejected. If the old agent is still registered/live, dismiss it first.
+`agent-recover` can retry the same live worker, but escalates with the retained
+path instead of silently transferring an isolated worker's task to another
+checkout. The fresh handoff gets a new watchdog lease.
 
 ## Recovery — what to do when a peer crashes
 
@@ -462,10 +559,10 @@ Override freely based on what each agent is best at for the task at hand.
 
 ## What this is not
 
-- Not an orchestrator (no scheduler, no worktree management)
+- No autonomous task scheduler (workflows and worktree operations are explicit)
 - Not a tmux thing (uses cmux's native API; tmux users have plenty of
   better-fit projects)
-- Not a daemon, broker, or service
+- No central broker or HTTP service (watchdog and notification helpers run locally)
 - Not opinionated about which agents you run — anything that runs in a
   terminal and can read/write files works
 

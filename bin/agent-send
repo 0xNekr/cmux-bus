@@ -206,6 +206,16 @@ while IFS= read -r recipient; do
     [ -n "$recipient" ] || continue
     id=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
     ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+    worktree_json='null'
+    if [ "$type" = handoff ]; then
+        worktree_json="$(agent_worktree_json "$recipient")"
+        if [ "$worktree_json" != null ]; then
+            printf '%s' "$paths_json" | jq -e 'all(.[]; (startswith("/") | not) and (split("/") | index("..") | not))' >/dev/null || {
+                echo "agent-send: managed worktree claims must be relative to the recipient checkout, without '..'" >&2
+                exit 1
+            }
+        fi
+    fi
     event=$(jq -nc \
         --arg id "$id" \
         --arg ts "$ts" \
@@ -220,7 +230,9 @@ while IFS= read -r recipient; do
         --argjson created_at "$created_at" \
         --argjson ttl "$ttl_json" \
         --argjson ack_by "$ack_by_json" \
+        --argjson wt "$worktree_json" \
         '{id:$id, ts:$ts, from:$from, to:$to, type:$type, ref:$ref, status:$status, paths_claimed:$paths_claimed, cwd:$cwd, body:$body}
+         + (if $wt != null then {claims_cwd:$wt.path,worktree:($wt | {name,path,branch,base,repo})} else {} end)
          + (if $ttl != null then {ttl:$ttl, created_at:$created_at} else {} end)
          + (if $ack_by != null then {ack_by:$ack_by} else {} end)')
 

@@ -119,10 +119,19 @@ first_live_peer() {
 
 # Decide the next step. Every branch assigns action (and target where it is used),
 # so no initialization is needed.
+managed_worktree="$(agent_worktree_json "$worker")"
+recovery_note=""
+if [ "$managed_worktree" != null ]; then
+    # Reassigning to a different agent's checkout silently drops uncommitted
+    # work and starts a divergent branch. Keep the original checkout instead.
+    recovery_note=" Retained worktree: $(printf '%s' "$managed_worktree" | jq -r '.path'). Respawn '$worker' with --worktree on this bus, then agent-resume --force $root."
+fi
 if [ "$attempts" -ge "$max_retries" ]; then
     action="escalate"
 elif [ "$attempts" -eq 0 ] && is_live "$worker"; then
     action="retry"; target="$worker"
+elif [ "$managed_worktree" != null ]; then
+    action="escalate"
 else
     target="$(first_live_peer)"
     if [ -n "$target" ]; then action="reassign"; else action="escalate"; fi
@@ -146,6 +155,6 @@ case "$action" in
         echo "$AGENT_CMD: escalate -> user (after $attempts attempt(s)) thread $root"
         [ "$dry_run" -eq 1 ] && exit 0
         "$AGENT_BIN_DIR/agent-send" user block --ref "$root" \
-            "ESCALATION: thread $root (\"$body\") timed out after $attempts recovery attempt(s); no automated path left — needs your decision." >/dev/null
+            "ESCALATION: thread $root (\"$body\") timed out after $attempts recovery attempt(s); no automated path left — needs your decision.$recovery_note" >/dev/null
         ;;
 esac

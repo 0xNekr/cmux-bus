@@ -98,15 +98,17 @@ scan_candidates() {
         | .[0] as $rootev
         | .[-1] as $last
         | select($rootev.type == "handoff")
-        | select($rootev.ttl != null and $rootev.created_at != null)
         | select($last.status == "open" or $last.status == "in_progress")
-        | (any(.[]; .type == "ack")) as $acked
-        | ($rootev.created_at + $rootev.ttl) as $ttl_deadline
-        | (if $rootev.ack_by != null then ($rootev.created_at + $rootev.ack_by) else null end) as $ack_deadline
+        | (map(select(.type == "handoff")) | last) as $attempt
+        | select($attempt.ttl != null and $attempt.created_at != null)
+        | (map(.id) | index($attempt.id)) as $attempt_index
+        | (any(.[$attempt_index:][]; .type == "ack")) as $acked
+        | ($attempt.created_at + $attempt.ttl) as $ttl_deadline
+        | (if $attempt.ack_by != null then ($attempt.created_at + $attempt.ack_by) else null end) as $ack_deadline
         | (if ($acked | not) and $ack_deadline != null and $now >= $ack_deadline then "no_ack"
            elif $now >= $ttl_deadline then (if $acked then "stale_ack" else "stale" end)
            else "none" end) as $reason
-        | [$rootev.id, $rootev.from, ($surf[$rootev.from] // ""), $rootev.to, ($surf[$rootev.to] // ""), $reason]
+        | [$rootev.id, $rootev.from, ($surf[$rootev.from] // ""), $attempt.to, ($surf[$attempt.to] // ""), $reason]
         | @tsv
     ' "$AGENT_BUS_FILE"
 }

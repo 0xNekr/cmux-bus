@@ -303,6 +303,7 @@ agent_bus_append_event() {
         and (.status | IN("open","in_progress","done","blocked"))
         and (.paths_claimed | type == "array")
         and ((.cwd == null) or (.cwd | type == "string"))
+        and ((.claims_cwd == null) or (.claims_cwd | type == "string"))
         and (.body | type == "string")
         and ((.ttl == null) or (.ttl | type == "number"))
         and ((.ack_by == null) or (.ack_by | type == "number"))
@@ -427,6 +428,88 @@ agent_meta_get() {
     local name="$1" field="$2"
     [ -f "$AGENT_BUS_AGENTS_FILE" ] || return 0
     jq -r --arg n "$name" --arg f "$field" '.meta[$n][$f] // empty' "$AGENT_BUS_AGENTS_FILE"
+}
+
+# Durable worktree records deliberately outlive the surface registry.
+agent_worktree_record() {
+    [[ "$1" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || return 1
+    printf '%s/worktrees/records/%s.json\n' "$AGENT_BUS_DIR_EFFECTIVE" "$1"
+}
+
+agent_worktree_json() {
+    local record
+    record="$(agent_worktree_record "$1")" || { printf 'null\n'; return 0; }
+    if [ -f "$record" ]; then
+        jq -c 'if .status == "removed" then null else . end' "$record"
+    else
+        printf 'null\n'
+    fi
+}
+
+# These locks protect registry updates and Git lifecycle operations, independently
+# of bus appends. Never steal a live local process's lock during a long check.
+agent_operation_unlock() {
+    local lock
+    for lock in ${AGENT_OPERATION_LOCKS[@]+"${AGENT_OPERATION_LOCKS[@]}"}; do
+        if [ "$(cat "$lock/owner" 2>/dev/null)" = "${AGENT_OPERATION_OWNER:-}" ]; then
+            rm -f "$lock/owner"
+            rmdir "$lock" 2>/dev/null || true
+        fi
+    done
+    AGENT_OPERATION_LOCKS=()
+}
+
+agent_operation_lock() {
+    local lock="$1" deadline host pid token stamp observed
+    deadline=$(( $(date +%s) + ${AGENT_BUS_LOCK_TIMEOUT_SECS:-30} ))
+    while ! mkdir "$lock" 2>/dev/null; do
+        host=""; pid=""
+        if [ -r "$lock/owner" ]; then
+            observed="$(cat "$lock/owner" 2>/dev/null || true)"
+            read -r host pid token < "$lock/owner" || true
+            if [ "$host" = "$(agent_bus_hostid)" ] && [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+                # Only one contender may reap a dead owner; recheck after
+                # acquiring the reaper so a new owner is never removed.
+                if mkdir "$lock/reap" 2>/dev/null; then
+                    if [ "$(cat "$lock/owner" 2>/dev/null)" = "$observed" ]; then rm -f "$lock/owner"; fi
+                    rmdir "$lock/reap" 2>/dev/null || true
+                    rmdir "$lock" 2>/dev/null || true
+                fi
+            fi
+        else
+            stamp="$(stat -f %m "$lock" 2>/dev/null || stat -c %Y "$lock" 2>/dev/null || true)"
+            if [[ "$stamp" =~ ^[0-9]+$ ]] && [ $(( $(date +%s) - stamp )) -ge 30 ]; then
+                rmdir "$lock" 2>/dev/null || true
+            fi
+        fi
+        [ "$(date +%s)" -lt "$deadline" ] || {
+            echo "${AGENT_CMD}: timed out waiting for $lock" >&2; return 1;
+        }
+        sleep 0.1
+    done
+    AGENT_OPERATION_LOCKS+=("$lock")
+    [ -n "${AGENT_OPERATION_OWNER:-}" ] || AGENT_OPERATION_OWNER="$(agent_bus_hostid) $$ $RANDOM"
+    printf '%s\n' "$AGENT_OPERATION_OWNER" > "$lock/owner"
+    trap 'agent_operation_unlock' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+}
+
+agent_registry_update() (
+    # The subshell must not release locks held by its parent (e.g. spawn).
+    AGENT_OPERATION_LOCKS=()
+    AGENT_OPERATION_OWNER=""
+    agent_operation_lock "$AGENT_BUS_DIR_EFFECTIVE/registry.lock" || exit 1
+    local tmp
+    tmp="$(mktemp "$AGENT_BUS_AGENTS_FILE.tmp.XXXXXX")"
+    jq "$@" "$AGENT_BUS_AGENTS_FILE" > "$tmp" && mv "$tmp" "$AGENT_BUS_AGENTS_FILE"
+)
+
+agent_worktree_common_dir() {
+    local dir
+    dir="$(git -C "$1" rev-parse --git-common-dir)" || return 1
+    case "$dir" in /*) ;; *) dir="$1/$dir";; esac
+    (cd "$dir" && pwd -P)
 }
 
 # ---- Lead execution policy ----

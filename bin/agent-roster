@@ -65,7 +65,10 @@ roster=$(jq -c --arg me "$me" --arg mysurf "$my_surface" --arg lead "$lead" --ar
         provider:   ($m.provider // null),
         model:      ($m.model // null),
         spawned_by: ($m.spawned_by // null),
-        via: (if $m then ($m.provider + (if ($m.model // "default") != "default" then ":" + $m.model else "" end)) else null end)
+        worktree: ($m.worktree // null),
+        branch: ($m.branch // null),
+        base: ($m.base // null),
+        via: (if $m.provider then ($m.provider + (if ($m.model // "default") != "default" then ":" + $m.model else "" end)) else null end)
       })
     | sort_by((.is_self | not), .name)
 ' "$AGENT_BUS_AGENTS_FILE")
@@ -125,3 +128,4 @@ while IFS=$'\t' read -r name st role via surface self; do
     if [ "$self" = "true" ]; then marker="->"; you=" (you)"; else marker=""; you=""; fi
     printf '%-3s %-16s %-7s %-7s %-22s %s%s\n' "$marker" "$name" "$st" "$role" "$via" "$surface" "$you"
 done
+printf '%s' "$roster" | jq -r '.[] | select(.worktree != null) | "  \(.name): \(.branch) → \(.worktree)"'
