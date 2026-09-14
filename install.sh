@@ -18,7 +18,7 @@ done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src_bin="$repo_root/bin"
-tools=(agent-bus agent-init agent-spawn agent-dismiss agent-fleet agent-worktree agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-watchdog agent-recover agent-wait agent-update)
+tools=(agent-presence agent-bus agent-init agent-spawn agent-dismiss agent-fleet agent-worktree agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-watchdog agent-recover agent-wait agent-update)
 
 missing=()
 command -v jq >/dev/null 2>&1 || missing+=("jq")
@@ -53,6 +53,7 @@ done
 runtime_dir="${XDG_DATA_HOME:-$HOME/.local/share}/cmux-bus/bin"
 mkdir -p "$runtime_dir"
 install -m 755 "$src_bin/agent-notify" "$runtime_dir/agent-notify"
+install -m 755 "$src_bin/agent-presence" "$runtime_dir/agent-presence"
 install -m 644 "$src_bin/agent-lib" "$runtime_dir/agent-lib"
 
 linked=()

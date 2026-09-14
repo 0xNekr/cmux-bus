@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+"""Agent counts in the native cmux sidebar. Independent of the bus."""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import socket
+import shlex
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+LABEL = 'io.cmux-bus.agent-presence'
+STATES = ('needs_input', 'working', 'idle', 'unknown')
+
+
+def atomic_write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.' + path.name)
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            stream.write(content)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+
+class ProcessIdentity:
+    """Check both process existence and generation, so reused PIDs are not agents."""
+    def __init__(self):
+        self.cache = {}
+
+    def __call__(self, record):
+        pid = record.get('pid')
+        if not isinstance(pid, int) or pid <= 0:
+            return None
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return None
+        expected = record.get('pidStartSeconds')
+        if expected is None:
+            return None
+        key = (pid, expected)
+        cached = self.cache.get(key)
+        if cached and time.monotonic() - cached[0] < 5:
+            return cached[1]
+        env = dict(os.environ, LC_ALL='C')
+        proc = subprocess.run(['ps', '-p', str(pid), '-o', 'lstart='], env=env,
+                              capture_output=True, text=True, timeout=2)
+        try:
+            started = time.mktime(time.strptime(proc.stdout.strip(), '%a %b %d %H:%M:%S %Y'))
+            alive = abs(started - float(expected)) < 2
+        except (ValueError, TypeError):
+            alive = None
+        self.cache[key] = (time.monotonic(), alive)
+        if len(self.cache) > 512:
+            self.cache = {key: self.cache[key]}
+        return alive
+
+
+class CodexTurns:
+    """Incremental lifecycle-only projection. No messages or tool arguments retained."""
+    def __init__(self):
+        self.files = {}
+
+    def read(self, record):
+        filename = record.get('transcriptPath')
+        if not filename:
+            return None
+        path = Path(filename)
+        try:
+            stat = path.stat()
+            previous = self.files.get(filename)
+            if not previous or previous['inode'] != stat.st_ino or stat.st_size < previous['offset']:
+                previous = {'inode': stat.st_ino, 'offset': 0, 'state': None, 'at': 0, 'turn': None, 'pending': set(), 'async': set()}
+                self.files[filename] = previous
+            with path.open('rb') as stream:
+                stream.seek(previous['offset'])
+                while True:
+                    start = stream.tell()
+                    line = stream.readline()
+                    if not line:
+                        break
+                    if not line.endswith(b'\n'):
+                        stream.seek(start)
+                        break
+                    try:
+                        event = json.loads(line)
+                        payload = event.get('payload', {})
+                        at = datetime.datetime.fromisoformat(event['timestamp'].replace('Z', '+00:00')).timestamp()
+                        kind = payload.get('type')
+                        call = payload.get('call_id', payload.get('callId', 'question'))
+                        if event.get('type') == 'response_item':
+                            name = str(payload.get('name', '')).split('.')[-1]
+                            if kind in ('function_call', 'custom_tool_call') and name in ('request_user_input', 'request_user_input_async'):
+                                previous['pending'].add(call)
+                                if name.endswith('_async'):
+                                    previous['async'].add(call)
+                                previous.update(at=at)
+                            elif kind in ('function_call_output', 'custom_tool_call_output') and call in previous['pending']:
+                                if call in previous['async']:
+                                    output = payload.get('output')
+                                    if isinstance(output, str):
+                                        try:
+                                            output = json.loads(output)
+                                        except ValueError:
+                                            output = None
+                                    if isinstance(output, dict) and output.get('accepted') is True:
+                                        continue
+                                previous['pending'].discard(call)
+                                previous['async'].discard(call)
+                                previous.update(at=at)
+                            elif kind == 'message' and payload.get('role') == 'user':
+                                previous['pending'].clear()
+                                previous['async'].clear()
+                                previous.update(at=at)
+                            continue
+                        if event.get('type') != 'event_msg':
+                            continue
+                        turn = payload.get('turn_id')
+                        if kind == 'task_started':
+                            previous['pending'].clear()
+                            previous['async'].clear()
+                            previous.update(state='working', at=at, turn=turn)
+                        elif kind in ('request_user_input', 'exec_approval_request', 'apply_patch_approval_request'):
+                            if not turn or not previous['turn'] or turn == previous['turn']:
+                                previous['pending'].add(call)
+                                previous.update(at=at)
+                        elif kind in ('task_complete', 'task_completed', 'turn_complete', 'turn_aborted') and (not turn or not previous['turn'] or turn == previous['turn']):
+                            previous['pending'].intersection_update(previous['async'])
+                            previous.update(state='idle', at=at, turn=turn)
+                    except (ValueError, KeyError, TypeError, AttributeError):
+                        continue
+                previous['offset'] = stream.tell()
+            state = 'needs_input' if previous['pending'] else previous['state']
+            return {'state': state, 'at': previous['at']} if state else None
+        except OSError:
+            return None
+
+
+def classify(record, turn=None):
+    runtime = record.get('runtimeStatus')
+    lifecycle = record.get('agentLifecycle')
+    # Explicit current requests have priority over an in-flight turn. A newer
+    # lifecycle event invalidates old needs-input status left by delayed hooks.
+    if runtime in ('needsInput', 'error') or lifecycle == 'needsInput':
+        if not turn or record.get('updatedAt', 0) >= turn['at']:
+            return 'needs_input'
+    if turn:
+        return turn['state']
+    if record.get('activePromptDepth', 0) or lifecycle == 'running' or runtime == 'running':
+        return 'working'
+    if runtime == 'idle' or lifecycle == 'idle':
+        return 'idle'
+    return 'unknown'
+
+
+def read_records(directory):
+    records, errors = [], []
+    paths = sorted(directory.glob('*-hook-sessions.json'))
+    for path in paths:
+        try:
+            obj = json.loads(path.read_text())
+            if not isinstance(obj, dict) or not isinstance(obj.get('sessions'), dict):
+                raise ValueError('unsupported schema')
+            provider = path.name.removesuffix('-hook-sessions.json')
+            for key, record in obj['sessions'].items():
+                if isinstance(record, dict) and isinstance(record.get('surfaceId'), str):
+                    records.append(dict(record, provider=provider, sessionId=record.get('sessionId', key)))
+        except (OSError, ValueError) as error:
+            errors.append(path.name + ': ' + str(error))
+    if not paths:
+        errors.append('No cmux hook stores found')
+    return records, errors
+
+
+def aggregate(tree, records, is_alive, turns):
+    workspaces = []
+    for window in tree.get('windows', []):
+        for workspace in window.get('workspaces', []):
+            surfaces = {s['id']: s for pane in workspace.get('panes', [])
+                        for s in pane.get('surfaces', []) if s.get('id')}
+            # Surface identity, not cwd or stored workspace: moving a terminal
+            # must move its agent count without waiting for another hook.
+            candidates = {}
+            for record in records:
+                sid = record['surfaceId']
+                if sid not in surfaces:
+                    continue
+                alive = is_alive(record)
+                if alive is False:
+                    continue
+                current = candidates.get(sid)
+                rank = (alive is True, record.get('startedAt', 0), record.get('updatedAt', 0))
+                if current is None or rank > current[0]:
+                    candidates[sid] = (rank, record, alive)
+            agents = []
+            for sid, (_, record, alive) in candidates.items():
+                turn = turns.read(record) if record['provider'] == 'codex' else None
+                state = classify(record, turn) if alive is True else 'unknown'
+                agents.append({'surface': sid, 'session': record['sessionId'],
+                               'provider': record['provider'], 'state': state})
+            counts = {state: sum(a['state'] == state for a in agents) for state in STATES}
+            targets = {state: next((a['surface'] for a in agents if a['state'] == state), '') for state in STATES}
+            workspaces.append({'id': workspace['id'], 'title': workspace.get('title', ''),
+                               'counts': counts, 'targets': targets, 'agents': agents})
+    return workspaces
+
+
+class Client:
+    def __init__(self, path):
+        self.socket = socket.socket(socket.AF_UNIX)
+        self.socket.settimeout(3)
+        self.socket.connect(path)
+        self.stream = self.socket.makefile('rwb')
+
+    def request(self, command):
+        self.stream.write((command + '\n').encode())
+        self.stream.flush()
+        reply = self.stream.readline().decode().strip()
+        if not reply or reply.startswith(('ERROR', 'Access denied')):
+            raise RuntimeError(reply or 'cmux disconnected')
+        return reply
+
+    def tree(self):
+        reply = json.loads(self.request(json.dumps({'id': 'presence', 'method': 'system.tree', 'params': {'all': True}})))
+        if not reply.get('ok'):
+            raise RuntimeError(str(reply.get('error')))
+        return reply['result']
+
+    def close(self):
+        self.stream.close()
+        self.socket.close()
+
+
+def status_rows(counts, unavailable=False):
+    if unavailable:
+        return {'health': ('Suivi indisponible', '#FF9F0A', 104)}
+    rows = {}
+    for state, suffix, color, priority in (
+        ('needs_input', 'en attente de réponse', '#FF9F0A', 103),
+        ('working', 'au travail', '#4C8DFF', 102),
+        ('idle', 'inactif', '#8E8E93', 101),
+        ('unknown', 'au statut inconnu', '#FF9F0A', 100),
+    ):
+        n = counts[state]
+        if state == 'unknown' and not n:
+            continue
+        label = f'{n} agent' + ('s' if n != 1 else '') + ' ' + suffix
+        if state == 'idle' and n != 1:
+            label += 's'
+        rows[state] = (label, color if n else '#636366', priority)
+    return rows
+
+
+class Monitor:
+    def __init__(self, args, client):
+        self.args, self.client = args, client
+        self.alive, self.turns = ProcessIdentity(), CodexTurns()
+        self.published = {}
+
+    def publish(self, workspace, rows):
+        previous = self.published.get(workspace, {})
+        for key in set(previous) - set(rows):
+            self.client.request(f'clear_status agent-presence-{key} --tab={workspace}')
+        for key, row in rows.items():
+            if row != previous.get(key):
+                label, color, priority = row
+                self.client.request(f'set_status agent-presence-{key} {label} --color={color} --priority={priority} --tab={workspace}')
+        self.published[workspace] = rows
+
+    def tick(self):
+        tree = self.client.tree()
+        records, errors = read_records(self.args.hook_dir)
+        workspaces = aggregate(tree, records, self.alive, self.turns)
+        live = {w['id'] for w in workspaces}
+        self.published = {wid: rows for wid, rows in self.published.items() if wid in live}
+        for workspace in workspaces:
+            wid = workspace['id']
+            # Clear our optional rows left by a previous process, once per workspace.
+            if wid not in self.published:
+                self.published[wid] = {key: None for key in (*STATES, 'health')}
+            self.publish(wid, status_rows(workspace['counts'], bool(errors)))
+        snapshot = {'workspaces': workspaces, 'errors': errors, 'observedAt': time.time()}
+        atomic_write(self.args.state_dir/'snapshot.json', json.dumps(snapshot, indent=2))
+        return snapshot
+
+    def clear(self):
+        for workspace in list(self.published):
+            try:
+                self.publish(workspace, {})
+            except (OSError, RuntimeError):
+                pass
+
+
+SHELL_BEGIN = '# cmux-bus agent-presence:start'
+SHELL_END = '# cmux-bus agent-presence:end'
+
+
+def shell_config(path, enabled, runtime):
+    content = path.read_text() if path.exists() else ''
+    if SHELL_BEGIN in content:
+        start = content.index(SHELL_BEGIN)
+        end = content.index(SHELL_END, start) + len(SHELL_END)
+        content = content[:start] + content[end:].lstrip('\n')
+    if enabled:
+        content = content.rstrip('\n') + '\n\n' + SHELL_BEGIN + '\n' + (
+            'if [[ -n "${CMUX_WORKSPACE_ID:-}" && -n "${CMUX_SOCKET_PATH:-}" ]]; then\n'
+            f'  {shlex.quote(sys.executable)} {shlex.quote(str(runtime))} watch --parent-pid $$ '
+            '</dev/null >>"$HOME/.local/state/cmux-bus/presence/service.log" 2>&1 &!\n'
+            'fi\n') + SHELL_END + '\n'
+    # Preserve the user's rc file permissions and any symlink target.
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+
+
+def enable(args):
+    if not os.environ.get('CMUX_SOCKET_PATH'):
+        raise RuntimeError('Run enable from a cmux terminal')
+    client = Client(args.socket)
+    try:
+        client.tree()
+    finally:
+        client.close()
+    runtime = Path.home()/'.local/share/cmux-bus/bin/agent-presence'
+    runtime.parent.mkdir(parents=True, exist_ok=True)
+    if Path(__file__).resolve() != runtime.resolve():
+        shutil.copy2(__file__, runtime)
+    runtime.chmod(0o755)
+    args.state_dir.mkdir(parents=True, exist_ok=True)
+    # Remove the obsolete custom-sidebar LaunchAgent when upgrading.
+    if sys.platform == 'darwin':
+        subprocess.run(['launchctl', 'bootout', 'gui/'+str(os.getuid())+'/'+LABEL], capture_output=True)
+        (Path.home()/'Library/LaunchAgents'/(LABEL+'.plist')).unlink(missing_ok=True)
+    shell_config(args.zshrc, True, runtime)
+    (args.state_dir/'enabled').touch()
+    print('Enabled for new cmux zsh terminals. Start now with: agent-presence watch')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('command', choices=['once', 'watch', 'enable', 'disable', 'status'])
+    parser.add_argument('--hook-dir', type=Path, default=Path(os.environ.get('CMUX_AGENT_HOOK_STATE_DIR', str(Path.home()/'.cmuxterm'))))
+    parser.add_argument('--state-dir', type=Path, default=Path.home()/'.local/state/cmux-bus/presence')
+    parser.add_argument('--socket', default=os.environ.get('CMUX_SOCKET_PATH'))
+    parser.add_argument('--zshrc', type=Path, default=Path(os.environ.get('ZDOTDIR', str(Path.home())))/'.zshrc')
+    parser.add_argument('--parent-pid', type=int)
+    args = parser.parse_args()
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if args.command == 'enable':
+        enable(args)
+        return
+    if args.command == 'disable':
+        shell_config(args.zshrc, False, Path())
+        (args.state_dir/'enabled').unlink(missing_ok=True)
+        # Clear even when there is no collector currently connected.
+        client = Client(args.socket)
+        try:
+            for window in client.tree().get('windows', []):
+                for workspace in window.get('workspaces', []):
+                    for key in (*STATES, 'health'):
+                        client.request(f"clear_status agent-presence-{key} --tab={workspace['id']}")
+        finally:
+            client.close()
+        print('Presence disabled; native workspace UI is unchanged.')
+        return
+    if args.command == 'status':
+        print((args.state_dir/'snapshot.json').read_text())
+        return
+    if not args.socket:
+        raise RuntimeError('Run inside cmux (CMUX_SOCKET_PATH is required)')
+    args.state_dir.mkdir(parents=True, exist_ok=True)
+    with (args.state_dir/'monitor.lock').open('a') as lock:
+        while True:
+            if args.parent_pid:
+                try:
+                    os.kill(args.parent_pid, 0)
+                except ProcessLookupError:
+                    return
+                if not (args.state_dir/'enabled').exists():
+                    return
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not args.parent_pid:
+                    raise RuntimeError('A presence collector is already running')
+                time.sleep(2)
+        client = monitor = None
+        managed = (args.state_dir/'enabled').exists()
+        last_error = None
+        try:
+            while True:
+                if managed and not (args.state_dir/'enabled').exists():
+                    break
+                if args.parent_pid:
+                    try:
+                        os.kill(args.parent_pid, 0)
+                    except ProcessLookupError:
+                        break
+                try:
+                    if client is None:
+                        client = Client(args.socket)
+                        monitor = Monitor(args, client)
+                    snapshot = monitor.tick()
+                    last_error = None
+                    if args.command == 'once':
+                        print(json.dumps(snapshot, indent=2))
+                        return
+                except (OSError, RuntimeError, ValueError) as error:
+                    if args.command == 'once':
+                        raise
+                    if monitor:
+                        monitor.clear()
+                    if client:
+                        client.close()
+                    client = monitor = None
+                    if str(error) != last_error:
+                        print(str(error), file=sys.stderr, flush=True)
+                        last_error = str(error)
+                time.sleep(2)
+        finally:
+            if monitor and args.command == 'watch':
+                monitor.clear()
+            if client:
+                client.close()
+
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
+        print('agent-presence: ' + str(error), file=sys.stderr)
+        sys.exit(1)
