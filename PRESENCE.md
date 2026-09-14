@@ -22,6 +22,24 @@ Disable removes the startup block, stops managed collectors, and clears only
 `agent-presence-*` status keys. It does not stop coding agents or change the bus.
 The repo installer only makes the command available; enable is explicit.
 
+## Compact appearance
+
+```sh
+agent-presence compact
+```
+
+Saves the compact native sidebar preferences on macOS: hide notification message
+previews, workspace descriptions, branch/directory paths and listening ports.
+Workspace titles, agent counts and native context menus remain. This is opt-in;
+`enable` and `disable` do not change these appearance preferences.
+
+For an already running cmux, use **Settings → Sidebar** to turn off **Show
+Notification Message in Sidebar**, **Show Workspace Description in Sidebar**,
+**Show Branch and Directory in Sidebar** and **Show Listening Ports in Sidebar**.
+The command saves the same preferences for subsequent launches; it does not
+restart cmux or interrupt terminals. Re-enable any of these options in Settings
+to restore the corresponding detail.
+
 ## Performance and native behavior
 
 The collector polls every two seconds over a persistent local cmux socket and
@@ -32,8 +50,8 @@ cmux terminal shell, not launchd. No extra workspace or pane is needed.
 
 If upgrading from the experimental custom sidebar, select **Default Workspaces**
 in the sidebar button's right-click menu. Enable removes the old LaunchAgent.
-The native sidebar also retains cmux's existing notification previews and
-metadata. Selected-row colors follow cmux's native selection styling.
+Without `compact`, the native sidebar retains cmux's existing notification
+previews and metadata. Selected-row colors follow cmux's native selection styling.
 
 ## Data and compatibility
 

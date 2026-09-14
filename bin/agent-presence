@@ -350,7 +350,7 @@ def enable(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['once', 'watch', 'enable', 'disable', 'status'])
+    parser.add_argument('command', choices=['once', 'watch', 'enable', 'disable', 'status', 'compact'])
     parser.add_argument('--hook-dir', type=Path, default=Path(os.environ.get('CMUX_AGENT_HOOK_STATE_DIR', str(Path.home()/'.cmuxterm'))))
     parser.add_argument('--state-dir', type=Path, default=Path.home()/'.local/state/cmux-bus/presence')
     parser.add_argument('--socket', default=os.environ.get('CMUX_SOCKET_PATH'))
@@ -358,6 +358,15 @@ def main():
     parser.add_argument('--parent-pid', type=int)
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    if args.command == 'compact':
+        if sys.platform != 'darwin':
+            raise RuntimeError('Compact sidebar preferences require macOS')
+        for key in ('sidebarShowNotificationMessage', 'sidebarShowWorkspaceDescription',
+                    'sidebarShowBranchDirectory', 'sidebarShowPorts'):
+            subprocess.run(['/usr/bin/defaults', 'write', 'com.cmuxterm.app', key,
+                            '-bool', 'false'], check=True)
+        print('Compact sidebar saved. If cmux is open, apply the same toggles in Settings → Sidebar or reopen cmux when convenient.')
+        return
     if args.command == 'enable':
         enable(args)
         return
