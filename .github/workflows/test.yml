@@ -38,6 +38,7 @@ jobs:
         shell: bash
         run: |
           for file in bin/agent-* install.sh tests/*.sh; do
+            if [ "$file" = "bin/agent-presence" ]; then continue; fi
             bash -n "$file"
           done
 
@@ -52,3 +53,6 @@ jobs:
       - name: Run workspace opt-out tests
         shell: bash
         run: ./tests/disabled.sh
+
+      - name: Presence state and sidebar tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 tests/presence.py
