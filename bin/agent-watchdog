@@ -210,6 +210,7 @@ else
     trap 'exit 0' INT TERM
     echo "$AGENT_CMD: daemon scanning every ${interval}s (Ctrl-C to stop)"
     while :; do
+        agent_bus_require_enabled || exit $?
         run_scan || echo "$AGENT_CMD: scan pass failed, continuing" >&2
         # Sleep in the background and wait on it so a SIGTERM/INT fires the trap
         # immediately instead of being deferred until a foreground sleep returns

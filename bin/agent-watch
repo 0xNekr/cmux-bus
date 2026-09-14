@@ -211,6 +211,7 @@ tail -n "$lines" "$AGENT_BUS_FILE" | print_events
 seen_lines=$(wc -l < "$AGENT_BUS_FILE" | tr -d ' ')
 while :; do
     sleep "$interval"
+    agent_bus_require_enabled || exit $?
     current_lines=$(wc -l < "$AGENT_BUS_FILE" | tr -d ' ')
     if [ "$current_lines" -gt "$seen_lines" ]; then
         tail -n $((current_lines - seen_lines)) "$AGENT_BUS_FILE" | print_events

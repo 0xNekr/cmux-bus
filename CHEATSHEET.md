@@ -1,5 +1,34 @@
 # cmux-bus — Cheat Sheet
 
+## Independent agents in one workspace
+
+Run this from any pane **before launching independent AI sessions**:
+
+```sh
+agent-bus disable       # all panes in this cmux workspace
+agent-bus status        # enabled / disabled
+agent-bus enable        # explicitly allow coordination again
+```
+
+Disabling persists across commands and new panes in the same workspace. It
+blocks registration, messaging, spawning, recovery and bus reads (exit code 4),
+including attempts through repo scope or an explicit bus directory. Other
+workspaces, including those on the same repository, remain enabled. The command
+always targets the caller's workspace, ignoring bus environment overrides.
+`agent-bus status --quiet` exits 0 when enabled and 1 when disabled.
+
+Panes, agent processes, worktrees and bus history are retained. The canonical
+workspace watchdog and notifier are stopped; running bus loops check the switch
+on their next iteration. An operation already in flight or text already injected
+cannot be recalled. Existing AI conversations may remember their old role: tell
+them to continue independently. Bus/lead rules do not apply while disabled;
+never re-enable or bypass the switch without an explicit user request.
+
+After `enable`, run `agent-init <name>` in participating panes to resume. Existing
+threads are retained, and an independent `agent-notify disable` preference is
+preserved. Enabling alone does not launch workers or restart services.
+
+
 Bus multi-agents pour cmux. Un log append-only par **workspace cmux**, piloté par
 les commandes `agent-*`. Tout agent dans le même workspace tombe sur le même bus.
 
