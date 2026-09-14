@@ -106,18 +106,42 @@ class PresenceTests(unittest.TestCase):
         records,errors=p.read_records(folder)
         self.assertTrue(errors)
         self.assertEqual(records,[])
-        rendered=p.render([],123,error=True)
-        self.assertIn('Suivi indisponible',rendered)
-        self.assertTrue(rendered.startswith(p.MARKER))
-        self.assertNotIn('lastBody',rendered)
-        self.assertEqual(p.swift_string('"\\(evil)'),'"\\"\\\\(evil)"')
+        rows=p.status_rows(dict.fromkeys(p.STATES,0),unavailable=True)
+        self.assertEqual(list(rows),['health'])
+        self.assertEqual(rows['health'][0],'Suivi indisponible')
 
-    def test_service_staleness_and_safe_render(self):
-        w={'id':'workspace','agents':[{'surface':'s','state':'working'}],'counts':dict(needs_input=1,working=2,idle=0,unknown=0),'targets':{k:'s' for k in p.STATES}}
-        text=p.render([w],123)
-        self.assertIn('clock.epoch - 123 > 15',text)
-        self.assertIn('surface.focus',text)
-        self.assertIn('workspace.reorder',text)
-        self.assertIn('en attente de réponse',text)
+    def test_native_updates_only_changed_lines_and_clear_removed(self):
+        class Client:
+            def __init__(self): self.commands=[]
+            def request(self,command): self.commands.append(command)
+        client=Client()
+        monitor=p.Monitor(None,client)
+        counts=dict(needs_input=1,working=2,idle=0,unknown=1)
+        rows=p.status_rows(counts)
+        monitor.publish('workspace',rows)
+        self.assertEqual(len(client.commands),4)
+        self.assertIn('1 agent en attente de réponse',client.commands[0])
+        client.commands.clear()
+        monitor.publish('workspace',rows)
+        self.assertEqual(client.commands,[])
+        counts.update(working=1,unknown=0)
+        monitor.publish('workspace',p.status_rows(counts))
+        self.assertEqual(len(client.commands),2)
+        self.assertTrue(any(c.startswith('clear_status agent-presence-unknown') for c in client.commands))
+        self.assertTrue(any('1 agent au travail' in c for c in client.commands))
+        self.assertFalse(any('workspace.select' in c for c in client.commands))
+
+    def test_shell_install_idempotent_and_preserves_user_config(self):
+        rc=Path(self.tmp.name)/'.zshrc'
+        original='export CUSTOM=value\n'
+        rc.write_text(original)
+        p.shell_config(rc,True,Path('/tmp/runtime path/agent-presence'))
+        once=rc.read_text()
+        p.shell_config(rc,True,Path('/tmp/runtime path/agent-presence'))
+        self.assertEqual(rc.read_text(),once)
+        self.assertIn('--parent-pid $$',once)
+        self.assertIn('CMUX_SOCKET_PATH',once)
+        p.shell_config(rc,False,Path())
+        self.assertEqual(rc.read_text().strip(),original.strip())
 
 if __name__=='__main__': unittest.main()

@@ -64,5 +64,5 @@ history and explicit reactivation. All cmux/launchctl calls are stubbed.
 
 `presence.py` tests the read-only presence adapter: lifecycle transitions, sync
 and async questions, stale stops, partial JSONL records and rotation, moved
-surfaces, duplicate sessions, dead processes, malformed stores and stale UI.
+surfaces, duplicate sessions, dead processes, malformed stores, native status deltas and idempotent shell setup.
 Run with `PYTHONDONTWRITEBYTECODE=1 python3 tests/presence.py`.

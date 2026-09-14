@@ -635,6 +635,6 @@ Override freely based on what each agent is best at for the task at hand.
 
 ## Live workspace agent counts
 
-`agent-presence enable` installs an independent, read-only sidebar showing agents
+`agent-presence enable` adds colored status lines to the native sidebar showing agents
 working, awaiting a response, and idle. It also works with the bus disabled.
 See [PRESENCE.md](PRESENCE.md) for setup, lifecycle semantics and limitations.
