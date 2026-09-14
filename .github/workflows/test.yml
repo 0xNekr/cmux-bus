@@ -48,3 +48,7 @@ jobs:
       - name: Run worktree lifecycle tests
         shell: bash
         run: ./tests/worktrees.sh
+
+      - name: Run workspace opt-out tests
+        shell: bash
+        run: ./tests/disabled.sh

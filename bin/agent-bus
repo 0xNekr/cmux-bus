@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Explicit workspace-wide opt-out, even before the first agent-init.
+set -euo pipefail
+AGENT_CMD="agent-bus"
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+    script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+    link_target="$(readlink "$script_path")"
+    case "$link_target" in
+        /*) script_path="$link_target";;
+        *) script_path="$script_dir/$link_target";;
+    esac
+done
+. "$(cd "$(dirname "$script_path")" && pwd)/agent-lib"
+
+usage() {
+    cat <<'EOF'
+usage: agent-bus disable|enable|status [--quiet]
+
+Controls the caller's cmux workspace, across all its panes and folders.
+Ignores AGENT_BUS_SCOPE/AGENT_BUS_DIR; scope/bus-dir flags are not accepted.
+disable  persistently block bus commands; leave agents, panes and history intact
+enable   allow bus use again (only on explicit user request)
+status   print enabled/disabled; --quiet exits 0 enabled, 1 disabled
+
+Run disable before launching independent agents. Existing AI conversations may
+still remember earlier instructions; tell them to continue independently.
+EOF
+}
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+action="$1"; shift
+case "$action" in
+    -h|--help) usage; exit 0;;
+    disable|enable|status) ;;
+    *) usage >&2; exit 2;;
+esac
+quiet=0
+if [ "$action" = status ] && [ "${1:-}" = --quiet ]; then quiet=1; shift; fi
+[ $# -eq 0 ] || { usage >&2; exit 2; }
+workspace_id="$(agent_bus_workspace_id)"
+dir="$(agent_bus_state_home)/cmux-bus/workspaces/$workspace_id"
+case "$action" in
+    disable)
+        mkdir -p "$dir"
+        touch "$dir/disabled"
+        # Stop the canonical bus services without touching any agent process.
+        agent_bus_stop_watchdog "$dir"
+        if [ -f "$dir/bus.jsonl" ] && [ -f "$dir/agents.json" ]; then
+            # Preserve the independent notification opt-out preference.
+            notify_was_disabled=0
+            [ ! -f "$dir/notifier/disabled" ] || notify_was_disabled=1
+            "$AGENT_BIN_DIR/agent-notify" --bus-dir "$dir" disable >/dev/null
+            [ "$notify_was_disabled" -eq 1 ] || rm -f "$dir/notifier/disabled"
+        fi
+        echo "agent-bus: disabled for workspace $workspace_id; agents and panes remain independent"
+        ;;
+    enable)
+        rm -f "$dir/disabled"
+        echo "agent-bus: enabled for workspace $workspace_id; run agent-init <name> in each pane to resume coordination"
+        ;;
+    status)
+        if [ -e "$dir/disabled" ]; then
+            [ "$quiet" -eq 0 ] || exit 1
+            echo "disabled"
+        else
+            [ "$quiet" -eq 0 ] || exit 0
+            echo "enabled"
+        fi
+        ;;
+esac

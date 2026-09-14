@@ -256,6 +256,7 @@ send_notification() {
 }
 
 process_pending() {
+    agent_bus_require_enabled || exit $?
     local cursor total line_number start_line event
     cursor=0
     if [ -f "$cursor_file" ]; then
@@ -272,6 +273,7 @@ process_pending() {
     while IFS= read -r event || [ -n "$event" ]; do
         line_number=$((line_number + 1))
         if printf '%s\n' "$event" | jq -e 'type == "object" and (.id | type == "string")' >/dev/null 2>&1; then
+            agent_bus_require_enabled || exit $?
             send_notification "$event"
         fi
         write_cursor "$line_number"
@@ -333,7 +335,10 @@ if [ "$command" != "enable" ] && [ "$command" != "start" ] && [ "$command" != "o
     exit 2
 fi
 
-agent_bus_set_paths
+case "$command" in
+    disable|stop|status) agent_bus_set_paths allow-disabled;;
+    *) agent_bus_set_paths;;
+esac
 agent_bus_need_existing
 agent_bus_need_agents
 command -v cmux >/dev/null 2>&1 || { echo "agent-notify: cmux is required" >&2; exit 1; }

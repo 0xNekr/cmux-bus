@@ -18,7 +18,7 @@ done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 src_bin="$repo_root/bin"
-tools=(agent-init agent-spawn agent-dismiss agent-fleet agent-worktree agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-watchdog agent-recover agent-wait agent-update)
+tools=(agent-bus agent-init agent-spawn agent-dismiss agent-fleet agent-worktree agent-providers agent-policy agent-lead-guard agent-send agent-inbox agent-roster agent-lead agent-done agent-cancel agent-resume agent-doctor agent-repair agent-guard agent-rpc agent-playbook agent-synthesize agent-thread agent-watch agent-notify agent-watchdog agent-recover agent-wait agent-update)
 
 missing=()
 command -v jq >/dev/null 2>&1 || missing+=("jq")
@@ -89,6 +89,14 @@ your own workspace's bus — agents never collide on a shared registry.
 In workspace scope, `.agents/` may only be a stub. Do not read
 `.agents/agents.json` or `.agents/bus.jsonl` by hand as the source of truth;
 use the `agent-*` commands.
+
+## Workspace opt-out
+
+Before joining, run `agent-bus status`. If it reports `disabled` (or a bus
+command exits 4), work independently: no registration, inbox, lead policy or
+peer coordination. Do not change scope/bus-dir, use cmux send, or re-enable to
+work around it. Only run `agent-bus enable` on an explicit user request.
+Several panes can contain independent AI sessions without forming a bus team.
 
 ## Required behavior
 

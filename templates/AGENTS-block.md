@@ -7,6 +7,11 @@ resolved by the `agent-*` commands. By default the bus is scoped to the
 current cmux workspace, not the current folder. Use `AGENT_BUS_SCOPE=repo` or
 `--scope repo` only when you intentionally want a folder-local `.agents/` bus.
 
+**Workspace opt-out:** First run `agent-bus status`. If disabled, work
+independently and skip all bus/lead rules below. Bus commands exit 4 while
+disabled. Do not retry registration, switch scope/bus-dir, or use `cmux send`
+as a workaround. Only re-enable on an explicit user request (`agent-bus enable`).
+
 **At session start:**
 1. Treat `agent-inbox` as the source of truth for the current bus. The protocol
    copied by `agent-init` defines the schema, types, inbox routine,

@@ -240,7 +240,13 @@ else
 fi
 
 [ $# -ge 1 ] || usage
-agent_bus_set_paths
+if agent_bus_set_paths; then
+    :
+else
+    code=$?
+    agent_bus_disabled && [ "${1:-}" = "check" ] && exit 0
+    exit "$code"
+fi
 cmd="$1"; shift
 case "$cmd" in
     check) check_cmd "$@";;

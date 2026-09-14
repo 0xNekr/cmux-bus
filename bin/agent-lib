@@ -146,14 +146,39 @@ agent_bus_resolve_dir() {
             printf '%s/.agents\n' "$root"
             ;;
         workspace)
-            printf '%s/cmux-bus/workspaces/%s\n' "$(agent_bus_state_home)" "$(agent_bus_workspace_id)"
+            local workspace_id
+            workspace_id="$(agent_bus_workspace_id)" || return $?
+            printf '%s/cmux-bus/workspaces/%s\n' "$(agent_bus_state_home)" "$workspace_id"
             ;;
     esac
 }
 
+# Workspace opt-out is independent of cwd, scope and explicit bus overrides.
+# Check the target too: detached daemons may have only --bus-dir, no cmux env.
+agent_bus_disabled() {
+    local workspace_id="${CMUX_WORKSPACE_ID:-}"
+    if [ -z "$workspace_id" ] && [ -n "${CMUX_SURFACE_ID:-}" ]; then
+        workspace_id="$(agent_bus_workspace_id 2>/dev/null)" || workspace_id=""
+    fi
+    if [ -n "$workspace_id" ]; then
+        workspace_id="$(printf '%s' "$workspace_id" | tr -c 'A-Za-z0-9._-' '_')"
+        [ ! -e "$(agent_bus_state_home)/cmux-bus/workspaces/$workspace_id/disabled" ] || return 0
+    fi
+    [ -n "${AGENT_BUS_DIR_EFFECTIVE:-}" ] && [ -e "$AGENT_BUS_DIR_EFFECTIVE/disabled" ]
+}
+
+agent_bus_require_enabled() {
+    if agent_bus_disabled; then
+        echo "${AGENT_CMD}: bus disabled for this workspace; continue independently. Only re-enable with 'agent-bus enable' when the user explicitly requests it. Do not retry init, change scope/bus-dir, or use cmux send as a fallback." >&2
+        return 4
+    fi
+    return 0
+}
+
 agent_bus_set_paths() {
-    AGENT_BUS_SCOPE_EFFECTIVE="$(agent_bus_scope)"
-    AGENT_BUS_DIR_EFFECTIVE="$(agent_bus_resolve_dir)"
+    AGENT_BUS_SCOPE_EFFECTIVE="$(agent_bus_scope)" || return $?
+    AGENT_BUS_DIR_EFFECTIVE="$(agent_bus_resolve_dir)" || return $?
+    [ "${1:-}" = "allow-disabled" ] || agent_bus_require_enabled || return $?
     AGENT_BUS_FILE="$AGENT_BUS_DIR_EFFECTIVE/bus.jsonl"
     AGENT_BUS_LOCK="$AGENT_BUS_DIR_EFFECTIVE/bus.lock"
     AGENT_BUS_AGENTS_FILE="$AGENT_BUS_DIR_EFFECTIVE/agents.json"
@@ -290,6 +315,7 @@ agent_bus_lock_holder_note() {
 }
 
 agent_bus_append_event() {
+    agent_bus_require_enabled || exit $?
     local event="$1"
 
     case "$event" in
@@ -346,6 +372,7 @@ agent_bus_append_event() {
     done
 
     printf '%s %s %s\n' "$(agent_bus_hostid)" "$$" "$(date +%s)" > "$owner_file" 2>/dev/null || true
+    agent_bus_require_enabled || exit $?
     printf '%s\n' "$event" >> "$AGENT_BUS_FILE"
     rm -rf "$AGENT_BUS_LOCK"
     trap - EXIT INT TERM

@@ -5,6 +5,7 @@ Run the smoke suite from the repository root:
 ```sh
 ./tests/run.sh
 ./tests/worktrees.sh
+./tests/disabled.sh
 ```
 
 The suite is intentionally plain Bash: no Bats, Python, or Node dependency.
@@ -55,3 +56,8 @@ conflicts, retained branches, ignored-file protection, fleet validation and
 concurrent creation. It disables notification/watchdog startup and uses no real
 provider, cmux socket, user Git configuration or network. Both suites run on
 macOS and Linux in CI.
+
+`disabled.sh` covers workspace opt-out before registration, four independent
+panes, scope/directory overrides, caller identification, isolation between
+workspaces, active wait/watchdog/notifier shutdown, relaxed hooks, retained
+history and explicit reactivation. All cmux/launchctl calls are stubbed.
