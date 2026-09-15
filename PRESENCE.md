@@ -64,6 +64,10 @@ previews and metadata. Selected-row colors follow cmux's native selection stylin
   moves its count, and closed terminals disappear. Checks PID and process start
   time; uncertain identities are **unknown**, not idle. Counts one live session
   per terminal surface, not provider-internal subagents.
+- After a restart, explicit `codex resume <session-id>` processes recover stale
+  hook PIDs using their live terminal and process start time. Ambiguous sessions
+  or terminals are not rebound; pre-restart activity is not treated as current.
+  Hook stores are never rewritten.
 - Codex transcripts are read incrementally for lifecycle events, correcting
   stale native idle flags. Explicit `request_user_input` calls remain pending
   until their result. Async questions stay pending after `accepted:true` until
