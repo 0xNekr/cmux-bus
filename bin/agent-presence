@@ -184,6 +184,67 @@ def read_records(directory):
     return records, errors
 
 
+def live_codex_resumes():
+    """Read explicit resume identities without retaining process arguments."""
+    proc = subprocess.run(['ps', '-axo', 'pid=,tty=,lstart=,args='],
+                          env=dict(os.environ, LC_ALL='C'),
+                          capture_output=True, text=True, timeout=2)
+    if proc.returncode:
+        return []
+    return parse_codex_resumes(proc.stdout)
+
+
+def parse_codex_resumes(output):
+    sessions = []
+    for line in output.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) != 8 or parts[1] == '??':
+            continue
+        try:
+            args = shlex.split(parts[7])
+            if not args or Path(args[0]).name != 'codex':
+                continue
+            index = args.index('resume')
+            session = args[index + 1]
+            started = time.mktime(time.strptime(' '.join(parts[2:7]), '%a %b %d %H:%M:%S %Y'))
+            sessions.append(dict(sessionId=session, pid=int(parts[0]), tty=parts[1],
+                                 pidStartSeconds=started))
+        except (ValueError, IndexError):
+            continue
+    return sessions
+
+
+def recover_codex_resumes(tree, records, processes, is_alive):
+    # Restored hooks may still contain yesterday's PID. Bind only an explicit
+    # resume ID to the currently live terminal; never infer identity from cwd.
+    surfaces = {}
+    for window in tree.get('windows', []):
+        for workspace in window.get('workspaces', []):
+            for pane in workspace.get('panes', []):
+                for surface in pane.get('surfaces', []):
+                    tty = surface.get('tty')
+                    if tty and surface.get('id'):
+                        surfaces.setdefault(tty.removeprefix('/dev/'), []).append(surface['id'])
+    by_session = {}
+    for process in processes:
+        by_session.setdefault(process['sessionId'], []).append(process)
+    recovered = []
+    for record in records:
+        matches = by_session.get(record['sessionId'], [])
+        if record['provider'] == 'codex' and len(matches) == 1 and is_alive(record) is False:
+            process = matches[0]
+            targets = surfaces.get(process['tty'], [])
+            if len(targets) == 1 and (record.get('pid') != process['pid'] or
+                                     record.get('pidStartSeconds') != process['pidStartSeconds']):
+                record = dict(record, pid=process['pid'],
+                              pidStartSeconds=process['pidStartSeconds'],
+                              surfaceId=targets[0], startedAt=process['pidStartSeconds'],
+                              runtimeStatus=None, agentLifecycle=None, activePromptDepth=0,
+                              updatedAt=0, recoveredAfterRestart=True)
+        recovered.append(record)
+    return recovered
+
+
 def aggregate(tree, records, is_alive, turns):
     workspaces = []
     for window in tree.get('windows', []):
@@ -207,6 +268,8 @@ def aggregate(tree, records, is_alive, turns):
             agents = []
             for sid, (_, record, alive) in candidates.items():
                 turn = turns.read(record) if record['provider'] == 'codex' else None
+                if record.get('recoveredAfterRestart') and turn and turn['at'] < record['startedAt']:
+                    turn = None
                 state = classify(record, turn) if alive is True else 'unknown'
                 agents.append({'surface': sid, 'session': record['sessionId'],
                                'provider': record['provider'], 'state': state})
@@ -239,8 +302,12 @@ class Client:
         return reply['result']
 
     def close(self):
-        self.stream.close()
-        self.socket.close()
+        try:
+            self.stream.close()
+        except OSError:
+            pass
+        finally:
+            self.socket.close()
 
 
 def status_rows(counts, unavailable=False):
@@ -282,6 +349,7 @@ class Monitor:
     def tick(self):
         tree = self.client.tree()
         records, errors = read_records(self.args.hook_dir)
+        records = recover_codex_resumes(tree, records, live_codex_resumes(), self.alive)
         workspaces = aggregate(tree, records, self.alive, self.turns)
         live = {w['id'] for w in workspaces}
         self.published = {wid: rows for wid, rows in self.published.items() if wid in live}

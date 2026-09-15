@@ -131,6 +131,56 @@ class PresenceTests(unittest.TestCase):
         self.assertTrue(any('1 agent au travail' in c for c in client.commands))
         self.assertFalse(any('workspace.select' in c for c in client.commands))
 
+    def test_restored_session_rebinds_pid_and_surface_without_trusting_old_state(self):
+        tree = {'windows':[{'workspaces':[{'id':'w','panes':[{'surfaces':[
+            {'id':'restored','tty':'ttys002'}]}]}]}]}
+        record = dict(sessionId='session',provider='codex',surfaceId='old',pid=11,
+                      pidStartSeconds=1,startedAt=1,runtimeStatus='needsInput',
+                      updatedAt=100,transcriptPath=str(self.file))
+        process = dict(sessionId='session',pid=22,pidStartSeconds=2,tty='ttys002')
+        result = p.recover_codex_resumes(tree,[record],[process],lambda r:False)
+        self.assertEqual(result[0]['pid'],22)
+        self.assertEqual(result[0]['surfaceId'],'restored')
+        self.assertEqual(record['pid'],11)
+        self.assertEqual(p.classify(result[0]),'unknown')
+        self.event('task_started',turn_id='restored')
+        aggregated=p.aggregate(tree,result,lambda r:True,self.turns)
+        self.assertEqual(aggregated[0]['counts']['working'],1)
+        self.event('task_complete',turn_id='restored')
+        self.assertEqual(p.aggregate(tree,result,lambda r:True,self.turns)[0]['counts']['idle'],1)
+        result[0]['startedAt']=9999999999
+        self.assertEqual(p.aggregate(tree,result,lambda r:True,self.turns)[0]['counts']['unknown'],1)
+        self.assertEqual(p.recover_codex_resumes(tree,[record],[],lambda r:False),[record])
+        self.assertEqual(p.recover_codex_resumes(tree,[record],[process,process],lambda r:False),[record])
+        self.assertEqual(p.recover_codex_resumes(tree,[record],[process],lambda r:True),[record])
+        self.assertEqual(p.recover_codex_resumes(tree,[record],[process],lambda r:None),[record])
+        process['tty']='closed'
+        self.assertEqual(p.recover_codex_resumes(tree,[record],[process],lambda r:False),[record])
+
+    def test_resume_process_parser_excludes_wrappers_and_other_commands(self):
+        prefix='22 ttys002 Tue Sep 15 09:24:53 2026 '
+        output='\n'.join([
+            prefix+'/opt/vendor/bin/codex -c \'hooks.example="value"\' resume session -a on-request',
+            prefix+'node /opt/bin/codex resume session',
+            prefix+'/opt/vendor/bin/codex exec task',
+            prefix+'/opt/vendor/bin/codex resume',
+            prefix+'/opt/vendor/bin/codex "unterminated',
+        ])
+        records=p.parse_codex_resumes(output)
+        self.assertEqual(len(records),1)
+        self.assertEqual(records[0]['sessionId'],'session')
+        self.assertEqual(records[0]['pid'],22)
+        self.assertNotIn('args',records[0])
+
+    def test_broken_connection_cleanup_always_closes_socket(self):
+        from unittest.mock import Mock
+        client=p.Client.__new__(p.Client)
+        client.stream=Mock()
+        client.socket=Mock()
+        client.stream.close.side_effect=BrokenPipeError()
+        client.close()
+        client.socket.close.assert_called_once()
+
     def test_shell_install_idempotent_and_preserves_user_config(self):
         rc=Path(self.tmp.name)/'.zshrc'
         original='export CUSTOM=value\n'
