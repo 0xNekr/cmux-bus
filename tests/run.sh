@@ -3047,7 +3047,7 @@ test_agent_notify_persistent_lifecycle() {
         [ -x "$runtime_dir/agent-notify" ] || fail "runtime notifier was not staged"
         [ -f "$runtime_dir/agent-lib" ] || fail "runtime library was not staged"
         grep -q 'Test &amp; Review' "$launch_dir/$service.plist" || fail "notification label was not XML escaped"
-        grep -q '<key>KeepAlive</key><true/>' "$launch_dir/$service.plist" || fail "LaunchAgent is not persistent"
+        grep -q '<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>' "$launch_dir/$service.plist" || fail "LaunchAgent is not persistent"
         [ "$(cat .agents/notifier/cursor)" -eq 1 ] || fail "enable did not start at the current bus end"
         output="$("$N" status)"
         printf '%s\n' "$output" | grep -q "enabled and running" || fail "status did not report persistent notifier"
