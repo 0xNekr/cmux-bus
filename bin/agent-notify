@@ -31,7 +31,9 @@ Commands:
 
 Notifications are enabled automatically by agent-init. `disable` is a durable
 per-bus opt-out; `enable` removes it. A persistent macOS LaunchAgent keeps the
-notifier alive across terminal, cmux, and login restarts. The notifier is
+notifier alive across terminal, cmux, and login restarts. Workspace notifiers
+retire after their workspace is confirmed absent for 60 seconds. API failures
+do not count as closure. The notifier is
 read-only with respect to bus.jsonl and starts at the current end by default.
 EOF
     agent_bus_common_usage >&2
@@ -101,7 +103,8 @@ resolve_label() {
 stage_runtime() {
     mkdir -p "$runtime_dir"
     if [ "$AGENT_SCRIPT_PATH" != "$runtime_script" ]; then
-        install -m 755 "$AGENT_SCRIPT_PATH" "$runtime_script"
+        install -m 755 "$AGENT_SCRIPT_PATH" "$runtime_script.tmp.$$"
+        mv "$runtime_script.tmp.$$" "$runtime_script"
     fi
     if [ "$AGENT_BIN_DIR/agent-lib" != "$runtime_dir/agent-lib" ]; then
         install -m 644 "$AGENT_BIN_DIR/agent-lib" "$runtime_dir/agent-lib"
@@ -114,7 +117,7 @@ launch_service_running() {
 }
 
 write_launch_agent() {
-    local tmp label_xml runtime_xml bus_xml notify_label_xml path_xml home_xml socket_xml workspace_xml
+    local tmp label_xml runtime_xml bus_xml notify_label_xml path_xml home_xml socket_xml workspace_xml state_home_xml
     mkdir -p "$launch_agents_dir" "$state_dir"
     tmp="$plist_file.tmp.$$"
     label_xml="$(xml_escape "$service_label")"
@@ -123,6 +126,7 @@ write_launch_agent() {
     notify_label_xml="$(xml_escape "$label")"
     path_xml="$(xml_escape "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin")"
     home_xml="$(xml_escape "$HOME")"
+    state_home_xml="$(xml_escape "$(agent_bus_state_home)")"
     socket_xml="$(xml_escape "$socket_path")"
     workspace_xml="$(xml_escape "$workspace_id")"
     cat > "$tmp" <<EOF
@@ -146,12 +150,13 @@ write_launch_agent() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key><string>$home_xml</string>
+    <key>XDG_STATE_HOME</key><string>$state_home_xml</string>
     <key>PATH</key><string>$path_xml</string>
     <key>CMUX_SOCKET_PATH</key><string>$socket_xml</string>
     <key>CMUX_WORKSPACE_ID</key><string>$workspace_xml</string>
   </dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>5</integer>
   <key>StandardOutPath</key><string>$(xml_escape "$state_dir/launchd.out")</string>
   <key>StandardErrorPath</key><string>$(xml_escape "$state_dir/launchd.err")</string>
@@ -192,6 +197,73 @@ disable_persistent() {
     stop_process
     rm -f "$plist_file" "$pid_file"
     echo "agent-notify: disabled for $AGENT_BUS_DIR_EFFECTIVE"
+}
+
+# Return 0 for a live workspace, 1 for confirmed absence, 2 for unknown.
+# Query every window: the caller's selected window is not authoritative.
+# Timeouts/schema failures must never turn a transient outage into deletion.
+# A fresh all-window presence snapshot can substitute for restricted socket access.
+workspace_liveness() {
+    python3 - "$lifecycle_workspace" "$(agent_bus_state_home)/cmux-bus/presence/snapshot.json" <<'PYTHON'
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+def query(*args):
+    result = subprocess.run(['cmux', '--json', *args], capture_output=True,
+                            text=True, timeout=3)
+    result.check_returncode()
+    return json.loads(result.stdout)
+
+
+def valid_ids(items):
+    return (isinstance(items, list) and
+            all(isinstance(item, dict) and isinstance(item.get('id'), str)
+                and item['id'] for item in items))
+
+
+try:
+    windows = query('list-windows')
+    if not valid_ids(windows):
+        raise ValueError('invalid windows response')
+    for window in windows:
+        response = query('list-workspaces', '--window', window['id'])
+        workspaces = response.get('workspaces') if isinstance(response, dict) else None
+        if not valid_ids(workspaces):
+            raise ValueError('invalid workspaces response')
+        if any(w['id'] == sys.argv[1] for w in workspaces):
+            sys.exit(0)
+except (OSError, ValueError, subprocess.SubprocessError):
+    # Under cmuxOnly, launchd children cannot access the socket. The presence
+    # collector runs under a cmux shell and publishes a complete all-window
+    # inventory atomically after each successful system.tree request.
+    try:
+        snapshot = json.loads(Path(sys.argv[2]).read_text())
+        observed = snapshot.get('observedAt')
+        workspaces = snapshot.get('workspaces')
+        if (not isinstance(observed, (int, float)) or isinstance(observed, bool)
+                or not 0 <= time.time() - observed <= 10
+                or not valid_ids(workspaces)
+                or not isinstance(snapshot.get('errors'), list)):
+            raise ValueError('stale or invalid presence snapshot')
+        sys.exit(0 if any(w['id'] == sys.argv[1] for w in workspaces) else 1)
+    except (OSError, ValueError, AttributeError):
+        sys.exit(2)
+sys.exit(1)
+PYTHON
+}
+
+retire_closed_workspace() {
+    # This is automatic retirement, NOT the user's durable opt-out. Keep the
+    # cursor and bus history so a restored workspace can be ensured again.
+    rm -f "$plist_file" "$pid_file"
+    echo "agent-notify: retired closed workspace $lifecycle_workspace"
+    # bootout may terminate this process before returning. All cleanup is done.
+    launchctl bootout "$launch_domain/$service_label" >/dev/null 2>&1 || true
+    exit 0
 }
 
 notification_target() {
@@ -361,6 +433,20 @@ plist_file="$launch_agents_dir/$service_label.plist"
 runtime_dir="${AGENT_BUS_NOTIFY_RUNTIME_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/cmux-bus/bin}"
 runtime_script="$runtime_dir/agent-notify"
 socket_path="${CMUX_SOCKET_PATH:-$(agent_bus_state_home)/cmux/cmux-$(id -u).sock}"
+# Bind lifecycle to the canonical bus path, never a caller's incidental
+# CMUX_WORKSPACE_ID (repo-scoped and explicit custom buses stay persistent).
+lifecycle_workspace=""
+case "$AGENT_BUS_DIR_EFFECTIVE" in
+    "$(agent_bus_state_home)/cmux-bus/workspaces/"*)
+        lifecycle_workspace="${AGENT_BUS_DIR_EFFECTIVE##*/}"
+        [ "$AGENT_BUS_DIR_EFFECTIVE" = "$(agent_bus_state_home)/cmux-bus/workspaces/$lifecycle_workspace" ] || lifecycle_workspace=""
+        ;;
+esac
+check_interval="${AGENT_BUS_NOTIFY_CHECK_INTERVAL:-15}"
+close_grace="${AGENT_BUS_NOTIFY_CLOSE_GRACE:-60}"
+for value in "$check_interval" "$close_grace"; do
+    case "$value" in ''|*[!0-9]*|0) echo "agent-notify: lifecycle timings must be positive integer seconds" >&2; exit 2;; esac
+done
 mkdir -p "$state_dir"
 
 case "$command" in
@@ -392,13 +478,15 @@ case "$command" in
             exit 0
         fi
         if launch_service_running; then
+            if cmp -s "$AGENT_SCRIPT_PATH" "$runtime_script" &&
+                grep -q '<key>SuccessfulExit</key><false/>' "$plist_file"; then
+                exit 0
+            fi
+            # Upgrade legacy always-restarting jobs without replaying events.
+            enable_persistent 0
             exit 0
         fi
-        if [ -f "$plist_file" ]; then
-            enable_persistent 0
-        else
-            enable_persistent 1
-        fi
+        enable_persistent 0
         ;;
     once)
         resolve_label
@@ -416,8 +504,40 @@ case "$command" in
         printf '%s\n' "$$" > "$pid_file"
         trap 'current=$(sed -n "1p" "$pid_file" 2>/dev/null || true); [ "$current" != "$$" ] || rm -f "$pid_file"' EXIT
         trap 'exit 0' INT TERM
+        next_check=0
+        absent_since=-1
+        liveness=0
+        previous_liveness=-1
         while :; do
-            process_pending
+            if [ -n "$lifecycle_workspace" ] && [ "$SECONDS" -ge "$next_check" ]; then
+                liveness=0
+                workspace_liveness || liveness=$?
+                next_check=$((SECONDS + check_interval))
+                if [ "$liveness" -ne "$previous_liveness" ]; then
+                    case "$liveness" in
+                        0) echo "agent-notify: workspace inventory live ($lifecycle_workspace)";;
+                        1) echo "agent-notify: workspace inventory absent; waiting for closure grace";;
+                        *) echo "agent-notify: workspace inventory unavailable; preserving service";;
+                    esac
+                    previous_liveness=$liveness
+                fi
+                case "$liveness" in
+                    0) absent_since=-1;;
+                    1)
+                        if [ "$absent_since" -lt 0 ]; then
+                            absent_since=$SECONDS
+                        elif [ "$((SECONDS - absent_since))" -ge "$close_grace" ]; then
+                            retire_closed_workspace
+                        fi
+                        ;;
+                    *) absent_since=-1;;
+                esac
+            fi
+            # Do not send stale events to a fallback workspace during closure
+            # or a cmux outage. Resume from the same cursor when it returns.
+            if [ "$liveness" -eq 0 ]; then
+                process_pending
+            fi
             sleep "$interval"
         done
         ;;

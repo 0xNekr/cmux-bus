@@ -60,6 +60,7 @@ an audit trail you can inspect with `cat`.
   `cmux send-key`, `cmux surface-health`)
 - `bash` 3.2+ (macOS default works, no Homebrew bash needed)
 - `jq` 1.6+
+- Python 3 (workspace notification lifecycle checks and presence collector)
 
 ## Install
 
@@ -339,6 +340,20 @@ checkout. The fresh handoff gets a new watchdog lease.
 `agent-init` automatically installs and starts one persistent notifier for the
 current bus. It survives terminal, cmux, and login restarts through a macOS
 LaunchAgent. No per-agent setup is needed.
+
+Workspace-scoped notifiers check all cmux windows every 15 seconds. After a
+workspace is confirmed absent for 60 seconds, its notifier removes its own
+LaunchAgent and exits. Socket failures, timeouts and malformed responses do not
+count as closure. With `cmuxOnly`, a valid all-window presence snapshot less than
+10 seconds old substitutes for the socket inventory; stale snapshots are ignored.
+If neither source is available, cleanup waits and no events are sent. Keep the
+presence collector enabled when using `cmuxOnly`; no socket security setting is
+changed.
+Bus history and the notification cursor are preserved, without setting the
+user's opt-out marker. A restored workspace can use `agent-init` / `ensure` to
+restart notifications. Repo-scoped and custom bus directories remain persistent.
+`ensure` upgrades legacy jobs without resetting their cursor. A normal process
+exit no longer triggers launchd's automatic restart; failures still do.
 
 Notifications are enabled by default. Opt out for one bus with:
 

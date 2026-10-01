@@ -46,6 +46,9 @@ jobs:
         shell: bash
         run: ./tests/run.sh
 
+      - name: Notification workspace lifecycle tests
+        run: PYTHONDONTWRITEBYTECODE=1 python3 tests/notify_lifecycle.py
+
       - name: Run worktree lifecycle tests
         shell: bash
         run: ./tests/worktrees.sh
