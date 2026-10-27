@@ -36,6 +36,8 @@ Covered areas:
 - `agent-notify` cmux pop-up formatting, event filtering, cursor deduplication,
   recipient targeting, persistent LaunchAgent lifecycle, and durable opt-out
 - `agent-wait` final-status waits, timeouts, and unknown ids
+- `agent-watchdog` expired/dead workers, ten minutes of simulated worker
+  heartbeats, expiry after silence, late/unrelated acks and fresh handoff retries
 
 The fake `cmux` implements only the contract the scripts need:
 

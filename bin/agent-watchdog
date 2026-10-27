@@ -10,9 +10,10 @@
 # and signals its pane. The timeout event is status=blocked, so it also closes the
 # thread (releasing its path claims) and unblocks any agent-wait on it.
 #
-# Idempotent: a thread that is already timed out is skipped. Batched: at most one
-# wake-up signal per delegator per pass, to avoid flooding when many expire at
-# once.
+# Worker progress acks renew the TTL. Idempotent: an attempt that has already
+# timed out is skipped even after late acks; only a new handoff rearms it.
+# Batched: at most one wake-up signal per delegator per pass, to avoid flooding
+# when many expire at once.
 
 set -euo pipefail
 
@@ -38,7 +39,8 @@ usage: agent-watchdog [--scope repo|workspace] [--bus-dir DIR] scan
 
   A timed-out thread gets a 'timeout' event (status blocked) addressed to its
   delegator; the delegator's pane is signalled so the lead reacts instead of
-  waiting forever. Re-running scan never double-times-out the same thread.
+  waiting forever. Worker progress acks renew the TTL. Re-running scan never
+  double-times-out the same attempt, even after late acks; a new handoff rearms it.
 
 WATCHDOG LIVENESS: the daemon is intentionally trivial so it rarely dies, but it
 is still a single point of failure. Run it from a stable pane (or re-launch it
@@ -102,8 +104,15 @@ scan_candidates() {
         | (map(select(.type == "handoff")) | last) as $attempt
         | select($attempt.ttl != null and $attempt.created_at != null)
         | (map(.id) | index($attempt.id)) as $attempt_index
-        | (any(.[$attempt_index:][]; .type == "ack")) as $acked
-        | ($attempt.created_at + $attempt.ttl) as $ttl_deadline
+        | .[$attempt_index:] as $attempt_events
+        # A timeout is terminal for this attempt, regardless of later acks.
+        | select(any($attempt_events[]; .type == "timeout") | not)
+        | ($attempt_events | map(select(.type == "ack" and .from == $attempt.to and .to == $attempt.from))) as $acks
+        | ($acks | length > 0) as $acked
+        # ts exists on all events, including older acks without created_at.
+        # Ignore malformed timestamps and never move the lease before creation.
+        | (([$attempt.created_at] + ($acks | map(try (.ts | fromdateiso8601) catch empty))) | max) as $last_activity
+        | ($last_activity + $attempt.ttl) as $ttl_deadline
         | (if $attempt.ack_by != null then ($attempt.created_at + $attempt.ack_by) else null end) as $ack_deadline
         | (if ($acked | not) and $ack_deadline != null and $now >= $ack_deadline then "no_ack"
            elif $now >= $ttl_deadline then (if $acked then "stale_ack" else "stale" end)
@@ -122,7 +131,7 @@ emit_timeout() {
     case "$reason" in
         worker_dead) body="worker '$worker' pane is gone — task abandoned (worker_dead)";;
         no_ack)      body="worker '$worker' did not ack within the ack window (no_ack)";;
-        stale_ack)   body="worker '$worker' acked but did not finish before the ttl (stale_ack)";;
+        stale_ack)   body="worker '$worker' has not sent a progress ack or finished within the ttl (stale_ack)";;
         stale)       body="worker '$worker' did not finish before the ttl (stale)";;
         *)           body="worker '$worker' timed out ($reason)";;
     esac

@@ -24,8 +24,8 @@ usage: agent-send [--scope repo|workspace] [--bus-dir DIR] <to> <type> [flags] <
   --ref ID         parent event id (chains the thread)
   --paths "p1,p2"  comma-separated paths_claimed
   --status STATUS  open | in_progress | done | blocked (default: type-derived)
-  --ttl SEC        work deadline in seconds (handoff default 300); the watchdog
-                   times the thread out and wakes the delegator past it
+  --ttl SEC        inactivity lease in seconds (handoff default 300); worker acks
+                   renew it. On expiry, the watchdog wakes the delegator
   --ack-by SEC     ack window in seconds (handoff default 45)
 
 prints new event id(s) on stdout, one per line
@@ -187,10 +187,11 @@ fi
 ref_json='null'
 [ -n "$ref" ] && ref_json=$(jq -nc --arg r "$ref" '$r')
 
-# Lease deadlines. A handoff carries a TTL (work deadline) and an ack window so
+# Lease deadlines. A handoff carries a TTL (inactivity lease) and an ack window so
 # the watchdog can time it out and wake the delegator if the worker never acks or
 # never finishes. Defaults apply to handoffs only; other event types stay
-# deadline-free unless the caller passes them explicitly. created_at anchors both.
+# deadline-free unless the caller passes them explicitly. created_at anchors the
+# initial deadlines; progress acks from the worker renew the TTL via their ts.
 created_at=$(date +%s)
 ttl_json='null'
 ack_by_json='null'
