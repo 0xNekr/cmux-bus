@@ -1421,6 +1421,96 @@ test_agent_watchdog_detects_dead_worker() {
     pass "agent-watchdog flags a dead worker even before the ttl expires"
 }
 
+make_fake_watchdog_clock() {
+    cat > "$1/date" <<'DATE'
+#!/usr/bin/env bash
+case "$*" in
+    '+%s') printf '%s\n' "$WATCHDOG_NOW";;
+    '-u +%Y-%m-%dT%H:%M:%SZ') jq -nr --argjson t "$WATCHDOG_NOW" '$t | strftime("%Y-%m-%dT%H:%M:%SZ")';;
+    *) exec /bin/date "$@";;
+esac
+DATE
+    chmod +x "$1/date"
+}
+
+test_agent_watchdog_renews_worker_lease() {
+    local fakebin workspace cmux_log start elapsed hid ref
+    fakebin="$tmp_root/fakebin-watchdog-heartbeat"
+    workspace="$(new_workspace watchdog-heartbeat)"
+    cmux_log="$tmp_root/cmux-watchdog-heartbeat.log"
+    make_fake_cmux "$fakebin"
+    make_fake_watchdog_clock "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        export PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" WATCHDOG_NOW=2000000000
+        start=$WATCHDOG_NOW
+        hid=$(CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff --ttl 120 --ack-by 45 "long task")
+        WATCHDOG_NOW=$((start + 44)) "$repo_root/bin/agent-watchdog" scan >/dev/null
+        # Ten minutes of ack heartbeats, including refs chained through prior acks.
+        ref=$hid
+        for elapsed in 30 90 150 210 270 330 390 450 510 570 630; do
+            export WATCHDOG_NOW=$((start + elapsed))
+            ref=$(CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-send" codex ack --ref "$ref" "still working")
+            WATCHDOG_NOW=$((start + elapsed + 59)) "$repo_root/bin/agent-watchdog" scan >/dev/null
+            [ "$(jq -s 'map(select(.type=="timeout")) | length' .agents/bus.jsonl)" = "0" ] \
+                || fail "watchdog timed out a worker sending regular heartbeats"
+        done
+        # The heartbeat is still bounded: expire exactly ttl seconds after it stops.
+        WATCHDOG_NOW=$((start + 630 + 119)) "$repo_root/bin/agent-watchdog" scan >/dev/null
+        [ "$(jq -s 'map(select(.type=="timeout")) | length' .agents/bus.jsonl)" = "0" ] || fail "heartbeat lease expired early"
+        WATCHDOG_NOW=$((start + 630 + 120)) "$repo_root/bin/agent-watchdog" scan >/dev/null
+        jq -s -e 'map(select(.type=="timeout")) | length==1 and (.[0].body | contains("stale_ack"))' .agents/bus.jsonl >/dev/null \
+            || fail "silent worker did not expire at the renewed deadline"
+        [ "$(grep -c '^send --surface s1 new timeout ' "$cmux_log")" = "1" ] || fail "heartbeat produced extra wake-ups"
+    )
+    pass "agent-watchdog renews ttl on worker heartbeats and expires after silence"
+}
+
+test_agent_watchdog_timeout_requires_new_handoff() {
+    local fakebin workspace cmux_log start hid retry
+    fakebin="$tmp_root/fakebin-watchdog-rearm"
+    workspace="$(new_workspace watchdog-rearm)"
+    cmux_log="$tmp_root/cmux-watchdog-rearm.log"
+    make_fake_cmux "$fakebin"
+    make_fake_watchdog_clock "$fakebin"
+
+    (
+        cd "$workspace"
+        write_agents
+        export PATH="$fakebin:$PATH" CMUX_LOG="$cmux_log" WATCHDOG_NOW=2000000000
+        start=$WATCHDOG_NOW
+        hid=$(CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" claude handoff --ttl 120 --ack-by 45 "task")
+        # An unrelated agent's ack must not satisfy the worker's ack window.
+        CMUX_SURFACE_ID=s3 "$repo_root/bin/agent-send" codex ack --ref "$hid" "observer" >/dev/null
+        export WATCHDOG_NOW=$((start + 45))
+        "$repo_root/bin/agent-watchdog" scan >/dev/null
+        jq -s -e 'map(select(.type=="timeout")) | length==1 and (.[0].body | contains("no_ack"))' .agents/bus.jsonl >/dev/null \
+            || fail "another agent acked on behalf of the worker"
+        # Late worker acks must not re-arm this attempt, even after their own ttl.
+        for elapsed in 60 240 420 600; do
+            export WATCHDOG_NOW=$((start + elapsed))
+            CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-send" codex ack --ref "$hid" "late heartbeat" >/dev/null
+            WATCHDOG_NOW=$((start + elapsed + 120)) "$repo_root/bin/agent-watchdog" scan >/dev/null
+            [ "$(jq -s 'map(select(.type=="timeout")) | length' .agents/bus.jsonl)" = "1" ] || fail "late ack rearmed a timed-out attempt"
+        done
+        # An explicit handoff in the same thread starts a fresh lease for a new worker.
+        export WATCHDOG_NOW=$((start + 900))
+        retry=$(CMUX_SURFACE_ID=s1 "$repo_root/bin/agent-send" deepseek handoff --ref "$hid" --ttl 120 --ack-by 45 "retry")
+        CMUX_SURFACE_ID=s2 "$repo_root/bin/agent-send" codex ack --ref "$retry" "previous worker" >/dev/null
+        WATCHDOG_NOW=$((start + 944)) "$repo_root/bin/agent-watchdog" scan >/dev/null
+        [ "$(jq -s 'map(select(.type=="timeout")) | length' .agents/bus.jsonl)" = "1" ] || fail "retry inherited an old deadline"
+        WATCHDOG_NOW=$((start + 945)) "$repo_root/bin/agent-watchdog" scan >/dev/null
+        jq -s -e 'map(select(.type=="timeout")) | length==2 and (.[1].body | contains("no_ack"))' .agents/bus.jsonl >/dev/null \
+            || fail "new handoff did not rearm watchdog for its own worker"
+        "$repo_root/bin/agent-watchdog" scan >/dev/null
+        [ "$(jq -s 'map(select(.type=="timeout")) | length' .agents/bus.jsonl)" = "2" ] || fail "retry timed out twice"
+        [ "$(grep -c '^send --surface s1 new timeout ' "$cmux_log")" = "2" ] || fail "timeout wake-ups were not unique per attempt"
+    )
+    pass "agent-watchdog ignores unrelated and late acks; only a new handoff rearms it"
+}
+
 test_agent_watchdog_releases_paths_on_worker_death() {
     local fakebin workspace now
     fakebin="$tmp_root/fakebin-watchdog-release"
@@ -3172,6 +3262,8 @@ test_bus_mtime_handles_stat_variants
 test_bus_lock_breaks_stale_holder
 test_agent_watchdog_times_out_expired_and_dead
 test_agent_watchdog_detects_dead_worker
+test_agent_watchdog_renews_worker_lease
+test_agent_watchdog_timeout_requires_new_handoff
 test_agent_watchdog_releases_paths_on_worker_death
 test_agent_inbox_empty_bus
 test_agent_cancel_and_resume_smoke

@@ -92,7 +92,7 @@ the repo-scoped thread first.
   "body":           "free text",
 
   "created_at":     "epoch seconds (handoffs) — anchors the lease",
-  "ttl":            "work-deadline seconds (handoffs, default 300)",
+  "ttl":            "inactivity-lease seconds (handoffs, default 300)",
   "ack_by":         "ack-window seconds (handoffs, default 45)"
 }
 ```
@@ -101,6 +101,13 @@ The last three are **lease** fields, optional and numeric. `agent-send`
 stamps them on every `handoff` (defaults `ttl=300`, `ack_by=45`) so the
 watchdog can time the thread out; other event types omit them unless passed
 explicitly with `--ttl` / `--ack-by`.
+
+The initial `ttl` deadline is `created_at + ttl`. Each `ack` from the current
+attempt's worker to its delegator renews it to the ack's `ts + ttl`. Workers
+doing long tasks should send progress acks more often than `ttl` seconds.
+`ack_by` still bounds the first ack from handoff creation. Once an attempt
+times out, late acks do not rearm the watchdog; only a new `handoff` in the
+thread starts a fresh attempt (including `agent-resume` / `agent-recover`).
 
 The bus is **append-only**: `status` is *declared* by an event, not mutated
 on prior events. The effective state of a thread is the **last** event whose
@@ -114,7 +121,8 @@ partial JSON into `bus.jsonl`.
 
 - `ask` — open a thread asking the recipient for input
 - `handoff` — pass a task; recipient should `ack` then `done`
-- `ack` — acknowledge receipt; declares `in_progress`
+- `ack` — acknowledge receipt or report progress; declares `in_progress` and
+  renews the current worker's active lease
 - `done` — close a thread with the result
 - `block` — escalate to user when stuck
 - `timeout` — emitted by `agent-watchdog` when a handoff's worker died or its
@@ -445,7 +453,8 @@ blocked forever waiting on a worker. The rule it enforces:
 Three pieces make that true:
 
 1. **Lease on every handoff.** `agent-send … handoff` stamps `created_at`,
-   `ttl` (work deadline, default 300s) and `ack_by` (ack window, default 45s).
+   `ttl` (inactivity lease, default 300s) and `ack_by` (ack window, default 45s).
+   Worker progress acks renew the `ttl` deadline; `ack_by` stays fixed.
    A handoff is a *lease*, not an open-ended wait.
 
 2. **`agent-watchdog`** — an independent timer.
@@ -454,7 +463,8 @@ Three pieces make that true:
      has passed, it appends a `timeout` event (`status=blocked`) addressed to
      the delegator and signals its pane.
    - `agent-watchdog daemon [--interval SEC]` runs `scan` on a loop.
-   - It is **idempotent** (a closed/timed-out thread is skipped) and **batched**
+   - It is **idempotent** (at most one timeout per handoff attempt, even after
+     late acks; a new handoff rearms it) and **batched**
      (at most one wake-up signal per delegator per pass).
    - Because the timeout is `status=blocked`, it also **closes the thread**,
      which releases the worker's `paths_claimed` and unblocks any `agent-wait`.
